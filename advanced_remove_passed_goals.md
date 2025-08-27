@@ -1,7 +1,14 @@
-네, 알겠습니다. 요청하신 대로 네임스페이스와 노드 이름을 변경하여 전체 코드를 다시 작성해 드리겠습니다.
- * Namespace: robust_nav2_bt_nodes -> amr_bt_nodes
- * Node/Class Name: AdvancedRemovePassedGoals -> AdvancedRemovePassedGoalsAction
-1. 헤더 파일 (advanced_remove_passed_goals_action.hpp)
+네, 알겠습니다. 우리가 함께 설계한 모든 강건한 로직(경로 유효성 검사, 거리 기반 동적 탐색 윈도우, 히스테리시스, 최대 경로 이탈 체크 등)을 포함하여, Nav2와 함께 사용할 수 있는 Production-ready 수준의 완벽한 커스텀 BT 노드 소스코드를 작성해 드리겠습니다.
+
+코드는 Modern C++(17) 스타일 가이드와 ROS 2 Jazzy를 기준으로 작성되었습니다.
+
+-----
+
+### 1\. 헤더 파일 (`advanced_remove_passed_goals.hpp`)
+
+이 파일은 클래스 정의, 멤버 변수, BT 포트(입출력)를 선언합니다.
+
+```cpp
 #pragma once
 
 #include <string>
@@ -14,7 +21,7 @@
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav_msgs/msg/path.hpp"
 
-namespace amr_bt_nodes
+namespace robust_nav2_bt_nodes
 {
 
 /**
@@ -25,15 +32,15 @@ namespace amr_bt_nodes
  * search window to find the robot's progress. It is resilient to path replanning,
  * large deviations from the path, and oscillations near the goal.
  */
-class AdvancedRemovePassedGoalsAction : public BT::StatefulActionNode
+class AdvancedRemovePassedGoals : public BT::StatefulActionNode
 {
 public:
   /**
-   * @brief A constructor for amr_bt_nodes::AdvancedRemovePassedGoalsAction
+   * @brief A constructor for nav2_behavior_tree::AdvancedRemovePassedGoals
    * @param xml_tag_name Name for the XML tag for this node
    * @param conf BT node configuration
    */
-  AdvancedRemovePassedGoalsAction(
+  AdvancedRemovePassedGoals(
     const std::string & xml_tag_name,
     const BT::NodeConfiguration & conf);
 
@@ -93,10 +100,17 @@ private:
     const geometry_msgs::msg::PoseStamped & robot_pose);
 };
 
-}  // namespace amr_bt_nodes
+}  // namespace robust_nav2_bt_nodes
+```
 
-2. 소스 파일 (advanced_remove_passed_goals_action.cpp)
-#include "path/to/your/header/advanced_remove_passed_goals_action.hpp"
+-----
+
+### 2\. 소스 파일 (`advanced_remove_passed_goals.cpp`)
+
+이 파일에 우리가 설계한 모든 핵심 로직이 구현됩니다.
+
+```cpp
+#include "path/to/your/header/advanced_remove_passed_goals.hpp"
 
 #include <functional>
 #include <numeric>
@@ -105,7 +119,7 @@ private:
 #include "nav2_util/geometry_utils.hpp"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
-namespace amr_bt_nodes
+namespace robust_nav2_bt_nodes
 {
 
 // Helper function to calculate distance between two poses (2D)
@@ -116,7 +130,7 @@ inline double euclidean_distance(
   return std::hypot(p1.position.x - p2.position.x, p1.position.y - p2.position.y);
 }
 
-AdvancedRemovePassedGoalsAction::AdvancedRemovePassedGoalsAction(
+AdvancedRemovePassedGoals::AdvancedRemovePassedGoals(
   const std::string & xml_tag_name,
   const BT::NodeConfiguration & conf)
 : BT::StatefulActionNode(xml_tag_name, conf)
@@ -138,7 +152,7 @@ AdvancedRemovePassedGoalsAction::AdvancedRemovePassedGoalsAction(
   transform_tolerance_ = rclcpp::Duration::from_seconds(transform_tolerance_secs);
 }
 
-BT::PortsList AdvancedRemovePassedGoalsAction::providedPorts()
+BT::PortsList AdvancedRemovePassedGoals::providedPorts()
 {
   return {
     BT::InputPort<std::vector<geometry_msgs::msg::PoseStamped>>("input_goals", "Original list of goals"),
@@ -153,9 +167,9 @@ BT::PortsList AdvancedRemovePassedGoalsAction::providedPorts()
   };
 }
 
-BT::NodeStatus AdvancedRemovePassedGoalsAction::onStart()
+BT::NodeStatus AdvancedRemovePassedGoals::onStart()
 {
-  RCLCPP_DEBUG(logger_, "AdvancedRemovePassedGoalsAction: onStart");
+  RCLCPP_DEBUG(logger_, "AdvancedRemovePassedGoals: onStart");
 
   // Reset all state variables when the node is started
   last_path_hash_ = 0;
@@ -169,12 +183,12 @@ BT::NodeStatus AdvancedRemovePassedGoalsAction::onStart()
   return BT::NodeStatus::RUNNING;
 }
 
-void AdvancedRemovePassedGoalsAction::onHalted()
+void AdvancedRemovePassedGoals::onHalted()
 {
-  RCLCPP_DEBUG(logger_, "AdvancedRemovePassedGoalsAction: onHalted");
+  RCLCPP_DEBUG(logger_, "AdvancedRemovePassedGoals: onHalted");
 }
 
-BT::NodeStatus AdvancedRemovePassedGoalsAction::onRunning()
+BT::NodeStatus AdvancedRemovePassedGoals::onRunning()
 {
   // 1. Get inputs from blackboard
   std::vector<geometry_msgs::msg::PoseStamped> current_goals;
@@ -253,7 +267,7 @@ BT::NodeStatus AdvancedRemovePassedGoalsAction::onRunning()
   return BT::NodeStatus::SUCCESS;
 }
 
-bool AdvancedRemovePassedGoalsAction::updateRobotPose(geometry_msgs::msg::PoseStamped & robot_pose)
+bool AdvancedRemovePassedGoals::updateRobotPose(geometry_msgs::msg::PoseStamped & robot_pose)
 {
   if (!nav2_util::getCurrentPose(
       robot_pose, *tf_, global_frame_, robot_base_frame_, transform_tolerance_))
@@ -264,7 +278,7 @@ bool AdvancedRemovePassedGoalsAction::updateRobotPose(geometry_msgs::msg::PoseSt
   return true;
 }
 
-bool AdvancedRemovePassedGoalsAction::isPathUpdated(const nav_msgs::msg::Path & path)
+bool AdvancedRemovePassedGoals::isPathUpdated(const nav_msgs::msg::Path & path)
 {
   // Hash the path to get a unique identifier
   std::string path_str;
@@ -284,7 +298,7 @@ bool AdvancedRemovePassedGoalsAction::isPathUpdated(const nav_msgs::msg::Path & 
   return false;
 }
 
-void AdvancedRemovePassedGoalsAction::createWaypointIndexMapping(
+void AdvancedRemovePassedGoals::createWaypointIndexMapping(
   const nav_msgs::msg::Path & path,
   const std::vector<geometry_msgs::msg::PoseStamped> & goals)
 {
@@ -309,7 +323,7 @@ void AdvancedRemovePassedGoalsAction::createWaypointIndexMapping(
   }
 }
 
-size_t AdvancedRemovePassedGoalsAction::findCurrentProgressIndex(
+size_t AdvancedRemovePassedGoals::findCurrentProgressIndex(
   const nav_msgs::msg::Path & path,
   const geometry_msgs::msg::PoseStamped & robot_pose)
 {
@@ -350,7 +364,7 @@ size_t AdvancedRemovePassedGoalsAction::findCurrentProgressIndex(
   return best_index;
 }
 
-}  // namespace amr_bt_nodes
+}  // namespace robust_nav2_bt_nodes
 
 
 // This is the Behavior Tree plugin registration.
@@ -358,10 +372,6 @@ size_t AdvancedRemovePassedGoalsAction::findCurrentProgressIndex(
 #include "behaviortree_cpp/bt_factory.h"
 BT_REGISTER_NODES(factory)
 {
-  factory.registerNodeType<amr_bt_nodes::AdvancedRemovePassedGoalsAction>("AdvancedRemovePassedGoalsAction");
+  factory.registerNodeType<robust_nav2_bt_nodes::AdvancedRemovePassedGoals>("AdvancedRemovePassedGoals");
 }
-
-중요사항:
- * 헤더 파일의 #include 경로를 실제 프로젝트 구조에 맞게 수정해야 합니다. (예: #include "amr_bt_nodes/advanced_remove_passed_goals_action.hpp")
- * 이 코드를 컴파일하고 라이브러리로 빌드한 뒤, plugin_description.xml에 플러그인을 등록하고 CMakeLists.txt에 라이브러리를 링크해야 합니다.
- * BT XML 파일에서 노드를 사용할 때는 이제 <AdvancedRemovePassedGoalsAction ... />으로 사용하셔야 합니다.
+```
