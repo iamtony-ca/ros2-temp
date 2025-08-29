@@ -1,220 +1,3 @@
-네, 알겠습니다. 개선된 로직을 반영하여 `hpp` 헤더 파일과 `cpp` 소스 파일을 분리한 전체 코드를 상세한 주석과 함께 제공해 드리겠습니다.
-
-코드를 헤더(.hpp)와 소스(.cpp)로 분리하는 것은 좋은 프로그래밍 습관입니다.
-
-  * **`.hpp` (헤더 파일):** 클래스의 구조와 인터페이스(어떤 함수와 변수가 있는지)를 정의합니다.
-  * **`.cpp` (소스 파일):** 헤더에 선언된 함수의 실제 동작 로직을 구현합니다.
-
-이렇게 분리하면 코드의 가독성이 높아지고, 컴파일 시간을 단축하며, 관리가 용이해집니다.
-
------
-
-### 1\. 헤더 파일: `is_goals_occupied_condition.hpp`
-
-이 파일은 `IsGoalsOccupiedCondition` 클래스의 선언을 담고 있습니다. 어떤 입력/출력 포트가 있는지, 어떤 함수가 멤버로 있는지 정의합니다.
-
-```cpp
-#ifndef AMR_BT_NODES__IS_GOALS_OCCUPIED_CONDITION_HPP_
-#define AMR_BT_NODES__IS_GOALS_OCCUPIED_CONDITION_HPP_
-
-#include <string>
-#include <vector>
-#include <memory>
-
-#include "rclcpp/node.hpp"
-#include "behaviortree_cpp/condition_node.h"
-#include "geometry_msgs/msg/pose_stamped.hpp"
-
-// Forward declaration to reduce header dependency
-namespace nav2_costmap_2d
-{
-class Costmap2DROS;
-}
-
-namespace amr_bt_nodes
-{
-
-/**
- * @brief BT::ConditionNode to check if any of the provided goals are in an occupied space in the costmap.
- * @details 이 노드는 'goals' 입력 포트로 받은 목표 지점들 중 하나라도
- * costmap 상에서 설정된 임계값(threshold) 이상의 비용을 가지는지 확인합니다.
- * 점유된 목표를 발견하면 SUCCESS를, 모든 목표가 안전하면 FAILURE를 반환합니다.
- */
-class IsGoalsOccupiedCondition : public BT::ConditionNode
-{
-public:
-  /**
-   * @brief 생성자
-   * @param condition_name 노드의 이름
-   * @param conf BT 노드 설정 객체
-   */
-  IsGoalsOccupiedCondition(
-    const std::string & condition_name,
-    const BT::NodeConfiguration & conf);
-
-  /**
-   * @brief 노드가 사용하는 포트들을 정의하는 정적 메서드
-   * @return BT::PortsList 포트 목록
-   */
-  static BT::PortsList providedPorts();
-
-protected:
-  /**
-   * @brief 노드의 주기적인 실행 로직 (tick)
-   * @return BT::NodeStatus 노드 실행 결과 (SUCCESS, FAILURE, RUNNING)
-   */
-  BT::NodeStatus tick() override;
-
-private:
-  // --- 멤버 변수 ---
-
-  // 리소스(node, costmap) 초기화 여부를 나타내는 플래그
-  bool initialized_{false};
-  
-  // ROS 2 노드 핸들. 로깅 및 기타 ROS 기능에 사용.
-  rclcpp::Node::SharedPtr node_;
-  
-  // Nav2 Costmap ROS 래퍼. Costmap 데이터에 접근하는 데 사용.
-  std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros_;
-};
-
-}  // namespace amr_bt_nodes
-
-#endif  // AMR_BT_NODES__IS_GOALS_OCCUPIED_CONDITION_HPP_
-```
-
------
-
-### 2\. 소스 파일: `is_goals_occupied_condition.cpp`
-
-이 파일은 `is_goals_occupied_condition.hpp`에 선언된 함수들의 실제 구현을 담고 있습니다.
-
-```cpp
-#include "amr_bt_nodes/is_goals_occupied_condition.hpp"
-
-#include "nav2_costmap_2d/costmap_2d_ros.hpp"
-#include "nav2_costmap_2d/cost_values.hpp"
-
-namespace amr_bt_nodes
-{
-
-// 생성자 구현
-IsGoalsOccupiedCondition::IsGoalsOccupiedCondition(
-  const std::string & condition_name,
-  const BT::NodeConfiguration & conf)
-: BT::ConditionNode(condition_name, conf)
-{
-  // 실제 리소스 초기화는 tick()에서 지연 로딩(lazy loading) 방식으로 수행
-}
-
-// 포트 정의 구현
-BT::PortsList IsGoalsOccupiedCondition::providedPorts()
-{
-  return {
-    BT::InputPort<std::vector<geometry_msgs::msg::PoseStamped>>(
-      "goals", "Vector of goals to check in the costmap"),
-    
-    BT::InputPort<int>(
-      "occupied_cost_threshold",
-      nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE, // 기본값: 내접 장애물 비용
-      "Cost value to consider a goal as occupied"),
-      
-    BT::InputPort<bool>(
-      "invert_logic", false, "If true, SUCCESS if all goals are free, else FAILURE"),
-      
-    BT::OutputPort<geometry_msgs::msg::PoseStamped>(
-      "occupied_goal", "The first goal found to be occupied")
-  };
-}
-
-// tick() 메서드 구현 (핵심 로직)
-BT::NodeStatus IsGoalsOccupiedCondition::tick()
-{
-  // --- 1. 초기화 (Lazy Loading) ---
-  // 노드가 처음 실행될 때만 ROS 노드와 Costmap 같은 리소스를 블랙보드에서 가져옵니다.
-  // 이렇게 하면 BT가 생성되는 시점에 리소스가 없더라도 에러가 발생하지 않습니다.
-  if (!initialized_) {
-    node_ = config().blackboard->get<rclcpp::Node::SharedPtr>("node");
-    costmap_ros_ = config().blackboard->get<std::shared_ptr<nav2_costmap_2d::Costmap2DROS>>(
-        "global_costmap");
-
-    if (!node_ || !costmap_ros_) {
-      auto logger = node_ ? node_->get_logger() : rclcpp::get_logger("IsGoalsOccupiedCondition");
-      RCLCPP_ERROR(logger, "Failed to get required resources ('node', 'global_costmap') from blackboard");
-      return BT::NodeStatus::FAILURE;
-    }
-    initialized_ = true;
-  }
-
-  // --- 2. 입력 포트에서 데이터 읽기 ---
-  std::vector<geometry_msgs::msg::PoseStamped> goals;
-  if (!getInput<std::vector<geometry_msgs::msg::PoseStamped>>("goals", goals) || goals.empty()) {
-    RCLCPP_WARN(node_->get_logger(), "Input 'goals' is empty or not provided. Returning FAILURE.");
-    return BT::NodeStatus::FAILURE;
-  }
-
-  int threshold;
-  getInput("occupied_cost_threshold", threshold);
-  
-  bool invert_logic;
-  getInput("invert_logic", invert_logic);
-
-  // --- 3. 핵심 로직: Costmap 점유 상태 확인 ---
-  auto costmap = costmap_ros_->getCostmap();
-  // Costmap에 여러 스레드가 동시에 접근하는 것을 방지하기 위해 뮤텍스 잠금
-  std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> lock(*(costmap->getMutex()));
-
-  bool any_goal_occupied = false;
-  for (const auto & goal : goals) {
-    unsigned int mx, my;
-
-    // worldToMap: 월드 좌표를 맵 셀 좌표로 변환. 맵 밖에 있으면 false 반환.
-    // getCost: 해당 맵 셀의 비용(0~255)을 반환.
-    // 조건: 맵을 벗어났거나, 비용이 임계값 이상이면 '점유'된 것으로 간주.
-    if (!costmap->worldToMap(goal.pose.position.x, goal.pose.position.y, mx, my) || 
-        costmap->getCost(mx, my) >= threshold) 
-    {
-      any_goal_occupied = true;
-      // 점유된 첫 번째 목표를 출력 포트를 통해 블랙보드에 기록
-      setOutput("occupied_goal", goal);
-      RCLCPP_INFO(
-        node_->get_logger(), 
-        "Goal (%.2f, %.2f) is considered occupied.", goal.pose.position.x, goal.pose.position.y);
-      // 점유된 목표를 하나라도 찾았으므로 더 이상 검사할 필요 없이 반복 종료
-      break; 
-    }
-  }
-
-  lock.unlock(); // 뮤텍스 잠금 해제
-
-  // --- 4. 최종 결과 반환 ---
-  // invert_logic 값에 따라 최종 결과(SUCCESS/FAILURE)를 결정
-  if (invert_logic) {
-    // 로직 반전 모드: '모든' 목표가 안전해야 SUCCESS
-    // any_goal_occupied가 true이면(점유된게 있으면) FAILURE, false이면 SUCCESS
-    return any_goal_occupied ? BT::NodeStatus::FAILURE : BT::NodeStatus::SUCCESS;
-  } else {
-    // 기본 모드: '하나라도' 점유되었다면 SUCCESS
-    // any_goal_occupied가 true이면 SUCCESS, false이면 FAILURE
-    return any_goal_occupied ? BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
-  }
-}
-
-}  // namespace amr_bt_nodes
-```
-
-이 두 파일을 `amr_bt_nodes` 패키지의 `include/amr_bt_nodes/`와 `src/` 디렉터리에 각각 위치시키고 `CMakeLists.txt`에 `is_goals_occupied_condition.cpp` 파일을 빌드 타겟에 추가하면 됩니다.
-
-
-```
-
-```
-
-
-
-
-
-
 네, 그럼요. 커스텀 BT 노드를 Nav2 시스템에 정식으로 등록하기 위한 **플러그인 XML**과, 이 노드를 실제 Behavior Tree에서 어떻게 활용하는지 보여주는 **사용 예시 BT XML**을 모두 제공해 드리겠습니다.
 
 -----
@@ -531,4 +314,273 @@ void IsGoalsOccupiedCondition::costmapCallback(const nav2_msgs::msg::Costmap::Sh
 }
 
 }  // namespace amr_bt_nodes
+```
+
+
+
+
+
+
+
+
+
+네, 알겠습니다. 두 개의 출력 포트(`occupied_goals`, `unoccupied_goals`)를 추가하여 점유된 목표와 그렇지 않은 목표를 분리해서 출력하도록 코드를 수정해 드리겠습니다.
+
+이 기능은 BT에서 특정 목표들이 점유되었을 때, 안전한 목표들만 가지고 다음 행동을 이어가는 등 훨씬 더 동적이고 지능적인 로직을 구현할 수 있게 해주는 매우 유용한 확장입니다.
+
+-----
+
+### **최종 코드 (출력 포트 추가 및 로직 완성)**
+
+#### **1. 헤더 파일: `is_goals_occupied_condition.hpp` (수정)**
+
+  * `PortsList`에 `occupied_goals`와 `unoccupied_goals` 출력 포트를 추가합니다.
+
+<!-- end list -->
+
+```cpp
+#ifndef AMR_BT_NODES__IS_GOALS_OCCUPIED_CONDITION_HPP_
+#define AMR_BT_NODES__IS_GOALS_OCCUPIED_CONDITION_HPP_
+
+#include <string>
+#include <vector>
+#include <memory>
+#include <mutex>
+
+#include "rclcpp/node.hpp"
+#include "rclcpp/executors.hpp"
+#include "behaviortree_cpp/condition_node.h"
+#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "nav2_costmap_2d/costmap_2d.hpp"
+#include "nav2_msgs/msg/costmap.hpp"
+#include "tf2_ros/buffer.h"
+
+namespace amr_bt_nodes
+{
+
+class IsGoalsOccupiedCondition : public BT::ConditionNode
+{
+public:
+  IsGoalsOccupiedCondition(
+    const std::string & condition_name,
+    const BT::NodeConfiguration & conf);
+
+  static BT::PortsList providedPorts();
+
+protected:
+  BT::NodeStatus tick() override;
+
+private:
+  void costmapCallback(const nav2_msgs::msg::Costmap::SharedPtr msg);
+
+  rclcpp::Node::SharedPtr node_;
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+
+  rclcpp::Subscription<nav2_msgs::msg::Costmap>::SharedPtr costmap_sub_;
+  rclcpp::CallbackGroup::SharedPtr callback_group_;
+  rclcpp::executors::SingleThreadedExecutor callback_group_executor_;
+
+  std::shared_ptr<nav2_costmap_2d::Costmap2D> latest_costmap_;
+  std::string costmap_frame_id_;
+  std::mutex costmap_mutex_;
+};
+
+}  // namespace amr_bt_nodes
+
+#endif  // AMR_BT_NODES__IS_GOALS_OCCUPIED_CONDITION_HPP_
+```
+
+#### **2. 소스 파일: `is_goals_occupied_condition.cpp` (수정)**
+
+  * **`providedPorts`**: 두 개의 `OutputPort`를 추가합니다.
+  * **`tick`**:
+      * 점유/비점유 목표를 담을 두 개의 `vector`를 생성합니다.
+      * `for` 루프 안에서 각 goal을 검사하고, 결과에 따라 적절한 벡터에 추가(`push_back`)합니다.
+      * `for` 루프가 끝난 후, 이 벡터들을 블랙보드의 출력 포트에 `setOutput`으로 설정합니다.
+      * 최종적으로 점유된 목표가 하나라도 있었는지 여부에 따라 `SUCCESS` 또는 `FAILURE`를 반환합니다.
+
+<!-- end list -->
+
+```cpp
+#include "amr_bt_nodes/is_goals_occupied_condition.hpp"
+
+#include "nav2_util/node_utils.hpp"
+#include "nav2_costmap_2d/cost_values.hpp"
+#include "rclcpp/qos.hpp"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+
+namespace amr_bt_nodes
+{
+
+IsGoalsOccupiedCondition::IsGoalsOccupiedCondition(
+  const std::string & condition_name,
+  const BT::NodeConfiguration & conf)
+: BT::ConditionNode(condition_name, conf)
+{
+  node_ = config().blackboard->get<rclcpp::Node::SharedPtr>("node");
+  tf_buffer_ = config().blackboard->get<std::shared_ptr<tf2_ros::Buffer>>("tf_buffer");
+
+  callback_group_ = node_->create_callback_group(
+    rclcpp::CallbackGroupType::MutuallyExclusive, false);
+  callback_group_executor_.add_callback_group(callback_group_, node_->get_node_base_interface());
+
+  std::string costmap_topic;
+  getInput("costmap_topic", costmap_topic);
+  if (costmap_topic.empty()) {
+    costmap_topic = "local_costmap/costmap_raw";
+  }
+
+  rclcpp::QoS qos(rclcpp::KeepLast(1));
+  qos.transient_local().reliable();
+
+  rclcpp::SubscriptionOptions sub_option;
+  sub_option.callback_group = callback_group_;
+
+  costmap_sub_ = node_->create_subscription<nav2_msgs::msg::Costmap>(
+    costmap_topic, qos,
+    std::bind(&IsGoalsOccupiedCondition::costmapCallback, this, std::placeholders::_1),
+    sub_option);
+}
+
+BT::PortsList IsGoalsOccupiedCondition::providedPorts()
+{
+  return {
+    BT::InputPort<std::vector<geometry_msgs::msg::PoseStamped>>("goals", "Vector of goals to check"),
+    BT::InputPort<int>("occupied_cost_threshold", nav2_costmap_2d::LETHAL_OBSTACLE, "Cost value to consider a goal as occupied"),
+    BT::InputPort<std::string>("costmap_topic", "Topic of the costmap to subscribe to"),
+    // ## 출력 포트 2개 추가 ##
+    BT::OutputPort<std::vector<geometry_msgs::msg::PoseStamped>>("occupied_goals", "List of goals that are in occupied space"),
+    BT::OutputPort<std::vector<geometry_msgs::msg::PoseStamped>>("unoccupied_goals", "List of goals that are in free space")
+  };
+}
+
+BT::NodeStatus IsGoalsOccupiedCondition::tick()
+{
+  callback_group_executor_.spin_some();
+
+  std::shared_ptr<nav2_costmap_2d::Costmap2D> costmap;
+  std::string costmap_frame;
+  {
+    std::lock_guard<std::mutex> lock(costmap_mutex_);
+    costmap = latest_costmap_;
+    costmap_frame = costmap_frame_id_;
+  }
+
+  if (!costmap || costmap_frame.empty()) {
+    RCLCPP_WARN(node_->get_logger(), "Costmap or its frame ID is not available yet.");
+    return BT::NodeStatus::FAILURE;
+  }
+
+  std::vector<geometry_msgs::msg::PoseStamped> goals;
+  if (!getInput<std::vector<geometry_msgs::msg::PoseStamped>>("goals", goals) || goals.empty()) {
+    return BT::NodeStatus::FAILURE;
+  }
+  int threshold;
+  getInput("occupied_cost_threshold", threshold);
+
+  // ## 결과를 담을 벡터 생성 ##
+  std::vector<geometry_msgs::msg::PoseStamped> occupied_goals;
+  std::vector<geometry_msgs::msg::PoseStamped> unoccupied_goals;
+
+  std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> lock(*(costmap->getMutex()));
+
+  for (const auto & goal : goals) {
+    geometry_msgs::msg::PoseStamped transformed_goal;
+    try {
+      tf_buffer_->transform(goal, transformed_goal, costmap_frame);
+    } catch (const tf2::TransformException & ex) {
+      RCLCPP_WARN(node_->get_logger(), "Failed to transform goal pose to %s frame: %s",
+        costmap_frame.c_str(), ex.what());
+      // TF 변환 실패 시 안전을 위해 점유된 것으로 간주
+      occupied_goals.push_back(goal);
+      continue;
+    }
+
+    unsigned int mx, my;
+    bool is_occupied = false;
+    if (!costmap->worldToMap(transformed_goal.pose.position.x, transformed_goal.pose.position.y, mx, my))
+    {
+      // Costmap 경계 밖은 비점유로 간주하고, unoccupied_goals에 추가
+      unoccupied_goals.push_back(goal);
+      continue;
+    }
+
+    if (costmap->getCost(mx, my) >= threshold)
+    {
+      is_occupied = true;
+    }
+
+    // ## 검사 결과에 따라 적절한 벡터에 추가 ##
+    if (is_occupied) {
+      occupied_goals.push_back(goal);
+    } else {
+      unoccupied_goals.push_back(goal);
+    }
+  }
+
+  // ## 루프 종료 후, 분류된 결과를 블랙보드에 설정 ##
+  setOutput("occupied_goals", occupied_goals);
+  setOutput("unoccupied_goals", unoccupied_goals);
+
+  if (!occupied_goals.empty()) {
+    RCLCPP_INFO(node_->get_logger(), "%zu goals are occupied. %zu goals are unoccupied.",
+      occupied_goals.size(), unoccupied_goals.size());
+    return BT::NodeStatus::SUCCESS; // 점유된 goal이 하나라도 있으면 SUCCESS
+  } else {
+    RCLCPP_INFO(node_->get_logger(), "All %zu goals are unoccupied.", unoccupied_goals.size());
+    return BT::NodeStatus::FAILURE; // 모든 goal이 비점유 상태이면 FAILURE
+  }
+}
+
+void IsGoalsOccupiedCondition::costmapCallback(const nav2_msgs::msg::Costmap::SharedPtr msg)
+{
+  auto new_costmap = std::make_shared<nav2_costmap_2d::Costmap2D>(
+    msg->metadata.size_x, msg->metadata.size_y,
+    msg->metadata.resolution, msg->metadata.origin.position.x, msg->metadata.origin.position.y);
+
+  unsigned char * char_map = new_costmap->getCharMap();
+  memcpy(char_map, &msg->data[0], msg->data.size() * sizeof(unsigned char));
+
+  {
+    std::lock_guard<std::mutex> lock(costmap_mutex_);
+    latest_costmap_ = new_costmap;
+    costmap_frame_id_ = msg->header.frame_id;
+  }
+}
+
+}  // namespace amr_bt_nodes
+```
+
+### **BT XML 사용 예시 (출력 포트 활용)**
+
+이제 BT XML에서 `occupied_goals`와 `unoccupied_goals`를 블랙보드의 다른 변수와 연결하여 후속 노드에서 사용할 수 있습니다.
+
+```xml
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence>
+      <IsGoalsOccupiedCondition
+          name="CheckGoalOccupancy"
+          goals="{candidate_goals}"
+          costmap_topic="local_costmap/costmap_raw"
+          occupied_goals="{obstructed_goals}"
+          unoccupied_goals="{safe_goals}" />
+
+      <Fallback name="ProcessGoals">
+        <Sequence>
+          <AlwaysSuccess> <Log message="Obstacles detected. Trying to use safe goals..."/>
+          </AlwaysSuccess>
+
+          <IsGoalVectorEmpty goals="{safe_goals}" invert="true"/>
+          
+          <ComputePathToPose goal="{safe_goals[0]}" path="{path}" />
+          <FollowPath path="{path}"/>
+        </Sequence>
+        
+        <Log message="No safe goals to navigate to." level="warn"/>
+      </Fallback>
+      
+    </Sequence>
+  </BehaviorTree>
+</root>
 ```
