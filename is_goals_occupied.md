@@ -310,3 +310,218 @@ BT::NodeStatus IsGoalsOccupiedCondition::tick()
 3.  **`PipelineSequence`**: 이 제어 노드는 자식 노드들을 순서대로 실행합니다. 만약 `IsGoalsOccupiedCondition`이 `FAILURE`를 반환하면 (즉, 목표가 점유되었다면), 뒤따르는 `ComputePathToPose`와 `FollowPath`는 실행되지 않고 시퀀스가 즉시 중단됩니다.
 4.  **`RecoveryNode`**: 전체 네비게이션 시퀀스가 실패했을 경우(예: 목표 지점이 점유되어 경로 계획 실패), 복구 행동(`ReactiveFallback`)을 한 번 시도하도록 합니다. 이 예시에서는 전역 Costmap을 초기화하는 것을 복구 전략으로 사용했습니다.
 
+
+
+
+
+
+
+
+
+
+
+
+네, 알겠습니다. `PlannerSelector` 노드의 구독 인터페이스는 ROS 콜백 처리를 BT의 `tick()` 주기와 명확하게 분리하고 제어하기 위한 매우 좋은 고급 패턴입니다. 이 패턴을 `IsGoalsOccupiedCondition` 노드에 적용하여 코드를 수정해 드리겠습니다.
+
+이 방식의 핵심은 다음과 같습니다.
+
+1.  BT 노드 내에 별도의 \*\*콜백 그룹(Callback Group)\*\*과 \*\*실행기(Executor)\*\*를 만듭니다.
+2.  Costmap 구독(Subscription)을 이 전용 콜백 그룹에 할당합니다.
+3.  `tick()`이 호출될 때마다, 이 전용 실행기를 `spin_some()`으로 돌려 대기 중인 Costmap 메시지를 동기적으로 처리합니다.
+4.  콜백 함수는 수신된 Costmap 데이터를 멤버 변수에 저장하고, `tick()`은 이 멤버 변수를 사용합니다.
+
+이전의 `nav2_costmap_2d::CostmapSubscriber` 헬퍼 클래스를 사용하는 대신, 이 패턴을 적용하여 더 명시적이고 제어 가능한 방식으로 직접 구독을 처리하도록 코드를 재구성하겠습니다.
+
+-----
+
+### **1. 헤더 파일: `is_goals_occupied_condition.hpp` (수정)**
+
+  * `CostmapSubscriber` 대신 `rclcpp::Subscription`을 직접 사용합니다.
+  * 콜백 그룹, 실행기, 수신된 Costmap을 저장할 멤버 변수, 그리고 이를 보호할 뮤텍스를 추가합니다.
+
+<!-- end list -->
+
+```cpp
+#ifndef AMR_BT_NODES__IS_GOALS_OCCUPIED_CONDITION_HPP_
+#define AMR_BT_NODES__IS_GOALS_OCCUPIED_CONDITION_HPP_
+
+#include <string>
+#include <vector>
+#include <memory>
+#include <mutex>
+
+#include "rclcpp/node.hpp"
+#include "rclcpp/executors.hpp"
+#include "behaviortree_cpp/condition_node.h"
+#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "nav2_costmap_2d/costmap_2d.hpp"
+#include "nav2_msgs/msg/costmap.hpp"
+
+namespace amr_bt_nodes
+{
+
+class IsGoalsOccupiedCondition : public BT::ConditionNode
+{
+public:
+  IsGoalsOccupiedCondition(
+    const std::string & condition_name,
+    const BT::NodeConfiguration & conf);
+
+  static BT::PortsList providedPorts();
+
+protected:
+  BT::NodeStatus tick() override;
+
+private:
+  /**
+   * @brief Costmap 토픽 콜백 함수
+   */
+  void costmapCallback(const nav2_msgs::msg::Costmap::SharedPtr msg);
+
+  rclcpp::Node::SharedPtr node_;
+  
+  // ROS 구독 관련 멤버 변수
+  rclcpp::Subscription<nav2_msgs::msg::Costmap>::SharedPtr costmap_sub_;
+  rclcpp::CallbackGroup::SharedPtr callback_group_;
+  rclcpp::executors::SingleThreadedExecutor callback_group_executor_;
+  
+  // 콜백과 tick() 사이의 데이터 공유를 위한 멤버 변수
+  std::shared_ptr<nav2_costmap_2d::Costmap2D> latest_costmap_;
+  std::mutex costmap_mutex_; // latest_costmap_ 접근을 보호하기 위한 뮤텍스
+};
+
+}  // namespace amr_bt_nodes
+
+#endif  // AMR_BT_NODES__IS_GOALS_OCCUPIED_CONDITION_HPP_
+```
+
+-----
+
+### **2. 소스 파일: `is_goals_occupied_condition.cpp` (수정)**
+
+  * 생성자에서 콜백 그룹, 실행기, 구독 설정을 완료합니다.
+  * `tick()`의 시작 부분에서 `spin_some()`을 호출하여 콜백을 처리합니다.
+  * `costmapCallback` 함수를 구현하여 `nav2_msgs::msg::Costmap` 메시지를 `nav2_costmap_2d::Costmap2D` 객체로 변환합니다.
+
+<!-- end list -->
+
+```cpp
+#include "amr_bt_nodes/is_goals_occupied_condition.hpp"
+
+#include "nav2_util/node_utils.hpp"
+#include "nav2_costmap_2d/cost_values.hpp"
+#include "rclcpp/qos.hpp"
+
+namespace amr_bt_nodes
+{
+
+IsGoalsOccupiedCondition::IsGoalsOccupiedCondition(
+  const std::string & condition_name,
+  const BT::NodeConfiguration & conf)
+: BT::ConditionNode(condition_name, conf)
+{
+  // 1. 블랙보드에서 노드 핸들 가져오기
+  node_ = config().blackboard->get<rclcpp::Node::SharedPtr>("node");
+
+  // 2. BT 노드 전용 콜백 그룹 및 실행기 생성
+  callback_group_ = node_->create_callback_group(
+    rclcpp::CallbackGroupType::MutuallyExclusive, false);
+  callback_group_executor_.add_callback_group(callback_group_, node_->get_node_base_interface());
+
+  // 3. 입력 포트에서 토픽 이름 가져오기
+  std::string costmap_topic;
+  getInput("costmap_topic", costmap_topic);
+  if (costmap_topic.empty()) {
+    costmap_topic = "local_costmap/costmap_raw";
+    RCLCPP_WARN(
+      node_->get_logger(),
+      "Input port 'costmap_topic' not provided, defaulting to '%s'", costmap_topic.c_str());
+  }
+  
+  // 4. 구독 설정
+  // Costmap은 마지막 발행된 메시지를 유지해야 하므로 Transient Local QoS 사용
+  rclcpp::QoS qos(rclcpp::KeepLast(1));
+  qos.transient_local().reliable();
+
+  rclcpp::SubscriptionOptions sub_option;
+  sub_option.callback_group = callback_group_; // 전용 콜백 그룹에 할당
+
+  costmap_sub_ = node_->create_subscription<nav2_msgs::msg::Costmap>(
+    costmap_topic, qos,
+    std::bind(&IsGoalsOccupiedCondition::costmapCallback, this, std::placeholders::_1),
+    sub_option);
+}
+
+BT::PortsList IsGoalsOccupiedCondition::providedPorts()
+{
+  return {
+    BT::InputPort<std::vector<geometry_msgs::msg::PoseStamped>>("goals", "Vector of goals to check"),
+    BT::InputPort<int>("occupied_cost_threshold", nav2_costmap_2d::LETHAL_OBSTACLE, "Cost value to consider a goal as occupied"),
+    BT::InputPort<std::string>("costmap_topic", "Topic of the costmap to subscribe to")
+  };
+}
+
+BT::NodeStatus IsGoalsOccupiedCondition::tick()
+{
+  // 1. 전용 실행기를 돌려 대기중인 Costmap 메시지를 처리 (콜백 함수 실행)
+  callback_group_executor_.spin_some();
+
+  // 2. 콜백에서 업데이트된 최신 Costmap을 안전하게 가져오기
+  std::shared_ptr<nav2_costmap_2d::Costmap2D> costmap;
+  {
+    std::lock_guard<std::mutex> lock(costmap_mutex_);
+    costmap = latest_costmap_;
+  }
+  
+  if (!costmap) {
+    RCLCPP_WARN(node_->get_logger(), "Costmap is not available yet, cannot check goals.");
+    return BT::NodeStatus::FAILURE;
+  }
+
+  // 3. 입력 포트에서 goals와 threshold 가져오기
+  std::vector<geometry_msgs::msg::PoseStamped> goals;
+  if (!getInput<std::vector<geometry_msgs::msg::PoseStamped>>("goals", goals) || goals.empty()) {
+    return BT::NodeStatus::FAILURE;
+  }
+  int threshold;
+  getInput("occupied_cost_threshold", threshold);
+
+  // 4. Costmap 점유 검사 로직 (이전과 동일)
+  std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> lock(*(costmap->getMutex()));
+
+  for (const auto & goal : goals) {
+    unsigned int mx, my;
+    if (!costmap->worldToMap(goal.pose.position.x, goal.pose.position.y, mx, my) ||
+        costmap->getCost(mx, my) >= threshold)
+    {
+      RCLCPP_INFO(
+        node_->get_logger(), "Goal (%.2f, %.2f) is occupied or out of bounds.",
+        goal.pose.position.x, goal.pose.position.y);
+      return BT::NodeStatus::SUCCESS;
+    }
+  }
+
+  RCLCPP_INFO(node_->get_logger(), "All goals are clear in the local costmap.");
+  return BT::NodeStatus::FAILURE;
+}
+
+void IsGoalsOccupiedCondition::costmapCallback(const nav2_msgs::msg::Costmap::SharedPtr msg)
+{
+  // Costmap 메시지를 Costmap2D 객체로 변환하는 로직
+  auto new_costmap = std::make_shared<nav2_costmap_2d::Costmap2D>(
+    msg->metadata.size_x, msg->metadata.size_y,
+    msg->metadata.resolution, msg->metadata.origin.position.x, msg->metadata.origin.position.y);
+  
+  // Costmap 데이터 복사
+  unsigned char * char_map = new_costmap->getCharMap();
+  memcpy(char_map, &msg->data[0], msg->data.size() * sizeof(unsigned char));
+
+  // 변환된 Costmap 객체를 멤버 변수에 안전하게 저장
+  {
+    std::lock_guard<std::mutex> lock(costmap_mutex_);
+    latest_costmap_ = new_costmap;
+  }
+}
+
+}  // namespace amr_bt_nodes
+```
