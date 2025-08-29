@@ -321,23 +321,29 @@ BT::NodeStatus IsGoalsOccupiedCondition::tick()
 
 
 
-네, 알겠습니다. `PlannerSelector` 노드의 구독 인터페이스는 ROS 콜백 처리를 BT의 `tick()` 주기와 명확하게 분리하고 제어하기 위한 매우 좋은 고급 패턴입니다. 이 패턴을 `IsGoalsOccupiedCondition` 노드에 적용하여 코드를 수정해 드리겠습니다.
+아, 네. 아주 중요한 문제를 발견하셨습니다. 죄송합니다. 제가 제공한 코드에 결정적인 결함이 있었습니다. 사용자님께서 겪고 계신 현상은 **좌표계(Coordinate Frame) 불일치** 문제일 가능성이 99%입니다.
 
-이 방식의 핵심은 다음과 같습니다.
+문제를 자세히 설명하고, 이를 해결한 최종 코드를 다시 제공해 드리겠습니다.
 
-1.  BT 노드 내에 별도의 \*\*콜백 그룹(Callback Group)\*\*과 \*\*실행기(Executor)\*\*를 만듭니다.
-2.  Costmap 구독(Subscription)을 이 전용 콜백 그룹에 할당합니다.
-3.  `tick()`이 호출될 때마다, 이 전용 실행기를 `spin_some()`으로 돌려 대기 중인 Costmap 메시지를 동기적으로 처리합니다.
-4.  콜백 함수는 수신된 Costmap 데이터를 멤버 변수에 저장하고, `tick()`은 이 멤버 변수를 사용합니다.
+### 문제의 원인: 좌표계 변환(TF) 누락
 
-이전의 `nav2_costmap_2d::CostmapSubscriber` 헬퍼 클래스를 사용하는 대신, 이 패턴을 적용하여 더 명시적이고 제어 가능한 방식으로 직접 구독을 처리하도록 코드를 재구성하겠습니다.
+  * **Local Costmap의 기준 좌표계:** `local_costmap`은 일반적으로 `odom` 좌표계를 기준으로 생성됩니다. 따라서 `local_costmap`의 `worldToMap()` 함수에 X, Y 좌표를 전달하려면, 그 좌표는 반드시 `odom` 좌표계 기준의 값이어야 합니다.
+  * **Goal의 좌표계:** Behavior Tree에 전달되는 `goal` (`geometry_msgs::msg::PoseStamped`)은 `map` 좌표계일 수도 있고, 다른 좌표계일 수도 있습니다.
+  * **이전 코드의 결함:** 제가 드린 이전 코드는 `goal`의 좌표계가 무엇인지 확인하거나 변환하는 과정 없이, `goal.pose.position.x` 값을 그대로 `worldToMap()` 함수에 사용했습니다. 만약 `goal`이 `map` 좌표계 기준이고 `local_costmap`이 `odom` 좌표계 기준이라면, `worldToMap()` 함수는 완전히 엉뚱한 위치를 계산하게 되고, 결과적으로 맵 바깥(out of bounds)으로 판단하여 `SUCCESS`를 반환하게 됩니다.
+
+### 해결책: TF(Transform) 적용
+
+`worldToMap()`을 호출하기 전에, 수신된 `goal`의 좌표를 `local_costmap`이 사용하는 전역 좌표계(`global_frame_id`, 보통 "odom")로 변환해주는 과정이 반드시 필요합니다.
+
+다행히 `bt_navigator`는 `tf2_ros::Buffer`를 블랙보드에 `"tf_buffer"`라는 키로 제공해주므로, 이를 활용하여 코드를 수정할 수 있습니다.
 
 -----
 
-### **1. 헤더 파일: `is_goals_occupied_condition.hpp` (수정)**
+### **최종 수정된 코드 (TF 변환 적용)**
 
-  * `CostmapSubscriber` 대신 `rclcpp::Subscription`을 직접 사용합니다.
-  * 콜백 그룹, 실행기, 수신된 Costmap을 저장할 멤버 변수, 그리고 이를 보호할 뮤텍스를 추가합니다.
+#### **1. 헤더 파일: `is_goals_occupied_condition.hpp` (수정)**
+
+  * `tf2_ros::Buffer`를 사용하기 위한 헤더와 멤버 변수를 추가합니다.
 
 <!-- end list -->
 
@@ -355,7 +361,9 @@ BT::NodeStatus IsGoalsOccupiedCondition::tick()
 #include "behaviortree_cpp/condition_node.h"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav2_costmap_2d/costmap_2d.hpp"
+#include "nav2_costmap_2d/costmap_subscriber.hpp"
 #include "nav2_msgs/msg/costmap.hpp"
+#include "tf2_ros/buffer.h" // ## TF 사용을 위해 추가 ##
 
 namespace amr_bt_nodes
 {
@@ -373,21 +381,17 @@ protected:
   BT::NodeStatus tick() override;
 
 private:
-  /**
-   * @brief Costmap 토픽 콜백 함수
-   */
   void costmapCallback(const nav2_msgs::msg::Costmap::SharedPtr msg);
 
   rclcpp::Node::SharedPtr node_;
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_; // ## TF 버퍼 멤버 변수 추가 ##
   
-  // ROS 구독 관련 멤버 변수
   rclcpp::Subscription<nav2_msgs::msg::Costmap>::SharedPtr costmap_sub_;
   rclcpp::CallbackGroup::SharedPtr callback_group_;
   rclcpp::executors::SingleThreadedExecutor callback_group_executor_;
   
-  // 콜백과 tick() 사이의 데이터 공유를 위한 멤버 변수
   std::shared_ptr<nav2_costmap_2d::Costmap2D> latest_costmap_;
-  std::mutex costmap_mutex_; // latest_costmap_ 접근을 보호하기 위한 뮤텍스
+  std::mutex costmap_mutex_;
 };
 
 }  // namespace amr_bt_nodes
@@ -395,13 +399,10 @@ private:
 #endif  // AMR_BT_NODES__IS_GOALS_OCCUPIED_CONDITION_HPP_
 ```
 
------
+#### **2. 소스 파일: `is_goals_occupied_condition.cpp` (수정)**
 
-### **2. 소스 파일: `is_goals_occupied_condition.cpp` (수정)**
-
-  * 생성자에서 콜백 그룹, 실행기, 구독 설정을 완료합니다.
-  * `tick()`의 시작 부분에서 `spin_some()`을 호출하여 콜백을 처리합니다.
-  * `costmapCallback` 함수를 구현하여 `nav2_msgs::msg::Costmap` 메시지를 `nav2_costmap_2d::Costmap2D` 객체로 변환합니다.
+  * 생성자에서 `"tf_buffer"`를 블랙보드로부터 가져옵니다.
+  * `tick()` 함수 내부에서 `tf_buffer_->transform`을 사용하여 좌표를 변환한 후 `worldToMap`을 호출합니다.
 
 <!-- end list -->
 
@@ -411,6 +412,7 @@ private:
 #include "nav2_util/node_utils.hpp"
 #include "nav2_costmap_2d/cost_values.hpp"
 #include "rclcpp/qos.hpp"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp" // ## TF 변환 헬퍼 함수 사용을 위해 추가 ##
 
 namespace amr_bt_nodes
 {
@@ -420,31 +422,25 @@ IsGoalsOccupiedCondition::IsGoalsOccupiedCondition(
   const BT::NodeConfiguration & conf)
 : BT::ConditionNode(condition_name, conf)
 {
-  // 1. 블랙보드에서 노드 핸들 가져오기
   node_ = config().blackboard->get<rclcpp::Node::SharedPtr>("node");
+  // ## TF 버퍼를 블랙보드에서 가져오기 ##
+  tf_buffer_ = config().blackboard->get<std::shared_ptr<tf2_ros::Buffer>>("tf_buffer");
 
-  // 2. BT 노드 전용 콜백 그룹 및 실행기 생성
   callback_group_ = node_->create_callback_group(
     rclcpp::CallbackGroupType::MutuallyExclusive, false);
   callback_group_executor_.add_callback_group(callback_group_, node_->get_node_base_interface());
 
-  // 3. 입력 포트에서 토픽 이름 가져오기
   std::string costmap_topic;
   getInput("costmap_topic", costmap_topic);
   if (costmap_topic.empty()) {
     costmap_topic = "local_costmap/costmap_raw";
-    RCLCPP_WARN(
-      node_->get_logger(),
-      "Input port 'costmap_topic' not provided, defaulting to '%s'", costmap_topic.c_str());
   }
   
-  // 4. 구독 설정
-  // Costmap은 마지막 발행된 메시지를 유지해야 하므로 Transient Local QoS 사용
   rclcpp::QoS qos(rclcpp::KeepLast(1));
   qos.transient_local().reliable();
 
   rclcpp::SubscriptionOptions sub_option;
-  sub_option.callback_group = callback_group_; // 전용 콜백 그룹에 할당
+  sub_option.callback_group = callback_group_;
 
   costmap_sub_ = node_->create_subscription<nav2_msgs::msg::Costmap>(
     costmap_topic, qos,
@@ -452,6 +448,7 @@ IsGoalsOccupiedCondition::IsGoalsOccupiedCondition(
     sub_option);
 }
 
+// ... providedPorts() 함수는 변경 없음 ...
 BT::PortsList IsGoalsOccupiedCondition::providedPorts()
 {
   return {
@@ -461,12 +458,11 @@ BT::PortsList IsGoalsOccupiedCondition::providedPorts()
   };
 }
 
+
 BT::NodeStatus IsGoalsOccupiedCondition::tick()
 {
-  // 1. 전용 실행기를 돌려 대기중인 Costmap 메시지를 처리 (콜백 함수 실행)
   callback_group_executor_.spin_some();
 
-  // 2. 콜백에서 업데이트된 최신 Costmap을 안전하게 가져오기
   std::shared_ptr<nav2_costmap_2d::Costmap2D> costmap;
   {
     std::lock_guard<std::mutex> lock(costmap_mutex_);
@@ -474,11 +470,10 @@ BT::NodeStatus IsGoalsOccupiedCondition::tick()
   }
   
   if (!costmap) {
-    RCLCPP_WARN(node_->get_logger(), "Costmap is not available yet, cannot check goals.");
+    RCLCPP_WARN(node_->get_logger(), "Costmap is not available yet.");
     return BT::NodeStatus::FAILURE;
   }
 
-  // 3. 입력 포트에서 goals와 threshold 가져오기
   std::vector<geometry_msgs::msg::PoseStamped> goals;
   if (!getInput<std::vector<geometry_msgs::msg::PoseStamped>>("goals", goals) || goals.empty()) {
     return BT::NodeStatus::FAILURE;
@@ -486,37 +481,57 @@ BT::NodeStatus IsGoalsOccupiedCondition::tick()
   int threshold;
   getInput("occupied_cost_threshold", threshold);
 
-  // 4. Costmap 점유 검사 로직 (이전과 동일)
+  // ## TF 변환 로직 시작 ##
+  std::string costmap_frame = costmap->getGlobalFrameID();
+
   std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> lock(*(costmap->getMutex()));
 
   for (const auto & goal : goals) {
+    geometry_msgs::msg::PoseStamped transformed_goal;
+    try {
+      // goal을 costmap의 좌표계로 변환
+      tf_buffer_->transform(goal, transformed_goal, costmap_frame);
+    } catch (const tf2::TransformException & ex) {
+      RCLCPP_WARN(node_->get_logger(), "Failed to transform goal pose: %s", ex.what());
+      return BT::NodeStatus::SUCCESS; // 변환 실패 시 점유된 것으로 간주
+    }
+    
     unsigned int mx, my;
-    if (!costmap->worldToMap(goal.pose.position.x, goal.pose.position.y, mx, my) ||
-        costmap->getCost(mx, my) >= threshold)
+    // 변환된 좌표(transformed_goal)를 사용하여 worldToMap 호출
+    if (!costmap->worldToMap(transformed_goal.pose.position.x, transformed_goal.pose.position.y, mx, my))
     {
       RCLCPP_INFO(
-        node_->get_logger(), "Goal (%.2f, %.2f) is occupied or out of bounds.",
-        goal.pose.position.x, goal.pose.position.y);
+        node_->get_logger(), "Goal (%.2f, %.2f) in frame %s is outside the costmap bounds.",
+        transformed_goal.pose.position.x, transformed_goal.pose.position.y, costmap_frame.c_str());
+      return BT::NodeStatus::SUCCESS;
+    }
+
+    if (costmap->getCost(mx, my) >= threshold)
+    {
+      RCLCPP_INFO(
+        node_->get_logger(), "Goal (%.2f, %.2f) is occupied in the costmap.",
+        transformed_goal.pose.position.x, transformed_goal.pose.position.y);
       return BT::NodeStatus::SUCCESS;
     }
   }
 
-  RCLCPP_INFO(node_->get_logger(), "All goals are clear in the local costmap.");
+  RCLCPP_INFO(node_->get_logger(), "All goals are clear in the costmap.");
   return BT::NodeStatus::FAILURE;
 }
 
+// ... costmapCallback() 함수는 변경 없음 ...
 void IsGoalsOccupiedCondition::costmapCallback(const nav2_msgs::msg::Costmap::SharedPtr msg)
 {
-  // Costmap 메시지를 Costmap2D 객체로 변환하는 로직
   auto new_costmap = std::make_shared<nav2_costmap_2d::Costmap2D>(
     msg->metadata.size_x, msg->metadata.size_y,
     msg->metadata.resolution, msg->metadata.origin.position.x, msg->metadata.origin.position.y);
   
-  // Costmap 데이터 복사
+  // global_frame_id를 메시지로부터 설정
+  new_costmap->setGlobalFrameID(msg->metadata.frame_id);
+
   unsigned char * char_map = new_costmap->getCharMap();
   memcpy(char_map, &msg->data[0], msg->data.size() * sizeof(unsigned char));
 
-  // 변환된 Costmap 객체를 멤버 변수에 안전하게 저장
   {
     std::lock_guard<std::mutex> lock(costmap_mutex_);
     latest_costmap_ = new_costmap;
@@ -525,3 +540,9 @@ void IsGoalsOccupiedCondition::costmapCallback(const nav2_msgs::msg::Costmap::Sh
 
 }  // namespace amr_bt_nodes
 ```
+
+**중요:** `costmapCallback` 함수에 `new_costmap->setGlobalFrameID(msg->metadata.frame_id);` 라인을 추가했습니다. 수신된 costmap 메시지로부터 좌표계 정보를 `Costmap2D` 객체에 설정하는 중요한 부분입니다.
+
+-----
+
+이 수정된 코드는 `goal`이 어떤 좌표계로 들어오든, 항상 `local_costmap`의 기준 좌표계로 변환한 후 점유 여부를 검사하므로, 사용자님께서 겪으셨던 문제를 해결할 것입니다. 훌륭한 디버깅이었습니다\!
