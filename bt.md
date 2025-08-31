@@ -196,20 +196,20 @@
 
   <BehaviorTree ID="ManeuverSubtree">
     <Sequence>
-      <Log color="green" message="[Subtree] Executing Maneuver with planner: {planner_id} and controller: {controller_id}"/>
+      <LogTextAction message="[Subtree] Executing Maneuver with planner: {planner_id} and controller: {controller_id}" interval_s="1.0"/>
       <ComputePathThroughPoses goals="{goals}" path="{alt_path}" planner_id="{planner_id}" error_code_id="{compute_path_error_code}"/>
       <TruncatePathLocal input_path="{alt_path}" output_path="{short_path}" distance_forward="1.5"/>
       <SetTruncatedGoalFromPath short_path="{short_path}" alt_goal="{alt_goal}"/>
       <ComputePathToPose goal="{alt_goal}" path="{short_path}" planner_id="{planner_id}" error_code_id="{compute_path_error_code}"/>
       <FollowPath path="{short_path}" controller_id="{controller_id}" goal_checker_id="super_relaxed_goal_checker" error_code_id="{follow_path_error_code}"/>
-      <Log color="green" message="[Subtree] Maneuver completed successfully."/>
+      <LogTextAction message="[Subtree] Maneuver completed successfully." interval_s="1.0"/>
     </Sequence>
   </BehaviorTree>
 
   <BehaviorTree ID="RemoveGoalsSubtree">
     <RetryUntilSuccessful num_attempts="{num_goals_to_remove}">
       <Sequence>
-        <Log color="green" message="[Subtree] Removing a goal point..."/>
+        <LogTextAction message="[Subtree] Removing a goal point..." interval_s="1.0"/>
         <RemoveFirstGoalAction input_goals="{goals}" remaining_goals="{goals}" />
       </Sequence>
     </RetryUntilSuccessful>
@@ -228,11 +228,11 @@
             <Fallback name="PlanningFallback">
               <IsPathValid path="{path}" max_cost="150" consider_unknown_as_obstacle="false" />
               <Sequence name="ComputeNewPath">
-                <Log message="Path is invalid or replan is requested. Computing new path..."/>
+                <LogTextAction message="Path is invalid or replan is requested. Computing new path..." interval_s="1.0"/>
                 <RecoveryNode number_of_retries="1" name="ComputePathRecovery">
                   <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
                   <Sequence name="ClearCostmapAndRetry">
-                     <Log color="yellow" message="[RECOVERY] Main planner failed. Clearing costmaps and retrying..."/>
+                     <LogTextAction message="[RECOVERY] Main planner failed. Clearing costmaps and retrying..." interval_s="1.0"/>
                      <ClearEntireCostmap name="ClearGlobalCostmap-Main" service_name="global_costmap/clear_entirely_global_costmap" />
                      <ClearEntireCostmap name="ClearLocalCostmap-Main" service_name="local_costmap/clear_entirely_local_costmap" />
                   </Sequence>
@@ -240,7 +240,7 @@
                 <SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" smoother_id="simple_smoother" />
               </Sequence>
             </Fallback>
-            </Sequence>
+          </Sequence>
         </RateController>
 
         <RecoveryNode number_of_retries="1" name="FollowPathRecovery">
@@ -250,7 +250,7 @@
           </Sequence>
           <Sequence>
             <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}" />
-            <Log color="yellow" message="[RECOVERY] Controller failed. Clearing local costmap."/>
+            <LogTextAction message="[RECOVERY] Controller failed. Clearing local costmap." interval_s="1.0"/>
             <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap" />
           </Sequence>
         </RecoveryNode>
@@ -261,25 +261,25 @@
           <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
           <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
         </Fallback>
-        <Log color="red" message="[!!! RECOVERY !!!] Main navigation failed. Initiating intelligent recovery logic."/>
+        <LogTextAction message="[!!! RECOVERY !!!] Main navigation failed. Initiating intelligent recovery logic." interval_s="1.0"/>
 
         <Fallback name="IntelligentRecoverySelector">
 
           <Sequence name="NoValidPathCase">
             <Precondition if="compute_path_error_code == 1" else="FAILURE">
               <Sequence>
-                <Log color="cyan" message="[RECOVERY CASE 0] 'No valid path' error detected. Trying to resolve..."/>
+                <LogTextAction message="[RECOVERY CASE 0] 'No valid path' error detected. Trying to resolve..." interval_s="1.0"/>
                 <Fallback>
                   <Sequence>
                     <IsGoalsOccupiedCondition goals="{goals}"/>
-                    <Log color="cyan" message=" -> Cause: Goal is occupied. Waiting or removing goals."/>
+                    <LogTextAction message=" -> Cause: Goal is occupied. Waiting or removing goals." interval_s="1.0"/>
                     <RoundRobin name="GoalOccupiedRecovery">
                       <Wait name="WaitToClear" wait_duration="5.0"/>
                       <Subtree ID="RemoveGoalsSubtree" num_goals_to_remove="-2"/> 
                     </RoundRobin>
                   </Sequence>
                   <Sequence>
-                    <Log color="cyan" message=" -> Cause: Path is blocked but goal is clear. Clearing costmaps and trying maneuver."/>
+                    <LogTextAction message=" -> Cause: Path is blocked but goal is clear. Clearing costmaps and trying maneuver." interval_s="1.0"/>
                     <RoundRobin name="PathBlockedRecovery">
                       <Sequence name="ClearCostmaps">
                         <ClearEntireCostmap name="ClearLocal" service_name="local_costmap/clear_entirely_local_costmap"/>
@@ -295,7 +295,7 @@
 
           <Sequence name="RobotIsStuckCase">
             <CheckIsStuck velocity_threshold="0.02"/>
-            <Log color="cyan" message="[RECOVERY CASE 1] Robot appears to be stuck. Executing maneuver."/>
+            <LogTextAction message="[RECOVERY CASE 1] Robot appears to be stuck. Executing maneuver." interval_s="1.0"/>
             <RoundRobin name="RobotIsStuckRecoveryActions">
               <Subtree ID="ManeuverSubtree" planner_id="RecoveryGridBased1" controller_id="RecoveryFollowPath1"/>
               <Subtree ID="ManeuverSubtree" planner_id="RecoveryGridBased2" controller_id="RecoveryFollowPath2"/>
@@ -303,7 +303,7 @@
           </Sequence>
 
           <Sequence name="DefaultFailureCase">
-            <Log color="cyan" message="[RECOVERY CASE 2] Default failure. Executing general recovery sequence."/>
+            <LogTextAction message="[RECOVERY CASE 2] Default failure. Executing general recovery sequence." interval_s="1.0"/>
             <RoundRobin name="DefaultFailureRecoveryActions">
               <Sequence name="ClearAllCostmaps">
                 <ClearEntireCostmap name="ClearLocal" service_name="local_costmap/clear_entirely_local_costmap"/>
@@ -321,17 +321,22 @@
   </BehaviorTree>
 
   <TreeNodesModel>
+    <Action ID="LogTextAction">
+        <input_port name="message" type="std::string"/>
+        <input_port name="interval_s" type="float" default="1.0"/>
+        <input_port name="bb_key" type="std::string"/>
+    </Action>
     <Condition ID="IsGoalsOccupiedCondition">
-      <input_port name="goals" type="std::vector<geometry_msgs::msg::PoseStamped>" description="The goals to check"/>
+      <input_port name="goals" type="std::vector<geometry_msgs::msg::PoseStamped>"/>
     </Condition>
     <Condition ID="CheckIsStuck">
-      <input_port name="velocity_threshold" type="double" default="0.02" description="Velocity below which robot is considered stuck"/>
+      <input_port name="velocity_threshold" type="double" default="0.02"/>
     </Condition>
     <Action ID="RemoveFirstGoalAction">
         <input_port name="input_goals" type="std::vector<geometry_msgs::msg::PoseStamped>"/>
         <output_port name="remaining_goals" type="std::vector<geometry_msgs::msg::PoseStamped>"/>
     </Action>
-    </TreeNodesModel>
+   </TreeNodesModel>
 
 </root>
 
