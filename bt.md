@@ -188,3 +188,151 @@
 
    
    
+
+
+
+```
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+
+  <BehaviorTree ID="ManeuverSubtree">
+    <Sequence>
+      <Log color="green" message="[Subtree] Executing Maneuver with planner: {planner_id} and controller: {controller_id}"/>
+      <ComputePathThroughPoses goals="{goals}" path="{alt_path}" planner_id="{planner_id}" error_code_id="{compute_path_error_code}"/>
+      <TruncatePathLocal input_path="{alt_path}" output_path="{short_path}" distance_forward="1.5"/>
+      <SetTruncatedGoalFromPath short_path="{short_path}" alt_goal="{alt_goal}"/>
+      <ComputePathToPose goal="{alt_goal}" path="{short_path}" planner_id="{planner_id}" error_code_id="{compute_path_error_code}"/>
+      <FollowPath path="{short_path}" controller_id="{controller_id}" goal_checker_id="super_relaxed_goal_checker" error_code_id="{follow_path_error_code}"/>
+      <Log color="green" message="[Subtree] Maneuver completed successfully."/>
+    </Sequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="RemoveGoalsSubtree">
+    <RetryUntilSuccessful num_attempts="{num_goals_to_remove}">
+      <Sequence>
+        <Log color="green" message="[Subtree] Removing a goal point..."/>
+        <RemoveFirstGoalAction input_goals="{goals}" remaining_goals="{goals}" />
+      </Sequence>
+    </RetryUntilSuccessful>
+  </BehaviorTree>
+
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="20" name="NavigateRecovery">
+
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="1.0">
+          <Sequence>
+            <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector" />
+            <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector" />
+            <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.7"/>
+
+            <Fallback name="PlanningFallback">
+              <IsPathValid path="{path}" max_cost="150" consider_unknown_as_obstacle="false" />
+              <Sequence name="ComputeNewPath">
+                <Log message="Path is invalid or replan is requested. Computing new path..."/>
+                <RecoveryNode number_of_retries="1" name="ComputePathRecovery">
+                  <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+                  <Sequence name="ClearCostmapAndRetry">
+                     <Log color="yellow" message="[RECOVERY] Main planner failed. Clearing costmaps and retrying..."/>
+                     <ClearEntireCostmap name="ClearGlobalCostmap-Main" service_name="global_costmap/clear_entirely_global_costmap" />
+                     <ClearEntireCostmap name="ClearLocalCostmap-Main" service_name="local_costmap/clear_entirely_local_costmap" />
+                  </Sequence>
+                </RecoveryNode>
+                <SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" smoother_id="simple_smoother" />
+              </Sequence>
+            </Fallback>
+            </Sequence>
+        </RateController>
+
+        <RecoveryNode number_of_retries="1" name="FollowPathRecovery">
+          <Sequence>
+            <PathPublisherAction input_path="{path}" topic_name="/plan_pruned" publish_period="0.3" node="{node}" />
+            <FollowPath path="{path}" controller_id="{selected_controller}" goal_checker_id="precise_goal_checker" progress_checker_id="progress_checker" error_code_id="{follow_path_error_code}" />
+          </Sequence>
+          <Sequence>
+            <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}" />
+            <Log color="yellow" message="[RECOVERY] Controller failed. Clearing local costmap."/>
+            <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap" />
+          </Sequence>
+        </RecoveryNode>
+      </PipelineSequence>
+
+      <Sequence name="IntelligentRecovery">
+        <Fallback name="FailureTypeCheck">
+          <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+          <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+        </Fallback>
+        <Log color="red" message="[!!! RECOVERY !!!] Main navigation failed. Initiating intelligent recovery logic."/>
+
+        <Fallback name="IntelligentRecoverySelector">
+
+          <Sequence name="NoValidPathCase">
+            <Precondition if="compute_path_error_code == 1" else="FAILURE">
+              <Sequence>
+                <Log color="cyan" message="[RECOVERY CASE 0] 'No valid path' error detected. Trying to resolve..."/>
+                <Fallback>
+                  <Sequence>
+                    <IsGoalsOccupiedCondition goals="{goals}"/>
+                    <Log color="cyan" message=" -> Cause: Goal is occupied. Waiting or removing goals."/>
+                    <RoundRobin name="GoalOccupiedRecovery">
+                      <Wait name="WaitToClear" wait_duration="5.0"/>
+                      <Subtree ID="RemoveGoalsSubtree" num_goals_to_remove="-2"/> 
+                    </RoundRobin>
+                  </Sequence>
+                  <Sequence>
+                    <Log color="cyan" message=" -> Cause: Path is blocked but goal is clear. Clearing costmaps and trying maneuver."/>
+                    <RoundRobin name="PathBlockedRecovery">
+                      <Sequence name="ClearCostmaps">
+                        <ClearEntireCostmap name="ClearLocal" service_name="local_costmap/clear_entirely_local_costmap"/>
+                        <ClearEntireCostmap name="ClearGlobal" service_name="global_costmap/clear_entirely_global_costmap"/>
+                      </Sequence>
+                      <Subtree ID="ManeuverSubtree" planner_id="RecoveryGridBased1" controller_id="RecoveryFollowPath1"/>
+                    </RoundRobin>
+                  </Sequence>
+                </Fallback>
+              </Sequence>
+            </Precondition>
+          </Sequence>
+
+          <Sequence name="RobotIsStuckCase">
+            <CheckIsStuck velocity_threshold="0.02"/>
+            <Log color="cyan" message="[RECOVERY CASE 1] Robot appears to be stuck. Executing maneuver."/>
+            <RoundRobin name="RobotIsStuckRecoveryActions">
+              <Subtree ID="ManeuverSubtree" planner_id="RecoveryGridBased1" controller_id="RecoveryFollowPath1"/>
+              <Subtree ID="ManeuverSubtree" planner_id="RecoveryGridBased2" controller_id="RecoveryFollowPath2"/>
+            </RoundRobin>
+          </Sequence>
+
+          <Sequence name="DefaultFailureCase">
+            <Log color="cyan" message="[RECOVERY CASE 2] Default failure. Executing general recovery sequence."/>
+            <RoundRobin name="DefaultFailureRecoveryActions">
+              <Sequence name="ClearAllCostmaps">
+                <ClearEntireCostmap name="ClearLocal" service_name="local_costmap/clear_entirely_local_costmap"/>
+                <ClearEntireCostmap name="ClearGlobal" service_name="global_costmap/clear_entirely_global_costmap"/>
+              </Sequence>
+              <Wait name="DefaultWait" wait_duration="2.0"/>
+              <Subtree ID="ManeuverSubtree" planner_id="RecoveryGridBased1" controller_id="RecoveryFollowPath1"/>
+              <Subtree ID="RemoveGoalsSubtree" num_goals_to_remove="-2"/>
+            </RoundRobin>
+          </Sequence>
+
+        </Fallback>
+      </Sequence>
+    </RecoveryNode>
+  </BehaviorTree>
+
+  <TreeNodesModel>
+    <Condition ID="IsGoalsOccupiedCondition">
+      <input_port name="goals" type="std::vector<geometry_msgs::msg::PoseStamped>" description="The goals to check"/>
+    </Condition>
+    <Condition ID="CheckIsStuck">
+      <input_port name="velocity_threshold" type="double" default="0.02" description="Velocity below which robot is considered stuck"/>
+    </Condition>
+    <Action ID="RemoveFirstGoalAction">
+        <input_port name="input_goals" type="std::vector<geometry_msgs::msg::PoseStamped>"/>
+        <output_port name="remaining_goals" type="std::vector<geometry_msgs::msg::PoseStamped>"/>
+    </Action>
+    </TreeNodesModel>
+
+</root>
+
+```
