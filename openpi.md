@@ -326,3 +326,99 @@ action_chunk = policy.infer(example)["actions"]
 
 1.  **실시간 성능과 지연 시간 (Real-time Performance & Latency)**: 원격 추론(Remote Inference) 시 Websocket을 통한 action 스트리밍의 평균 지연 시간(latency)은 어느 정도이며, 실시간 제어가 중요한 동적 작업에 적용할 때 발생할 수 있는 잠재적인 문제는 무엇인가요? JAX 기반 모델을 ROS 2와 같은 로보틱스 프레임워크에 효율적으로 통합하기 위한 권장 사항이 있습니까?
 2.  **모델 경량화 계획 (Model Quantization Plans)**: RTX 4090급 GPU를 추론에 요구하는 것은 실제 로봇 탑재(on-board deployment)에 제약이 될 수 있습니다. 모델 양자화(quantization)나 지식 증류(knowledge distillation) 같은 경량화 기법을 적용하는 것에 대한 내부적인 테스트나 향후 계획이 있는지 궁금합니다.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+네, 아주 정확하고 중요한 질문입니다. `openpi`가 `LeRobot`이라는 특정 데이터셋 형식을 사용하는 것처럼, DexMimicGen도 자체적인 데이터 생성 파이프라인을 위해 명확한 형식의 입력 데이터를 요구합니다.
+
+제공해주신 논문 내용을 바탕으로 DexMimicGen이 입력으로 받는 데이터 형식과, 전체적인 데이터 처리 흐름을 설명해 드리겠습니다.
+
+### DexMimicGen의 입력 데이터 형식
+
+결론적으로 DexMimicGen은 `LeRobot` 형식이 아닌, **개별적인 시연 궤적(Demonstration Trajectory)**을 입력으로 받습니다. 이 궤적은 특정 작업을 수행하는 동안 연속적으로 기록된 시계열 데이터입니다.
+
+[cite_start]논문에 따르면, 하나의 시연(demonstration) 데이터는 다음과 같은 요소들의 시퀀스(sequence)로 구성됩니다[cite: 74]:
+* [cite_start]**상태 ($s$, states)**: 로봇의 관절 각도, 엔드 이펙터(end-effector)의 위치, 시뮬레이션 내 객체들의 포즈(pose) 등 시스템의 물리적 상태 정보[cite: 74].
+* [cite_start]**관측 ($o$, observations)**: RGB-D 카메라 이미지와 같은 시각 정보[cite: 74].
+* [cite_start]**행동 ($a$, actions)**: 로봇을 제어하기 위해 입력된 명령어[cite: 74].
+
+[cite_start]특히 **행동($a$) 데이터**는 DexMimicGen의 핵심이며, 구체적으로 다음과 같이 정의됩니다[cite: 76]:
+1.  **엔드 이펙터 포즈(End-Effector Pose)**: 각 로봇 팔의 끝부분(손)에 대한 위치 및 방향(pose) 명령어.
+2.  [cite_start]**손 작동(Hand Actuation)**: 그리퍼를 여닫거나, 논문에서 언급된 정교한 손(dexterous hand)의 경우 6차원 관절 명령어[cite: 76].
+
+[cite_start]협업 부서에서 Apple Vision Pro를 활용하는 것은 바로 이 '엔드 이펙터 포즈'와 '손 작동' 데이터를 직관적으로 수집하기 위함입니다[cite: 211, 212]. [cite_start]Vision Pro를 통해 사람의 손목과 손가락 움직임을 추적하고, 이를 로봇의 행동 명령어로 변환하여 초기 시연 데이터를 수집하는 것입니다[cite: 212, 217].
+
+### 데이터 증강을 위한 전처리 과정
+
+단순히 위 데이터를 입력하는 것에서 끝나지 않습니다. DexMimicGen이 데이터를 효과적으로 생성(증강)하기 위해서는, 수집된 전체 궤적을 **의미 있는 단위로 분할(Segmentation)**해주는 전처리 과정이 필요합니다.
+
+1.  [cite_start]**하위 작업으로 분할 (Subtask Segmentation)**: 하나의 긴 시연 궤적을 '물체 잡기', '물체 옮기기', '물체 놓기'와 같이 객체 중심의 짧은 하위 작업(object-centric subtasks)들로 나눕니다[cite: 77, 80].
+2.  [cite_start]**팔 별 분할 (Per-Arm Segmentation)**: 양팔 로봇을 다루기 때문에, 각 팔에 대해 독립적인 하위 작업 시퀀스를 정의합니다[cite: 106, 107]. 예를 들어, 왼팔의 작업 목록과 오른팔의 작업 목록을 따로 만드는 것입니다.
+3.  [cite_start]**작업 유형 명시 (Subtask Type Specification)**: 분할된 하위 작업들이 서로 어떤 관계를 갖는지 수동으로 지정해주어야 합니다[cite: 417].
+    * [cite_start]**병렬(Parallel) 작업**: 두 팔이 서로 독립적으로 수행하는 작업[cite: 98].
+    * [cite_start]**협응(Coordination) 작업**: 두 팔이 정확한 타이밍에 함께 움직여야 하는 작업 (예: 큰 상자 함께 들기)[cite: 98].
+    * [cite_start]**순차(Sequential) 작업**: 한 팔의 작업이 끝나야 다른 팔의 작업이 시작될 수 있는 작업 (예: 한 손으로 그릇을 잡고 다른 손으로 내용물 붓기)[cite: 98].
+
+[cite_start]이러한 분할 및 정의 과정은 수동으로 하거나, 특정 규칙(heuristic)을 통해 자동화할 수 있습니다[cite: 155]. [cite_start]이 과정이 완료되어야 DexMimicGen의 완전 자동 데이터 생성 파이프라인이 시작될 수 있습니다[cite: 418].
+
+### OpenPI와의 연동 워크플로우
+
+따라서 `target robot` 로봇의 VLA 모델을 개발하는 전체적인 데이터 흐름은 다음과 같이 정리할 수 있습니다.
+
+1.  **데이터 수집 (Vision Pro)**: Vision Pro로 `target robot` 로봇을 원격 조종하여 **소량의 초기 시연 데이터(궤적)**를 수집합니다. 이 데이터는 `(상태, 관측, 행동)` 시퀀스 형태입니다.
+2.  **데이터 분할 및 정의 (DexMimicGen 전처리)**: 수집된 궤적을 DexMimicGen이 이해할 수 있도록 **팔 별로 하위 작업(subtask)으로 분할**하고, 각 작업의 유형(병렬, 협응, 순차)을 정의해줍니다.
+3.  **데이터 자동 생성 (DexMimicGen 실행)**: 분할된 데이터를 입력으로 DexMimicGen을 실행하여 **Isaac Sim 환경에서 수천, 수만 개의 새로운 궤적 데이터를 생성**합니다.
+4.  **데이터 변환 (LeRobot 형식)**: DexMimicGen이 생성한 대규모 궤적 데이터셋을 **`openpi`가 요구하는 `LeRobot` 데이터셋 형태로 변환**하는 별도의 스크립트를 작성합니다.
+5.  **VLA 모델 미세 조정 (OpenPI 학습)**: 최종적으로 변환된 `LeRobot` 데이터셋을 사용하여 `openpi` 베이스 모델을 `target robot`에 맞게 미세 조정합니다.
+
+요약하자면, DexMimicGen은 **'분할된 전문가 궤적'**을 입력받아 데이터를 생성하고, 이렇게 생성된 대규모 데이터를 `openpi`가 사용할 수 있도록 **'LeRobot 형식으로 변환'**하는 과정이 필요합니다.
+
+
+
+
+
+
+
+네, 알겠습니다. 협업 부서와 기술적인 논의를 명확하게 진행할 수 있도록, 제공해주신 DexMimicGen 논문 내용과 이전 대화 내용을 종합하여 target robot VLA 모델 사전 학습(미세 조정)에 대한 구체적인 기술 질문 리스트를 작성해 드리겠습니다.
+
+---
+
+### target robot VLA 모델 개발 관련 기술 질문 목록
+
+
+#### **1. 데이터 수집 및 시뮬레이션 환경에 대하여**
+
+1.  **디지털 트윈의 정밀도**: target robot의 Isaac Sim 디지털 트윈(Digital Twin) 모델은 실제 로봇의 동역학(dynamics) 및 운동학(kinematics)을 어느 정도의 정밀도로 반영하고 있나요? 특히, 관절 토크, 접촉(contact) 모델, 카메라 센서 모델의 Sim-to-Real Gap 최소화를 위해 어떤 검증 절차를 거치셨는지 궁금합니다.
+2.  [cite_start]**원격 조종 데이터의 품질**: Apple Vision Pro로 수집된 초기 시연 데이터는 로봇의 액션 공간(action space)으로 어떻게 변환되나요? [cite: 76, 213] [cite_start]사람의 움직임과 로봇 움직임 간의 대응(retargeting) 과정에서 발생하는 오차나 지연 시간(latency)을 보정하는 특별한 기법이 적용되어 있는지 문의드립니다. [cite: 216]
+3.  [cite_start]**초기 시연 데이터의 다양성**: DexMimicGen의 성능은 초기 시연 데이터의 품질에 크게 의존합니다. [cite: 11] 현재 확보된 'Pick and Place' 시연 데이터에는 다양한 초기 물체 위치, 잡기 힘든 자세, 또는 실패 후 복구하는 시나리오 등이 포함되어 있나요?
+
+#### **2. DexMimicGen을 활용한 데이터 생성에 대하여**
+
+1.  [cite_start]**하위 작업 분할(Segmentation) 전략**: DexMimicGen의 핵심 전처리 과정인 초기 시연 데이터 분할은 수동(manual)으로 진행하시나요, 아니면 특정 휴리스틱을 사용한 자동화 방식을 적용하시나요? [cite: 413, 414] [cite_start]또한, 양팔 작업의 성공률에 큰 영향을 미치는 하위 작업 유형(병렬, 협응, 순차)은 어떤 기준으로 정의하고 계신지 문의드립니다. [cite: 98]
+2.  **도메인 무작위화(Domain Randomization) 범위**: 데이터의 다양성 확보를 위해 Isaac Sim 환경에서 어느 범위까지 도메인 무작위화를 적용할 계획이신가요? (예: 조명, 텍스처, 물체 물리 속성, 카메라 위치 등) 이를 통해 VLA 모델이 학습하길 기대하는 강인함(robustness)의 구체적인 목표가 궁금합니다.
+3.  [cite_start]**데이터 생성 목표 및 필터링**: 논문에 따르면 생성된 데이터 중 성공한 궤적만 필터링하여 사용합니다. [cite: 86, 163] [cite_start]이번 프로젝트에서 목표로 하는 최종 데이터셋의 크기는 어느 정도이며(예: 1,000개, 5,000개), '작업 성공'을 판별하는 기준은 무엇인가요? [cite: 244, 245, 419]
+
+#### **3. OpenPI 모델 미세 조정(Fine-tuning)에 대하여**
+
+1.  **데이터 형식 변환**: DexMimicGen이 생성한 궤적 데이터(상태, 관측, 행동 시퀀스)를 `openpi`가 요구하는 `LeRobot` 데이터셋 형식으로 변환하기 위한 구체적인 파이프라인이나 스크립트가 준비되어 있나요? 특히, `target robot`의 액션 데이터를 `openpi` 모델의 입력 형식에 맞게 매핑하는 방식이 궁금합니다.
+2.  **미세 조정 하이퍼파라미터**: `openpi` 베이스 모델을 미세 조정할 때, 전체 모델을 학습시키는 방식(Full fine-tuning)과 LoRA와 같은 파라미터 효율적 미세 조정(PEFT) 방식 중 어떤 것을 고려하고 계신가요? 학습률(learning rate), 배치 사이즈(batch size) 등 주요 하이퍼파라미터 초기 설정 계획이 있으신지 문의드립니다.
+3.  **정규화(Normalization) 전략**: `openpi`의 기존 사전 학습된 정규화 통계(normalization statistics)를 재사용할 계획이신가요, 아니면 DexMimicGen으로 생성된 target robot 데이터셋 전체에 대해 통계를 새로 계산할 계획이신가요?
+
+#### **4. 모델 평가 및 실제 배포에 대하여**
+
+1.  **Sim-to-Real 성능 검증**: 시뮬레이션에서 미세 조정을 마친 VLA 모델의 성능을 실제 target robot 로봇에서 검증하기 위한 구체적인 평가 시나리오와 핵심 성능 지표(KPIs)는 무엇인가요? (예: 성공률, 작업 완료 시간, 궤적의 부드러움 등)
+2.  [cite_start]**성능 목표**: DexMimicGen 논문에서는 소량의 원본 데이터로 학습 시 0%였던 성공률이 생성된 데이터로 학습 후 90%까지 향상된 사례를 보여줍니다. [cite: 59, 281] 이번 target robot 'Pick and Place' 작업에서도 유사한 수준의 성능 향상을 목표로 하고 계신지 궁금합니다.
+3.  **추론 시스템 구성**: 최종적으로 학습된 VLA 모델을 실제 target robot 로봇에서 구동할 때, 추론(inference)은 로봇의 온보드(on-board) 컴퓨터에서 수행되나요, 아니면 별도의 워크스테이션을 통한 원격 추론(remote inference) 방식을 계획하고 계신가요? 실시간 제어를 위한 추론 속도 목표치가 있다면 공유 부탁드립니다.
+
+---
