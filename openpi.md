@@ -422,3 +422,109 @@ action_chunk = policy.infer(example)["actions"]
 3.  **추론 시스템 구성**: 최종적으로 학습된 VLA 모델을 실제 target robot 로봇에서 구동할 때, 추론(inference)은 로봇의 온보드(on-board) 컴퓨터에서 수행되나요, 아니면 별도의 워크스테이션을 통한 원격 추론(remote inference) 방식을 계획하고 계신가요? 실시간 제어를 위한 추론 속도 목표치가 있다면 공유 부탁드립니다.
 
 ---
+
+
+
+
+
+
+좋아, Seri. 아래는 네가 적어둔 질문을 **목적별 섹션으로 재정리**하고, 용어/표기 오류는 **기술적으로 타당한 표현**으로 고쳐 둔 버전이야. 메일/이슈 템플릿에 그대로 붙여넣기 좋아요. (핵심 레퍼런스는 각 섹션 끝에 달아 둠)
+
+---
+
+# A. 모델 선정·로드맵
+
+* 현재 사용 중인 **OpenPI 계열 모델**이 \*\*π₀(flow/diffusion)\*\*인지 \*\*π₀-FAST(autoregressive+FAST tokenizer)\*\*인지? 두 모델을 **태스크별로 어떻게 선택**하나요? (예: 고정밀 연속 제어 vs 빠른 학습/디코딩) ([GitHub][1], [Hugging Face][2])
+* 중장기 로드맵: OpenPI 외 **대안(VLA/BC/RT 계열)** 모델로의 전환 또는 병행 계획이 있나요? 트리거 조건/벤치마크 기준은?
+
+# B. 사전학습·튜닝 전략
+
+* **사전학습 데이터**: Hugging Face **LeRobot 허브**(공개 조작 데이터)로 pretrain 후, **Vision Pro 텔레옵으로 수집한 액션 데이터셋**으로 SFT/FT를 진행하나요? 비중과 시점은? ([Hugging Face][3], [GitHub][4])
+* **튜닝 방식**: Full fine-tuning vs **LoRA/Adapter(PEFT)** 중심—모델/데이터 스케일에 따른 기본 정책과 **학습률/LR multiplier**는?
+* **백본 동결 범위**: 다른 로봇(HW)로 이식할 때 **Vision/Text encoder 동결** + **상위 블록/크로스어텐션만 미세조정** 같은 가이드가 있나요? (망각 방지/수렴 안정 기준 포함)
+
+# C. 데이터 생성·포맷·파이프라인
+
+* **DexMimicGen → LeRobot 포맷 변환**: DexMimicGen이 생성한 **양팔 궤적**을 **LeRobot 데이터셋 스키마**로 변환하는 스크립트/툴링이 있나요? (episode metadata, success tag, object-relative frame 등)&#x20;
+* **Action–Perception 통합 SDG**:
+
+  * **Action-side**: DexMimicGen으로 성공 필터링된 **행동 데모 합성**(Transform/Replay/동기화 규칙, 세그멘테이션 자동화 유무).&#x20;
+  * **Perception-side**: Isaac Sim **Replicator**로 **라벨 포함 시각/센서 데이터** 렌더링 및 **도메인 랜덤화**(조명/재질/배경/카메라/센서). 두 단계 **타임스탬프/좌표계 동기화** 방식은? ([docs.isaacsim.omniverse.nvidia.com][5])
+* **세그멘테이션 자동화**: DexMimicGen 파이프라인의 **per-arm subtask segmentation**(휴리스틱/수기/하이브리드)과 **coordination/ordering 제약** 구현은? 실패/미완료 세그먼트 처리 규칙?&#x20;
+
+# D. 시뮬레이션 & 변이(Variation)
+
+* 사용 중인 **시뮬레이터/버전**(예: Isaac Sim 4.5.x, MuJoCo 등)과 **물리/센서 모델링** 설정은?
+* **Variation 범주를 분리해 설명 부탁**:
+
+  1. **Domain Randomization**(초기 배치·질감·조명·카메라, 마찰/질량/지연 등 **visual/dynamics DR**),
+  2. **Data augmentation**(이미지/센서 레벨),
+  3. **Action-label noise**(실행 잡음 재생),
+  4. **학습 알고리즘 변이**(dropout, mixup 등).
+     분포 폭 선택·튜닝은 **고정**인지, **SimOpt/실기 로그 기반 적응**인지? ([arXiv][6])
+
+# E. Sim-to-Real 전략·검증
+
+* 고려 중인 **sim2real 전략**: **(i) DR**, **(ii) SimOpt/Adaptive DR**, **(iii) Residual RL**(sim policy 위 **residual policy**를 실기에서 학습), **(iv) Online System ID/UP-style** 등. **태스크별 선택 기준**과 안전 바운드 설정은? ([arXiv][7], [ResearchGate][8])
+* **검증 파이프라인**: 디지털 트윈 상에서 **게이팅 테스트**(성공률/충돌/토크 스파이크), 실기로 보낼 **승인 규칙**, 실패 시 **rollback/재동기화** 프로토콜은?
+
+# F. 데이터셋 구성·품질 통제
+
+* **성공/실패 에피소드 구성**: BC 학습엔 **성공 위주**인지, 실패는 **리스크/판별자/선호학습(DPO/RLAIF) 보조 신호**로만 쓰는지? 실패 포함 시 **가중치·마스킹** 정책은? (DexMimicGen 생성분은 **성공 필터** 존재)&#x20;
+* **Occlusion/난상황 커버리지**: occlusion/글레어/모션블러 등 케이스를 **Replicator DR**로 충분히 커버하는지, 별도 **하드 네거티브** 데이터셋을 만들었는지? ([docs.isaacsim.omniverse.nvidia.com][5])
+
+# G. 회복·계획(Planning)·언어 지시
+
+* **Recovery action 학습**: 실패 근처 구간을 **near-miss window**로 정의해 **정책**이 아닌 **리스크/가치 헤드** 또는 **Residual RL**에 활용하나요?
+* **Task re-planning**: LLM-as-Planner + **SayCan-style value/affordance 게이트**로 실행가능 계획만 통과시키는지? 장기 과제에서 **replan 트리거**와 빈도는? ([say-can.github.io][9])
+* **Language Instruction Following**: 시각-언어 instruction-tuning 세트, 선호최적화(DPO/RLAIF), 웹-스케일 전이(RT-2류) 등 어떤 레시피를 적용했는지? 지표/벤치마크는? ([arXiv][10], [Robotics Transformer 2][11])
+
+# H. 텔레오퍼레이션·리타기팅(Gripper/Retargeter)
+
+* 사용 **gripper 타입**(parallel-jaw / vacuum / dexterous hand)과 **human→robot retargeting** 방식은? (키포인트 기반 핀치→개구 매핑, palm-normal 정렬, 제약/IK 투영 등) Vision Pro/ARKit 기반 **텔레옵 레이턴시·필터링** 파라미터도 공유 가능할까요? 참고 구현은 **AnyTeleop/Bunny-VisionPro** 등. ([arXiv][12], [Robotics Proceedings][13])
+
+# I. 평가·운영·재현성
+
+* **성능 지표**: 성공률/충돌률/사이클타임 외 **Unseen objects/tasks** 일반화·조합적 일반화 지표 포함 여부?
+* **Normalization stats 버저닝**: 로봇/그리퍼/제어주기(Δt) 교체 시 **재계산 vs 재사용** 기준과 성능 차이, **런타임 clamp(물리 bound)** 일관성은?
+* **실험 재현성**: 데이터/코드/파라미터/정규화 통계/체크포인트를 묶은 **artifact bundle**과 버전 정책은?
+
+---
+
+## 용어·표기 수정 메모
+
+* “lebro” → **LeRobot (Hugging Face)**: 로보틱스용 모델/데이터/툴 허브 및 데이터 포맷. ([Hugging Face][3], [GitHub][4])
+* “devimimicgen” → **DexMimicGen**: **bimanual** 행동 데모 합성 파이프라인(세그멘테이션·Transform/Replay·동기화·성공 필터).&#x20;
+* “data augmentation vs domain randomization”은 구분해서 질문(전자는 **데이터/신호 변환**, 후자는 **시뮬/렌더 파라미터 분포화**). ([arXiv][6])
+* “데이터 생성 파이프라인”은 모호 → \*\*“Action demonstration synthesis(DexMimicGen) + Synthetic perception rendering(Replicator) with DR”\*\*로 구체화 권장. ([docs.isaacsim.omniverse.nvidia.com][5])
+
+---
+
+### 빠른 참고
+
+OpenPI(π₀/π₀-FAST) 개요와 공개 가이드. ([GitHub][1], [Physical Intelligence][14])
+LeRobot 허브/포맷. ([Hugging Face][3], [GitHub][4])
+Isaac Sim Replicator(SDG/DR/라벨). ([docs.isaacsim.omniverse.nvidia.com][5])
+DexMimicGen 워크플로·성공필터.&#x20;
+Domain Randomization/SimOpt. ([arXiv][6])
+Residual RL(Residual Policy Learning). ([ResearchGate][8])
+SayCan/RT-2(언어 지시/웹 전이). ([say-can.github.io][9], [arXiv][10])
+AnyTeleop/Bunny-VisionPro(리타기팅 텔레옵). ([Robotics Proceedings][13], [arXiv][15])
+
+원하면 이 목록을 **체크박스/숫자 입력 포함한 Google Form/Confluence 템플릿**으로 변환해서 드릴게.
+
+[1]: https://github.com/Physical-Intelligence/openpi?utm_source=chatgpt.com "Physical-Intelligence/openpi"
+[2]: https://huggingface.co/blog/pi0?utm_source=chatgpt.com "Vision-Language-Action Models for General Robot Control"
+[3]: https://huggingface.co/lerobot?utm_source=chatgpt.com "LeRobot - Hugging Face"
+[4]: https://github.com/huggingface/lerobot?utm_source=chatgpt.com "LeRobot: Making AI for Robotics more accessible with end-to-end learning - GitHub"
+[5]: https://docs.isaacsim.omniverse.nvidia.com/latest/replicator_tutorials/index.html?utm_source=chatgpt.com "Perception Data Generation (Replicator)"
+[6]: https://arxiv.org/abs/1703.06907?utm_source=chatgpt.com "Domain Randomization for Transferring Deep Neural ..."
+[7]: https://arxiv.org/abs/1810.05687?utm_source=chatgpt.com "[1810.05687] Closing the Sim-to-Real Loop"
+[8]: https://www.researchgate.net/publication/335140884_Residual_Reinforcement_Learning_for_Robot_Control?utm_source=chatgpt.com "Residual Reinforcement Learning for Robot Control"
+[9]: https://say-can.github.io/?utm_source=chatgpt.com "SayCan: Grounding Language in Robotic Affordances"
+[10]: https://arxiv.org/abs/2307.15818?utm_source=chatgpt.com "RT-2: Vision-Language-Action Models Transfer Web ..."
+[11]: https://robotics-transformer2.github.io/assets/rt2.pdf?utm_source=chatgpt.com "rt2.pdf - RT-2: Vision-Language-Action Models"
+[12]: https://arxiv.org/abs/2307.04577?utm_source=chatgpt.com "AnyTeleop: A General Vision-Based Dexterous Robot Arm ..."
+[13]: https://www.roboticsproceedings.org/rss19/p015.pdf?utm_source=chatgpt.com "AnyTeleop: A General Vision-Based Dexterous Robot Arm- ..."
+[14]: https://www.physicalintelligence.company/blog/openpi?utm_source=chatgpt.com "Open Sourcing π0"
+[15]: https://arxiv.org/html/2407.03162v1?utm_source=chatgpt.com "Bunny-VisionPro: Real-Time Bimanual Dexterous ..."
