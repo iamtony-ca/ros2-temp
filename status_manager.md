@@ -335,3 +335,129 @@ void StatusManager::waypoints_status_callback(const GoalStatusArray::SharedPtr m
 // odom_callback, collision_callback, pause_flag_callback, 
 // query_initial_node_states, is_bt_node_running, status_to_string
 ```
+
+
+
+
+
+네, 정확히 맞습니다. 현재 코드의 `std::recursive_mutex`가 데이터의 동시 접근을 막아주는 보호장치 역할을 하므로 데이터가 깨지는 문제는 발생하지 않습니다. 사용자의 분석이 정확합니다.
+
+하지만 여기서 \*\*콜백 그룹(Callback Group)\*\*을 사용하는 것은 ROS 2의 실행기(Executor)에게 "이 콜백들을 어떻게 실행할지" 명확한 규칙을 알려주어 코드를 더 안정적이고 예측 가능하게 만드는 모범 사례(Best Practice)입니다.
+
+현재 코드에 **단일 `MutuallyExclusive` 콜백 그룹**을 적용하여 동시성 이슈를 원천적으로 차단하고, 놓치는 토픽 없이 모든 이벤트를 순차적으로 안전하게 처리하도록 코드를 다시 수정해 드리겠습니다.
+
+### 수정 사항
+
+1.  `MutuallyExclusive` 콜백 그룹을 하나 생성합니다.
+2.  모든 구독(`Subscription`)과 타이머(`Timer`)를 이 그룹에 할당합니다.
+3.  **효과:** `MultiThreadedExecutor`를 사용하더라도, ROS 2는 이 그룹에 속한 콜백들을 **절대로 동시에 실행하지 않고, 하나씩 순서대로 처리**합니다. 따라서 뮤텍스가 없어도 콜백 실행 순서로 인한 레이스 컨디션이 발생하지 않습니다. (물론, 만일을 대비해 뮤텍스를 유지하는 것이 더 안전합니다.)
+
+-----
+
+### `status_manager.hpp` (수정)
+
+단일 콜백 그룹을 위한 멤버 변수를 추가합니다.
+
+```cpp
+#pragma once
+
+// ... (includes and enum are the same as your provided code) ...
+#include "rclcpp/rclcpp.hpp"
+#include "rclcpp_action/rclcpp_action.hpp"
+#include "action_msgs/msg/goal_status_array.hpp"
+#include "nav_msgs/msg/odometry.hpp"
+// ...
+
+class StatusManager : public rclcpp::Node
+{
+public:
+    // ... (using declarations are the same) ...
+    explicit StatusManager(const rclcpp::NodeOptions & options);
+
+private:
+    // ... (function declarations are the same) ...
+
+    // --- 상태 저장을 위한 멤버 변수 ---
+    std::recursive_mutex status_mutex_;
+    // ... (other member variables are the same) ...
+
+    // --- ROS 인터페이스 ---
+    rclcpp::CallbackGroup::SharedPtr callback_group_; // *** FIX: 콜백 그룹 포인터 추가 ***
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_publisher_;
+    // ... (rest of the interface declarations are the same) ...
+};
+```
+
+### `status_manager.cpp` (수정)
+
+생성자에서 콜백 그룹을 생성하고 모든 구독과 타이머에 할당합니다.
+
+```cpp
+#include "robot_monitoring/status_manager.hpp"
+#include "action_msgs/msg/goal_status.hpp"
+#include <thread>
+
+// ... (is_same_goal_id helper function and using declarations are the same) ...
+
+StatusManager::StatusManager(const rclcpp::NodeOptions & options)
+: Node("status_manager", options)
+{
+    // *** FIX: 단일 MutuallyExclusive 콜백 그룹 생성 ***
+    // 이 그룹에 속한 모든 콜백은 한 번에 하나씩만 순차적으로 실행됩니다.
+    callback_group_ = this->create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
+
+    // 모든 구독에 적용할 옵션에 콜백 그룹을 할당합니다.
+    auto sub_options = rclcpp::SubscriptionOptions();
+    sub_options.callback_group = callback_group_;
+
+    // ROS 인터페이스 초기화
+    status_publisher_ = this->create_publisher<std_msgs::msg::String>("/robot_status", rclcpp::SystemDefaultsQoS());
+    
+    // *** FIX: 타이머에 콜백 그룹 할당 ***
+    timer_ = this->create_wall_timer(
+        std::chrono::seconds(1), 
+        std::bind(&StatusManager::timer_callback, this), 
+        callback_group_);
+
+    // *** FIX: 모든 구독 생성 시 sub_options를 통해 콜백 그룹 할당 ***
+    nav_to_pose_status_sub_ = this->create_subscription<GoalStatusArray>(
+        "/navigate_to_pose/_action/status", 10, std::bind(&StatusManager::nav_to_pose_status_callback, this, std::placeholders::_1), sub_options);
+    
+    waypoints_status_sub_ = this->create_subscription<GoalStatusArray>(
+        "/follow_waypoints/_action/status", 10, std::bind(&StatusManager::waypoints_status_callback, this, std::placeholders::_1), sub_options);
+    
+    nav_through_poses_status_sub_ = this->create_subscription<GoalStatusArray>(
+        "/navigate_through_poses/_action/status", 10, std::bind(&StatusManager::nav_through_poses_status_callback, this, std::placeholders::_1), sub_options);
+
+    compute_path_status_sub_ = this->create_subscription<GoalStatusArray>(
+        "/compute_path_to_pose/_action/status", 10, std::bind(&StatusManager::compute_path_status_callback, this, std::placeholders::_1), sub_options);
+    
+    follow_path_status_sub_ = this->create_subscription<GoalStatusArray>(
+        "/follow_path/_action/status", 10, std::bind(&StatusManager::follow_path_status_callback, this, std::placeholders::_1), sub_options);
+    
+    bt_log_sub_ = this->create_subscription<BehaviorTreeLog>(
+        "/behavior_tree_log", 10, std::bind(&StatusManager::bt_log_callback, this, std::placeholders::_1), sub_options);
+    
+    odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+        "/odom", 10, std::bind(&StatusManager::odom_callback, this, std::placeholders::_1), sub_options);
+    
+    collision_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+        "/is_collision_imminent", rclcpp::SystemDefaultsQoS(), std::bind(&StatusManager::collision_callback, this, std::placeholders::_1), sub_options);
+    
+    pause_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+        "/pause_robot", rclcpp::SystemDefaultsQoS(), std::bind(&StatusManager::pause_flag_callback, this, std::placeholders::_1), sub_options);
+
+    // Lifecycle 클라이언트는 콜백이 아니므로 그룹 설정이 필요 없습니다.
+    for (const auto& name : core_node_names_) {
+        lifecycle_clients_.push_back(this->create_client<lifecycle_msgs::srv::GetState>(name + "/get_state"));
+    }
+    
+    std::thread{ [this]() { this->query_initial_node_states(); }}.detach();
+    RCLCPP_INFO(this->get_logger(), "StatusManager Node has been started with a MutuallyExclusive CallbackGroup.");
+}
+
+// ... (나머지 모든 함수의 구현은 이전 답변과 완전히 동일합니다) ...
+```
+
+이제 이 코드는 ROS 2 실행기 레벨에서 모든 이벤트(토픽 메시지, 타이머)를 순차적으로 처리하도록 보장받습니다. 말씀하신 대로 토픽을 놓치는 일 없이, 들어온 순서대로 하나씩 안전하게 처리하게 됩니다.
