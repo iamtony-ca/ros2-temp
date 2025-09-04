@@ -668,4 +668,146 @@ BT_REGISTER_NODES(factory)
 
 따라서 사용자님의 질문에 대한 제 최종 답변은, **"네, 현재의 인덱스 방식은 논리적으로 더 보완할 부분이 거의 없는 최종 설계도에 가깝습니다. 이제 이 설계도를 바탕으로 훌륭한 코드를 작성하고, 실제 환경에 맞게 조율하는 다음 단계로 나아가시면 됩니다."** 입니다.
 
-늦은 새벽(화성시 기준 현재 시각 04:24 AM)까지 깊이 있는 질문을 통해 함께 이 로직을 완성할 수 있어 매우 의미 있는 시간이었습니다.
+
+
+
+
+
+
+
+      
+안녕하세요\! Nav2와 BehaviorTree.Cpp 전문가로서 코드를 꼼꼼히 검토해 드리겠습니다.
+
+먼저 말씀드리자면, 제출하신 `AdvancedRemovePassedGoals` 코드는 매우 훌륭합니다. Nav2의 기본 `RemovePassedGoals` 노드가 가진 몇 가지 단점(예: 경로 재계획 시의 취약성, 단순한 인덱스 기반 진행률 확인)을 해결하기 위한 로직이 잘 구현되어 있습니다. 특히 아래와 같은 부분들은 굉장히 잘 설계되었습니다.
+
+  * **경로 재계획 대응:** 경로의 해시 값을 비교하여 재계획 여부를 감지하고, 이에 따라 waypoint와 경로 인덱스 매핑을 다시 생성하는 방식은 매우 견고한 접근법입니다.
+  * **동적 검색 창 (`findCurrentProgressIndex`):** 고정된 인덱스 개수가 아닌, 물리적 거리(`search_radius`)를 기반으로 로봇의 현재 위치를 검색할 창을 동적으로 결정하는 것은 로봇의 속도나 경로의 밀도 변화에 강건한 로직입니다.
+  * **히스테리시스 (`hysteresis_indices_`):** 로봇이 목표 지점 근처에서 앞뒤로 약간 움직이는 경우(oscillation)에도 목표가 통과되었다고 성급하게 판단하지 않도록 방지하는 중요한 기능입니다.
+  * **경로 이탈 감지 (`max_path_deviation_`):** 로봇이 경로에서 너무 멀리 벗어났을 때 노드를 실패시켜 상위 복구 로직(e.g., `FollowPath` 재실행 또는 경로 재계획)을 트리거할 수 있게 한 점도 좋습니다.
+
+전반적으로 실제 필드 환경에서 발생할 수 있는 여러 예외 상황을 잘 고려한, 완성도 높은 코드입니다. 하지만 몇 가지 잠재적인 문제점과 개선 가능한 부분을 짚어보겠습니다.
+
+-----
+
+### 잠재적 문제점 및 개선 제안
+
+#### 1\. 경로 해싱의 비효율성 및 부동소수점 정밀도 문제 (`isPathUpdated`)
+
+현재 경로가 업데이트되었는지 확인하기 위해 `std::string`에 모든 pose 정보를 이어 붙인 후 해싱하고 있습니다. 이 방법은 몇 가지 잠재적인 약점을 가집니다.
+
+  * **성능:** 경로에 수천 개의 점이 포함된 경우, 매 tick마다 부동소수점 숫자를 문자열로 변환하고, 문자열을 계속해서 이어 붙이는 작업은 상당한 CPU 자원을 소모할 수 있습니다. `path_str.reserve()`를 사용하여 재할당을 최소화한 것은 좋은 시도이지만, 근본적인 변환 및 복사 오버헤드는 남아있습니다.
+  * **정밀도:** `std::to_string`은 부동소수점을 표현할 때 정밀도 손실이나 표현 방식의 차이를 유발할 수 있습니다. 의미적으로는 동일한 경로라 하더라도 아주 미세한 부동소수점 값의 차이(e.g., $1.234567$ vs $1.234568$)로 인해 다른 해시 값이 생성되어 불필요하게 인덱스 맵을 재생성할 수 있습니다.
+
+**개선 제안:**
+문자열 변환 없이 숫자 데이터 자체를 직접 해싱하는 것이 더 효율적이고 안정적입니다. `boost::hash_combine`과 유사한 방식을 직접 구현하거나 사용하여 각 pose의 숫자 값들을 조합해 하나의 해시 값을 만들 수 있습니다.
+
+```cpp
+// isPathUpdated 함수 내 수정 제안
+bool AdvancedRemovePassedGoals::isPathUpdated(const nav_msgs::msg::Path & path)
+{
+    // 숫자 데이터를 직접 해싱하는 방식
+    size_t new_hash = 0;
+    std::hash<double> hasher;
+    for (const auto & pose_stamped : path.poses) {
+        // boost::hash_combine과 유사한 로직
+        // https://www.boost.org/doc/libs/1_35_0/doc/html/boost/hash_combine_id241013.html
+        new_hash ^= hasher(pose_stamped.pose.position.x) + 0x9e3779b9 + (new_hash << 6) + (new_hash >> 2);
+        new_hash ^= hasher(pose_stamped.pose.position.y) + 0x9e3779b9 + (new_hash << 6) + (new_hash >> 2);
+        new_hash ^= hasher(pose_stamped.pose.orientation.z) + 0x9e3779b9 + (new_hash << 6) + (new_hash >> 2);
+        new_hash ^= hasher(pose_stamped.pose.orientation.w) + 0x9e3779b9 + (new_hash << 6) + (new_hash >> 2);
+    }
+
+    if (new_hash != last_path_hash_) {
+        last_path_hash_ = new_hash;
+        return true;
+    }
+    return false;
+}
+```
+
+#### 2\. Goal-Path 매핑의 순서 불일치 가능성 (`createWaypointIndexMapping`)
+
+`createWaypointIndexMapping` 함수는 각 `goal`에 대해 전체 경로에서 가장 가까운 점의 인덱스를 찾아 매핑합니다. 대부분의 경우 이 방식은 잘 동작하지만, 경로가 스스로를 교차하거나 매우 가까이 지나가는 경우(예: 클로버 모양 경로) 문제가 발생할 수 있습니다.
+
+예를 들어, 3번째 goal이 경로의 후반부(물리적으로는 가깝지만, 시간적으로는 먼)에 더 가까울 경우, 4번째 goal보다 더 큰 경로 인덱스에 매핑될 수 있습니다. `onRunning` 루프의 `break` 로직은 goal들이 경로 인덱스 순서대로 정렬되어 있다고 가정하므로, 이러한 매핑 오류는 goal 제거 로직을 조기에 중단시킬 수 있습니다.
+
+**개선 제안:**
+매핑을 생성할 때, 다음 goal의 경로 인덱스가 이전 goal의 경로 인덱스보다 크거나 같도록 강제하는 것이 좋습니다.
+
+```cpp
+void AdvancedRemovePassedGoals::createWaypointIndexMapping(
+  const nav_msgs::msg::Path & path,
+  const std::vector<geometry_msgs::msg::PoseStamped> & goals)
+{
+  waypoint_to_path_index_map_.clear();
+  if (path.poses.empty() || goals.empty()) {
+    return;
+  }
+
+  size_t last_found_path_index = 0; // 검색 시작 지점 추적
+  for (size_t i = 0; i < goals.size(); ++i) {
+    double min_dist_sq = std::numeric_limits<double>::max();
+    size_t best_index = last_found_path_index;
+
+    // 이전 goal이 매핑된 지점부터 검색을 시작하여 순서를 보장
+    for (size_t j = last_found_path_index; j < path.poses.size(); ++j) {
+      double dist_sq = nav2_util::geometry_utils::euclidean_distance_sq(
+        goals[i].pose, path.poses[j].pose);
+      if (dist_sq < min_dist_sq) {
+        min_dist_sq = dist_sq;
+        best_index = j;
+      }
+    }
+    waypoint_to_path_index_map_[i] = best_index;
+    last_found_path_index = best_index; // 다음 검색을 위해 시작 지점 업데이트
+    RCLCPP_DEBUG(logger_, "Mapped goal %zu to path index %zu", i, best_index);
+  }
+}
+```
+
+이 방식은 goal들이 경로를 따라 순차적으로 배치되어 있다는 가정을 강화하여 로직의 안정성을 높여줍니다.
+
+#### 3\. `onStart`에서 `initial_goals_` 초기화 시점
+
+`onStart`에서 `input_goals`를 `initial_goals_`로 저장하는 로직은 좋습니다. 하지만 `MapsThroughPoses` BT가 실행되는 동안 외부에서 목표가 변경되거나 하는 극히 드문 시나리오에서는 이 노드가 리셋되지 않는 한 `initial_goals_`가 갱신되지 않을 수 있습니다.
+
+**개선 제안:**
+현재 구조는 대부분의 `MapsThroughPoses` 구현에서 문제가 없습니다. 다만, 이 노드의 재사용성을 더 높이려면 `initial_goals_`와 `current_goals`의 불일치 여부를 감지하는 로직을 추가할 수 있습니다. 예를 들어, `current_goals`의 첫 번째 goal이 `initial_goals_`의 N번째 goal과 일치하는지 확인하는 등의 방어 코드를 추가하면 더 안전해집니다.
+
+현재 코드에서는 `initial_goals_passed` 계산이 이 역할을 어느 정도 수행하고 있으므로, 이는 심각한 버그라기보다는 견고성(robustness)을 더 높이기 위한 제안입니다.
+
+```cpp
+// onRunning 시작 부분에 추가할 수 있는 방어 코드 예시
+// ...
+if (current_goals.empty()) { /* ... */ }
+
+// current_goals가 initial_goals_의 부분 집합인지 확인
+size_t initial_goals_passed = initial_goals_.size() - current_goals.size();
+if (initial_goals_passed < initial_goals_.size()) {
+    // 두 포즈가 같은지 비교하는 함수가 필요 (e.g., 작은 오차 내에서)
+    if (!arePosesEqual(current_goals.front().pose, initial_goals_[initial_goals_passed].pose)) {
+        RCLCPP_WARN(logger_, "Mismatch between current goals and initial goals. Re-initializing.");
+        // 상태를 리셋하고 다시 시작하도록 유도
+        onStart(); 
+        // getInput을 다시 해야 할 수도 있음. 로직이 복잡해지므로 신중한 설계 필요.
+        return BT::NodeStatus::FAILURE; 
+    }
+}
+```
+
+다만 이 로직은 복잡성을 증가시키므로, 현재 사용 환경에서 문제가 없다면 굳이 추가할 필요는 없습니다.
+
+#### 4\. 사소한 개선점
+
+  * **입력 포트 타입:** `hysteresis_indices`는 음수 값을 가질 수 없으므로 BT 포트 정의에서 `BT::InputPort<int>` 대신 `BT::InputPort<unsigned int>`를 사용하는 것이 타입 안전성 측면에서 더 좋습니다. (BT.CPP가 `unsigned int`를 직접 지원하는지 확인 필요, 지원하지 않는다면 `int`로 받고 0보다 작은 값에 대한 경고/에러 처리를 추가)
+  * **변수명:** `initial_goals_passed`는 "이미 통과된 goal의 개수"를 의미하는데, 변수명만 보면 "초기 goal이 통과되었는지 여부"를 나타내는 boolean 값으로 오해할 수 있습니다. `num_goals_passed` 와 같이 좀 더 명확한 이름으로 바꾸는 것을 고려해볼 수 있습니다.
+
+-----
+
+### 결론
+
+전반적으로 이 BT 노드는 매우 잘 작성되었으며, 실제 주행 환경의 복잡성을 해결하기 위한 좋은 아이디어들로 가득 차 있습니다. 위에서 제안한 내용들은 현재 코드의 잠재적인 엣지 케이스(edge case)를 처리하고 성능을 개선하여 코드를 더욱 완벽하게 만들기 위한 것들입니다.
+
+특히 \*\*1번(경로 해싱)\*\*과 **2번(Goal-Path 매핑)** 항목을 수정하시면 성능과 안정성 측면에서 큰 이점을 얻을 수 있을 것입니다.
+
+훌륭한 코드를 작성하셨습니다\! 이 노드는 분명 `MapsThroughPoses`의 안정성을 크게 향상시킬 것입니다.
