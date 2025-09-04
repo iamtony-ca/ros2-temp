@@ -547,3 +547,163 @@ add_library(${PROJECT_NAME}_plugins SHARED
 ```
 
 이 코드는 사용자의 요구사항(`uint16 error_code`)을 정확히 반영하여 구현된 것입니다. 이제 프로젝트를 빌드하시면 `ErrorCodePublisherAction` 노드를 바로 사용하실 수 있습니다.
+
+
+
+
+
+
+네, 아주 좋은 질문이며 중요한 포인트를 정확히 짚어주셨습니다. 두 가지 질문에 대해 명확하게 답변해 드리고, 그에 맞게 코드를 수정해 드리겠습니다.
+
+### 질문 1: 타입 불일치 문제
+
+**결론부터 말씀드리면, 지적해주신 내용이 맞습니다.**
+
+`ComputePathThroughPosesAction`와 같은 Nav2의 노드들은 `error_code`를 `uint16_t` 타입으로 출력합니다. 제공해주신 코드의 `ActionResult::NONE` 역시 내부적으로 `uint16_t`로 정의된 enum 값입니다.
+
+제가 이전에 제공한 코드에서는 BT XML의 편의성을 위해 `InputPort`를 `int`로 만들었습니다. BehaviorTree.Cpp가 어느 정도 타입 변환을 해주기 때문에 동작할 수도 있지만, 이는 안전한 방법이 아니며 명시적으로 타입을 일치시키는 것이 훨씬 좋습니다.
+
+따라서 `ErrorCodePublisherAction`의 입력 포트 타입을 `int`에서 `uint16_t`로 변경하여 타입 불일치 문제를 원천적으로 해결하겠습니다.
+
+### 질문 2: "Empty" `error_code` 처리
+
+**네, 이 로직을 추가하는 것이 바람직합니다.**
+
+`ComputePathThroughPosesAction` 코드 예시에서 보셨듯이, 액션이 성공하거나 취소되었을 때는 에러 코드로 `ActionResult::NONE` (내부 값: `0`)을 출력합니다. 즉, `error_code`가 `0`이라는 것은 "에러가 없음"을 의미합니다.
+
+따라서 `ErrorCodePublisherAction`이 `error_code`로 `0`을 입력받았을 때는, 이를 "발행할 내용 없음"으로 간주하고 아무것도 발행하지 않은 채 `SUCCESS`를 반환하도록 로직을 수정하는 것이 맞습니다.
+
+-----
+
+### 수정된 전체 코드
+
+위 두 가지 요청 사항을 모두 반영하여 `ErrorCodePublisherAction` 코드를 다시 작성했습니다.
+
+#### `src/error_code_publisher_action.cpp` (수정된 파일)
+
+가장 큰 변경점은 `providedPorts()`와 `tick()` 함수에 있습니다.
+
+```cpp
+// src/error_code_publisher_action.cpp
+
+#include "amr_bt_nodes/error_code_publisher_action.hpp"
+#include <cstdint> // uint16_t 사용을 위해 추가
+
+namespace amr_bt_nodes
+{
+
+ErrorCodePublisherAction::ErrorCodePublisherAction(
+  const std::string & name,
+  const BT::NodeConfiguration & config)
+: BT::SyncActionNode(name, config)
+{
+  if (!getInput("node", node_)) {
+    throw BT::RuntimeError("[ErrorCodePublisherAction] Missing required input 'node'");
+  }
+
+  std::string topic_name;
+  getInput("topic_name", topic_name);
+  if (topic_name.empty()) {
+    topic_name = "/bt_error_code";
+    RCLCPP_WARN(
+      node_->get_logger(),
+      "[ErrorCodePublisherAction] 'topic_name' is not provided. Using default: '%s'", topic_name.c_str());
+  }
+
+  rclcpp::QoS qos_profile(10);
+  qos_profile.reliable();
+
+  publisher_ = node_->create_publisher<std_msgs::msg::UInt16>(topic_name, qos_profile);
+
+  RCLCPP_INFO(
+    node_->get_logger(),
+    "[ErrorCodePublisherAction] Created. Publishing to topic: '%s'", topic_name.c_str());
+}
+
+BT::PortsList ErrorCodePublisherAction::providedPorts()
+{
+  return {
+    BT::InputPort<rclcpp::Node::SharedPtr>("node", "The ROS 2 node."),
+    BT::InputPort<std::string>("topic_name", "/bt_error_code", "Topic name to publish the error code to."),
+    // 변경점 1: 입력 포트의 타입을 uint16_t로 명시적으로 변경하여 타입 안전성 확보
+    BT::InputPort<uint16_t>("error_code", "The uint16 error code to publish."),
+    BT::InputPort<int>("num_publishes", 1, "Number of times to publish the message.")
+  };
+}
+
+BT::NodeStatus ErrorCodePublisherAction::tick()
+{
+  uint16_t error_code_to_publish;
+  if (!getInput("error_code", error_code_to_publish)) {
+    RCLCPP_ERROR(node_->get_logger(), "[ErrorCodePublisherAction] Missing required input 'error_code'.");
+    return BT::NodeStatus::FAILURE;
+  }
+
+  // 변경점 2: error_code가 0 (ActionResult::NONE)이면, 발행하지 않고 SUCCESS 반환
+  if (error_code_to_publish == 0) {
+    RCLCPP_DEBUG(node_->get_logger(), "[ErrorCodePublisherAction] Error code is 0 (NONE), skipping publication.");
+    return BT::NodeStatus::SUCCESS;
+  }
+
+  int num_publishes;
+  if (!getInput("num_publishes", num_publishes) || num_publishes <= 0) {
+    RCLCPP_ERROR(node_->get_logger(), "[ErrorCodePublisherAction] 'num_publishes' must be a positive integer.");
+    return BT::NodeStatus::FAILURE;
+  }
+
+  std_msgs::msg::UInt16 msg;
+  msg.data = error_code_to_publish;
+
+  RCLCPP_INFO(
+    node_->get_logger(),
+    "[ErrorCodePublisherAction] Publishing error_code '%u' %d times.",
+    error_code_to_publish, num_publishes);
+
+  for (int i = 0; i < num_publishes; ++i) {
+    publisher_->publish(msg);
+  }
+
+  return BT::NodeStatus::SUCCESS;
+}
+
+} // namespace amr_bt_nodes
+
+#include "behaviortree_cpp/bt_factory.h"
+
+extern "C" void BT_RegisterNodesFromPlugin(BT::BehaviorTreeFactory &factory)
+{
+  factory.registerNodeType<amr_bt_nodes::ErrorCodePublisherAction>("ErrorCodePublisherAction");
+}
+```
+
+#### `include/amr_bt_nodes/error_code_publisher_action.hpp` (변경 없음)
+
+헤더 파일은 수정할 필요가 없습니다. `BT::InputPort<uint16_t>`를 사용하기 위해 `<cstdint>` 헤더가 필요하지만, 이는 `.cpp` 파일에만 포함하면 됩니다.
+
+-----
+
+### BT XML 사용 예시 (의도에 맞게 수정)
+
+이제 의도하신 대로, `ComputePathToPose` 같은 노드가 블랙보드에 `error_code_id`를 출력하면, `ErrorCodePublisherAction` 노드가 이 값을 입력으로 받아 처리할 수 있습니다.
+
+```xml
+<root main_tree_to_execute="MainTree">
+    <BehaviorTree ID="MainTree">
+        <Sequence>
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased" error_code_id="{error_code_id}"/>
+
+            <ErrorCodePublisherAction
+                topic_name="/robot_error"
+                error_code="{error_code_id}"
+                node="{ros_node}" />
+        </Sequence>
+    </BehaviorTree>
+</root>
+```
+
+이렇게 수정하면,
+
+1.  **타입 안전성**: 블랙보드를 통해 `uint16_t` 타입의 데이터가 그대로 전달되므로 타입 변환으로 인한 잠재적 위험이 사라집니다.
+2.  **의도된 로직**: 에러가 없을 때(`error_code`가 0일 때)는 불필요한 메시지를 발행하지 않으므로 BT의 흐름이 더 명확하고 효율적으로 됩니다.
+
+완벽하게 의도하신 대로 동작할 것입니다.
