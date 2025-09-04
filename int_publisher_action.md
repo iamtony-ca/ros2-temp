@@ -707,3 +707,115 @@ extern "C" void BT_RegisterNodesFromPlugin(BT::BehaviorTreeFactory &factory)
 2.  **의도된 로직**: 에러가 없을 때(`error_code`가 0일 때)는 불필요한 메시지를 발행하지 않으므로 BT의 흐름이 더 명확하고 효율적으로 됩니다.
 
 완벽하게 의도하신 대로 동작할 것입니다.
+
+
+
+
+네, 또다시 굉장히 중요한 실제적인 문제를 지적해주셨습니다. BT(Behavior Tree)에서는 노드의 실행 순서가 보장되지 않거나, 특정 경로가 실행되지 않아 블랙보드 변수가 아예 생성되지 않는 경우가 빈번하게 발생합니다.
+
+### 현재 코드의 문제점
+
+지적하신 대로, 현재 코드는 `ErrorCodePublisherAction`이 실행될 때 블랙보드에 `error_code`라는 키(key)가 존재하지 않으면 `getInput()` 함수가 `false`를 반환하고, 그 결과로 노드는 `FAILURE`를 반환하게 됩니다.
+
+```cpp
+// 현재 로직
+uint16_t error_code_to_publish;
+if (!getInput("error_code", error_code_to_publish)) { // 키가 없으면 false 반환
+  RCLCPP_ERROR(node_->get_logger(), "[ErrorCodePublisherAction] Missing required input 'error_code'.");
+  return BT::NodeStatus::FAILURE; // FAILURE로 종료
+}
+```
+
+### 의도하신 동작으로 수정
+
+의도하신 대로, 블랙보드에 `error_code` 키가 아직 없는 경우에도 **`FAILURE`가 아닌 `SUCCESS`를 반환하도록** 로직을 수정하는 것이 맞습니다. "아직 에러 코드가 없다"는 것을 "에러가 발생하지 않았다 (`error_code`가 0인 상태)"와 동일하게 취급하는 것입니다.
+
+이러한 수정은 BT를 훨씬 더 안정적이고 유연하게 만듭니다.
+
+-----
+
+### 수정된 코드
+
+`tick()` 함수 내부의 로직을 아래와 같이 변경하여 이 문제를 해결했습니다.
+
+#### `src/error_code_publisher_action.cpp` (수정된 파일)
+
+```cpp
+// src/error_code_publisher_action.cpp
+
+#include "amr_bt_nodes/error_code_publisher_action.hpp"
+#include <cstdint>
+
+namespace amr_bt_nodes
+{
+
+// ... 생성자와 providedPorts() 함수는 이전과 동일 ...
+ErrorCodePublisherAction::ErrorCodePublisherAction(
+  const std::string & name,
+  const BT::NodeConfiguration & config)
+: BT::SyncActionNode(name, config)
+{
+  // ... 생략 ...
+}
+
+BT::PortsList ErrorCodePublisherAction::providedPorts()
+{
+  // ... 생략 ...
+}
+
+
+BT::NodeStatus ErrorCodePublisherAction::tick()
+{
+  // 변경점: 변수를 0으로 먼저 초기화합니다.
+  // ActionResult::NONE (에러 없음) 상태를 기본값으로 설정합니다.
+  uint16_t error_code_to_publish = 0;
+
+  // getInput의 반환값을 체크하지 않습니다.
+  // 만약 블랙보드에 'error_code' 키가 있으면, error_code_to_publish 변수는 그 값으로 덮어써집니다.
+  // 만약 키가 없으면, 변수는 초기값인 0을 그대로 유지합니다.
+  getInput("error_code", error_code_to_publish);
+
+  // 이제 이 조건문 하나로 두 가지 경우를 모두 처리할 수 있습니다.
+  // 1. 블랙보드에 키가 없어서 error_code_to_publish가 0인 경우
+  // 2. 블랙보드에 키가 있고, 그 값이 0 (ActionResult::NONE)인 경우
+  if (error_code_to_publish == 0) {
+    RCLCPP_DEBUG(node_->get_logger(), "[ErrorCodePublisherAction] No valid error code (0 or not set). Skipping publication.");
+    return BT::NodeStatus::SUCCESS;
+  }
+
+  // 이후 로직은 동일합니다.
+  int num_publishes;
+  if (!getInput("num_publishes", num_publishes) || num_publishes <= 0) {
+    RCLCPP_ERROR(node_->get_logger(), "[ErrorCodePublisherAction] 'num_publishes' must be a positive integer.");
+    return BT::NodeStatus::FAILURE;
+  }
+
+  std_msgs::msg::UInt16 msg;
+  msg.data = error_code_to_publish;
+
+  RCLCPP_INFO(
+    node_->get_logger(),
+    "[ErrorCodePublisherAction] Publishing error_code '%u' %d times.",
+    error_code_to_publish, num_publishes);
+
+  for (int i = 0; i < num_publishes; ++i) {
+    publisher_->publish(msg);
+  }
+
+  return BT::NodeStatus::SUCCESS;
+}
+
+} // namespace amr_bt_nodes
+
+// ... 플러그인 등록 부분은 동일 ...
+```
+
+### 수정된 로직 설명
+
+1.  **`error_code_to_publish`를 `0`으로 초기화**: `tick()`이 시작될 때, `error_code`를 담을 변수를 '에러 없음' 상태인 `0`으로 미리 설정합니다.
+2.  **`getInput()`의 반환값 무시**: `getInput()`을 호출하되, 성공 여부(`true`/`false`)는 확인하지 않습니다.
+      - **성공 시**: 블랙보드에 `error_code` 키가 있다면, `error_code_to_publish` 변수는 해당 값으로 업데이트됩니다.
+      - **실패 시**: 블랙보드에 키가 없다면, 아무 일도 일어나지 않고 `error_code_to_publish` 변수는 초기값 `0`을 유지합니다.
+3.  **하나의 조건문으로 통합 처리**: `if (error_code_to_publish == 0)` 조건문이 이제 **(1) 키가 없는 경우**와 **(2) 키는 있지만 값이 0인 경우**를 모두 처리합니다. 두 경우 모두 발행하지 않고 `SUCCESS`를 반환하여 BT가 정상적으로 다음 노드로 진행할 수 있도록 합니다.
+
+이렇게 하면 노드의 실행 순서나 타이밍 문제에 훨씬 더 강건한(robust) BT 노드가 됩니다. 완벽하게 의도하신 대로 동작할 것입니다.
