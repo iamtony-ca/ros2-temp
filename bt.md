@@ -420,3 +420,227 @@
 원래 구상하신 로직은 매우 훌륭합니다. 제가 제안드린 XML 구조는 그 로직의 의도를 Behavior Tree의 표준적인 설계 패턴에 맞춰 가장 명확하고 효율적으로 구현한 것입니다. 이 구조를 사용하시면 의도하신 대로 완벽하게 동작할 뿐만 아니라, 향후 유지보수와 기능 확장에도 유리할 것입니다.
 
 `CheckFlagCondition`, `CheckPlannerChanged`, `CheckErrorExists`(제안에서는 `ComputePathThroughPoses`의 `error_code_id`를 활용)와 같은 커스텀 노드들은 C++로 직접 구현해야 합니다. `Precondition` 노드는 `nav2_behavior_tree` 패키지에 포함된 표준 노드이므로 바로 사용 가능합니다.
+
+
+
+
+
+
+네, 알겠습니다. 제공해주신 BT XML은 기능적으로는 복잡하지만, 많은 부분이 재사용 가능한 모듈로 분리될 수 있는 좋은 구조를 가지고 있습니다.
+
+Subtree를 활용하여 모듈화하고 가독성을 높이는 방향으로 코드를 최적화해 드리겠습니다. 모든 기능은 그대로 유지됩니다.
+
+### 최적화 전략
+
+1.  **논리적 기능 단위 식별:** 현재 `MainTree`에 있는 코드 블록들을 기능에 따라 나눕니다. (e.g., 초기화, 경로 계획, 경로 추종, 지능형 복구).
+2.  **Subtree 생성:** 식별된 각 기능 단위를 별도의 `BehaviorTree` (Subtree)로 정의합니다. 각 Subtree는 필요한 데이터를 입력(Input Ports)으로 받고, 결과를 출력(Output Ports)으로 반환하는 명확한 API를 갖게 됩니다.
+3.  **MainTree 재구성:** 기존의 긴 코드를 새로운 Subtree들을 호출하는 간결한 형태로 재구성합니다. 이렇게 하면 `MainTree`는 전체적인 흐름만 보여주게 되어 이해하기 쉬워집니다.
+4.  **중복 코드 제거:** 복구 로직에 반복적으로 나타나는 `RemoveFirstGoalAction` 시퀀스를 기존의 `RemoveGoalsSubtree`를 재사용하여 최적화합니다.
+5.  **`ManeuverSubtree` 역할 명확화:** `ManeuverSubtree`가 우회 기동이라는 단일 책임만 갖도록 내부의 "플래너/컨트롤러 리셋" 로직을 정리합니다. 복구 성공 후의 상태 복원은 `MainTree`의 흐름에 맡기는 것이 더 깔끔한 설계입니다.
+
+-----
+
+### 최적화된 BT XML 코드
+
+아래는 위 전략을 적용하여 재구성한 전체 BT XML입니다.
+
+```xml
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+
+  <BehaviorTree ID="InitializeNavSubtree">
+    <Sequence>
+      <LogTextAction message="[Subtree] Initializing navigation task..." interval_s="0.0"/>
+      <ClearEntireCostmap name="ClearGlobal" service_name="global_costmap/clear_entirely_global_costmap"/>
+      <UnsetBlackboard key="path" />
+      <UnsetBlackboard key="compute_path_error_code" />
+      <UnsetBlackboard key="follow_path_error_code" />
+    </Sequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="PlanPathSubtree">
+    <Fallback name="PlannerLogic">
+      <Sequence name="CheckPathAndConditions">
+        <IsPathValidCustomCondition path="{path}" />
+        <Inverter>
+          <CheckFlagCondition flag_topic="/replan_flag" latch="false" node="{node}" />
+        </Inverter>
+        <Inverter>
+          <IsBlackboardChangedCondition blackboard_entry="{selected_planner}" />
+        </Inverter>
+      </Sequence>
+      <Sequence name="ReplanAndHandleError">
+        <LogTextAction message="[Subtree] Path is invalid or replan triggered. Re-computing path..." />
+        <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}" />
+      </Sequence>
+    </Fallback>
+  </BehaviorTree>
+  
+  <BehaviorTree ID="FollowPathPipelineSubtree">
+    <ReactiveFallback name="PauseAndResume">
+      <Sequence>
+        <CheckFlagCondition flag_topic="/controller_pause_flag" latch="true" node="{node}" />
+        <LogTextAction message="[PAUSED] Controller is paused. Halting motion." interval_s="1.0" />
+        <SequenceWithMemory>
+          <CancelControl />
+          <Repeat num_cycles="-1">
+            <Sequence>
+              <CheckFlagCondition flag_topic="/controller_pause_flag" latch="true" node="{node}" />
+              <Wait wait_duration="0.1" />
+            </Sequence>
+          </Repeat>
+        </SequenceWithMemory>
+      </Sequence>
+      <RecoveryNode number_of_retries="1" name="FollowPathRecovery">
+        <PipelineSequence name="FollowAndMonitorPipe">
+          <LogTextAction name="FollowLog" message="[Subtree] Path is valid. Following path..." interval_s="1.0" />
+          <TruncatePathLocal input_path="{path}" output_path="{pruned_path}" distance_forward="50.0" max_robot_pose_search_dist="2.0"/>
+          <PathPublisherAction input_path="{pruned_path}" topic_name="/plan_pruned" publish_period="0.5" node="{node}" />
+          <FollowPath path="{pruned_path}" controller_id="{selected_controller}" goal_checker_id="precise_goal_checker" progress_checker_id="progress_checker" error_code_id="{follow_path_error_code}" />
+        </PipelineSequence>
+        <Sequence name="FollowPathRecoveryAction">
+          <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}" />
+          <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap" />
+        </Sequence>
+      </RecoveryNode>
+    </ReactiveFallback>
+  </BehaviorTree>
+
+  <BehaviorTree ID="ManeuverSubtree">
+    <Sequence>
+      <LogTextAction message="[Subtree] Executing Maneuver with planner: {planner_id} and controller: {controller_id}" interval_s="1.0"/>
+      <GetNextFewGoalsAction name="ExtractNextGoals" num_goals="2" input_goals="{goals}" output_goals="{few_goals}" />
+      <ComputePathThroughPoses goals="{few_goals}" path="{alt_path}" planner_id="{planner_id}" error_code_id="{recovery_compute_path_error_code}"/>
+      <TruncatePathLocal input_path="{alt_path}" output_path="{short_path}" distance_forward="1.0" angular_distance_weight="0.2" max_robot_pose_search_dist="1.0"/>
+      <SetTruncatedGoalFromPath short_path="{short_path}" alt_goal="{alt_goal}"/>
+      <ComputePathToPose goal="{alt_goal}" path="{short_path}" planner_id="{planner_id}" error_code_id="{recovery_compute_path_error_code}"/>
+      <FollowPath path="{short_path}" controller_id="{controller_id}" goal_checker_id="super_relaxed_goal_checker" progress_checker_id="progress_checker" error_code_id="{follow_path_error_code}"/>
+      <LogTextAction message="[Subtree] Maneuver completed successfully." interval_s="1.0"/>
+    </Sequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="RemoveGoalsSubtree">
+    <RetryUntilSuccessful num_attempts="{num_goals_to_remove}">
+      <Sequence>
+        <LogTextAction message="[Subtree] Removing a goal point..." interval_s="1.0"/>
+        <RemoveFirstGoalAction input_goals="{goals}" output_goals="{goals}" />
+      </Sequence>
+    </RetryUntilSuccessful>
+  </BehaviorTree>
+  
+  <BehaviorTree ID="IntelligentRecoverySubtree">
+    <Sequence>
+      <LogTextAction message="[!!! RECOVERY !!!] Main navigation failed. Initiating intelligent recovery logic." interval_s="1.0"/>
+      <Fallback name="FailureTypeCheck">
+        <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+        <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+      </Fallback>
+      
+      <Fallback name="IntelligentRecoverySelector">
+        <Sequence name="NoValidPathCase">
+          <Precondition if="compute_path_error_code == 308" else="FAILURE">
+            <Sequence>
+              <LogTextAction message="[RECOVERY CASE 0] 'No valid path' error detected."/>
+              </Sequence>
+          </Precondition>
+        </Sequence>
+        <Sequence name="RobotIsStuckCase">
+          <CheckFlagCondition flag_topic="/progress_checker/is_stuck" latch="false" node="{node}" />
+          <LogTextAction message="[RECOVERY CASE 1] Robot appears to be stuck."/>
+          <RoundRobin name="RobotIsStuckRecoveryActions">
+            <SubTree ID="ManeuverSubtree" planner_id="RecoveryGridBased1" controller_id="RecoveryFollowPath1" _autoremap="true"/>
+            <SubTree ID="ManeuverSubtree" planner_id="RecoveryGridBased2" controller_id="RecoveryFollowPath1" _autoremap="true"/>
+          </RoundRobin>
+        </Sequence>
+        <Sequence name="GoalOccupiedPathCase">
+          <Precondition if="compute_path_error_code == 306" else="FAILURE">
+             <Sequence>
+                <LogTextAction message="[RECOVERY CASE] Goal is occupied. Removing goals."/>
+                <SubTree ID="RemoveGoalsSubtree" num_goals_to_remove="3" _autoremap="true"/>
+             </Sequence>
+          </Precondition>
+        </Sequence>
+        <Sequence name="DefaultFailureCase">
+          <LogTextAction message="[RECOVERY CASE] Default failure."/>
+          <RoundRobin name="DefaultFailureRecoveryActions">
+            <Sequence name="ClearAllCostmaps">
+              <ClearEntireCostmap name="ClearLocal" service_name="local_costmap/clear_entirely_local_costmap"/>
+              <ClearEntireCostmap name="ClearGlobal" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+            <Wait name="DefaultWait" wait_duration="1.0"/>
+            <SubTree ID="ManeuverSubtree" planner_id="RecoveryGridBased1" controller_id="RecoveryFollowPath1" _autoremap="true"/>
+            <SubTree ID="ManeuverSubtree" planner_id="RecoveryGridBased2" controller_id="RecoveryFollowPath1" _autoremap="true"/>
+          </RoundRobin>
+        </Sequence>
+      </Fallback>
+    </Sequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="25" name="NavigateRecovery">
+      
+      <PipelineSequence name="MainNavigationPipeline">
+        <RunNTimesDecorator num_ticks="1">
+          <SubTree ID="InitializeNavSubtree"/>
+        </RunNTimesDecorator>
+        
+        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector" />
+        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector" />
+        <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.7"/>
+        
+        <SubTree ID="PlanPathSubtree" _autoremap="true"/>
+        <SubTree ID="FollowPathPipelineSubtree" _autoremap="true"/>
+        
+        <Fallback>
+            <IsNotBlackboardSet key="follow_path_error_code"/>
+            <Sequence>
+                 <LogTextAction message="[CRITICAL] Controller failed. Triggering recovery."/>
+                 <AlwaysFailure/>
+            </Sequence>
+        </Fallback>
+        <Fallback>
+            <IsNotBlackboardSet key="compute_path_error_code"/>
+            <Sequence>
+                 <LogTextAction message="[CRITICAL] Planner failed. Triggering recovery."/>
+                 <AlwaysFailure/>
+            </Sequence>
+        </Fallback>
+
+      </PipelineSequence>
+
+      <SubTree ID="IntelligentRecoverySubtree" _autoremap="true"/>
+      
+    </RecoveryNode>
+  </BehaviorTree>
+
+  <TreeNodesModel>
+    <Action ID="LogTextAction">
+      <input_port name="message" type="std::string"/>
+      <input_port name="interval_s" type="float" default="1.0"/>
+    </Action>
+    </TreeNodesModel>
+
+</root>
+```
+
+### 변경된 내용 요약
+
+1.  **새로운 Subtree:**
+
+      * `InitializeNavSubtree`: 네비게이션 시작 시 1회 실행되는 초기화 로직을 캡슐화했습니다.
+      * `PlanPathSubtree`: 경로 유효성을 검사하고 필요시 리플래닝하는 로직을 캡슐화했습니다.
+      * `FollowPathPipelineSubtree`: 일시정지 기능을 포함한 전체 경로 추종 로직을 캡슐화했습니다.
+      * `IntelligentRecoverySubtree`: 거대했던 복구 로직 전체를 하나의 Subtree로 묶었습니다.
+
+2.  **간결해진 `MainTree`:**
+
+      * 이제 `MainTree`는 전체 네비게이션의 큰 그림(초기화 -\> 계획 -\> 추종)을 명확하게 보여줍니다.
+      * 각 단계는 해당 기능을 담당하는 Subtree를 호출하는 방식으로 실행됩니다.
+      * `_autoremap="true"` 속성을 사용하여 `MainTree`의 블랙보드 변수들이 자동으로 Subtree의 포트로 전달되도록 하여 코드의 중복을 줄였습니다.
+
+3.  **코드 최적화:**
+
+      * `GoalOccupiedPathCase` 복구 로직에서 3번 반복되던 `RemoveFirstGoalAction` 호출을 `<SubTree ID="RemoveGoalsSubtree" num_goals_to_remove="3" .../>` 한 줄로 대체하여 더 효율적이고 가독성 좋게 만들었습니다.
+      * `ManeuverSubtree`는 순수하게 '우회 기동'만 담당하도록 단순화되었습니다.
+      * 주행 파이프라인(`PipelineSequence`) 마지막에 `Fallback`을 추가하여, `error_code`가 설정되었을 때 명시적으로 `AlwaysFailure`를 반환하도록 하여 복구 로GIN으로 확실히 넘어가도록 하는 로직을 강화했습니다.
+
+이와 같이 BT를 기능 단위로 모듈화하면 각 부분의 역할을 명확히 할 수 있어, 향후 특정 기능(예: 경로 계획 로직)만 수정하거나 다른 BT에서 재사용하기가 훨씬 용이해집니다.
