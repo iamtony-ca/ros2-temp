@@ -644,3 +644,363 @@ Subtree를 활용하여 모듈화하고 가독성을 높이는 방향으로 코�
       * 주행 파이프라인(`PipelineSequence`) 마지막에 `Fallback`을 추가하여, `error_code`가 설정되었을 때 명시적으로 `AlwaysFailure`를 반환하도록 하여 복구 로GIN으로 확실히 넘어가도록 하는 로직을 강화했습니다.
 
 이와 같이 BT를 기능 단위로 모듈화하면 각 부분의 역할을 명확히 할 수 있어, 향후 특정 기능(예: 경로 계획 로직)만 수정하거나 다른 BT에서 재사용하기가 훨씬 용이해집니다.
+
+
+
+
+
+```xml
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+
+  <!-- ===================================================== -->
+  <!-- Refactored Nav2 BT (v4):
+       - Consistent port names across subtrees for _autoremap
+       - Internal-only buffers use '_' prefix (no auto-remap)
+       - Output rename kept minimal; parents read canonical keys
+       - Reused logic factored into helper subtrees
+       - Behavior preserved; logs/IDs clarified where useful
+  -->
+  <!-- ===================================================== -->
+
+  <!-- ================= Common / Helper Subtrees ================= -->
+
+  <!-- 1) Initialization: run exactly once at session start -->
+  <BehaviorTree ID="InitSubtree">
+    <RunNTimesDecorator num_ticks="1" name="InitializingOnce">
+      <Sequence>
+        <LogTextAction message="Initializing..." interval_s="0.0"/>
+        <ClearEntireCostmap name="ClearGlobal@Init" service_name="global_costmap/clear_entirely_global_costmap"/>
+        <!-- Canonical keys cleared -->
+        <UnsetBlackboard key="path"/>
+        <UnsetBlackboard key="pruned_path"/>
+        <UnsetBlackboard key="compute_path_error_code"/>
+        <UnsetBlackboard key="follow_path_error_code"/>
+        <UnsetBlackboard key="obstructed_goals"/>
+        <UnsetBlackboard key="unoccupied_goals"/>
+      </Sequence>
+    </RunNTimesDecorator>
+  </BehaviorTree>
+
+  <!-- 2) Controller / Planner selectors (kept) -->
+  <BehaviorTree ID="SelectPluginsSubtree">
+    <Sequence>
+      <ControllerSelector selected_controller="{selected_controller}"
+        default_controller="FollowPath" topic_name="controller_selector"/>
+      <PlannerSelector selected_planner="{selected_planner}"
+        default_planner="GridBased" topic_name="planner_selector"/>
+    </Sequence>
+  </BehaviorTree>
+
+  <!-- 3) Path truncate & publish (internal buffer '_' for short version) -->
+  <BehaviorTree ID="TruncateAndPublishSubtree">
+    <Sequence>
+      <TruncatePathLocal
+        input_path="{path}"
+        output_path="{pruned_path}"
+        distance_forward="50.0"
+        distance_backward="0.0"
+        angular_distance_weight="0.2"
+        max_robot_pose_search_dist="2.0"
+        robot_frame="base_link"
+        transform_tolerance="0.3"/>
+
+      <!-- short variant is internal-only -->
+      <TruncatePathLocal
+        input_path="{pruned_path}"
+        output_path="{_truncated_short_path}"
+        distance_forward="3.0"
+        distance_backward="0.0"
+        angular_distance_weight="0.2"
+        max_robot_pose_search_dist="2.0"
+        robot_frame="base_link"
+        transform_tolerance="0.3"/>
+
+      <PathPublisherAction input_path="{pruned_path}" topic_name="/plan_pruned"
+        publish_period="0.5" node="{node}"/>
+      <PathPublisherAction input_path="{_truncated_short_path}" topic_name="/plan_truncated_short"
+        publish_period="0.5" node="{node}"/>
+    </Sequence>
+  </BehaviorTree>
+
+  <!-- 4) Clear local+global costmaps together -->
+  <BehaviorTree ID="ClearCostmapsPairSubtree">
+    <Sequence>
+      <ClearEntireCostmap name="ClearLocal@Pair"  service_name="local_costmap/clear_entirely_local_costmap"/>
+      <ClearEntireCostmap name="ClearGlobal@Pair" service_name="global_costmap/clear_entirely_global_costmap"/>
+    </Sequence>
+  </BehaviorTree>
+
+  <!-- 5) Gate: reuse valid path or replan (publishes error codes on failure) -->
+  <BehaviorTree ID="ReplanOrReusePathSubtree">
+    <Fallback name="PlannerLogic">
+      <!-- Keep path if valid && replan_flag=false && selected_planner unchanged -->
+      <Sequence name="CheckPathAndConditions">
+        <IsPathValidCustomCondition path="{path}"/>
+        <Inverter>
+          <CheckFlagCondition flag_topic="/replan_flag" latch="false" node="{node}"/>
+        </Inverter>
+        <Inverter>
+          <IsBlackboardChangedCondition blackboard_entry="{selected_planner}"/>
+        </Inverter>
+      </Sequence>
+
+      <!-- Otherwise compute path (with error publication on failure) -->
+      <Sequence name="ReplanAndHandleError">
+        <LogTextAction message="Path invalid or replan triggered. Re-computing path..."/>
+        <Fallback name="PlannerTryOrEscalate">
+          <ComputePathThroughPoses goals="{goals}" path="{path}"
+            planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+          <Sequence>
+            <LogTextAction message="[CRITICAL] Planner unrecoverable error: {compute_path_error_code}. Triggering recovery."/>
+            <ErrorCodePublisherAction topic_name="/bt_error_code" error_code="{compute_path_error_code}" node="{node}"/>
+            <ErrorCodePublisherAction topic_name="/bt_error_code" error_code="{follow_path_error_code}"  node="{node}"/>
+            <AlwaysFailure/>
+          </Sequence>
+        </Fallback>
+      </Sequence>
+    </Fallback>
+  </BehaviorTree>
+
+  <!-- 6) Pause/Resume + FollowPath (with recovery); relies on pruned_path from 3) -->
+  <BehaviorTree ID="FollowWithPauseAndRecoverySubtree">
+    <ReactiveFallback name="PauseAndResume">
+      <!-- PAUSE branch -->
+      <Sequence>
+        <CheckFlagCondition flag_topic="/controller_pause_flag" latch="true" node="{node}"/>
+        <LogTextAction message="[PAUSED] Controller paused. Halting motion." interval_s="1.0"/>
+        <SequenceWithMemory>
+          <CancelControl/>
+          <Repeat num_cycles="-1">
+            <Sequence>
+              <CheckFlagCondition flag_topic="/controller_pause_flag" latch="true" node="{node}"/>
+              <Wait wait_duration="0.1"/>
+            </Sequence>
+          </Repeat>
+        </SequenceWithMemory>
+      </Sequence>
+
+      <!-- FOLLOW branch with 1 retry recovery around controller -->
+      <RecoveryNode number_of_retries="1" name="FollowPathRecovery">
+        <PipelineSequence name="FollowAndMonitorPipe">
+          <LogTextAction name="FollowLog"
+            message="Path valid. Truncating, publishing, then following." interval_s="1.0"/>
+          <SubTree ID="TruncateAndPublishSubtree" _autoremap="true"/>
+          <Sequence>
+            <LogTextAction message="############ FollowPath #########"/>
+            <Fallback>
+              <FollowPath path="{pruned_path}" controller_id="{selected_controller}"
+                goal_checker_id="precise_goal_checker" progress_checker_id="progress_checker"
+                error_code_id="{follow_path_error_code}"/>
+              <Sequence>
+                <LogTextAction message="[CRITICAL] Controller unrecoverable error: {follow_path_error_code}. Triggering recovery."/>
+                <ErrorCodePublisherAction topic_name="/bt_error_code" error_code="{compute_path_error_code}" node="{node}"/>
+                <ErrorCodePublisherAction topic_name="/bt_error_code" error_code="{follow_path_error_code}"  node="{node}"/>
+                <AlwaysFailure/>
+              </Sequence>
+            </Fallback>
+          </Sequence>
+        </PipelineSequence>
+        <Sequence>
+          <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+          <ClearEntireCostmap name="ClearLocalCostmap@FollowCtx" service_name="local_costmap/clear_entirely_local_costmap"/>
+        </Sequence>
+      </RecoveryNode>
+    </ReactiveFallback>
+  </BehaviorTree>
+
+  <!-- 7) Remove N goals (reused routine) -->
+  <BehaviorTree ID="RemoveGoalsSubtree">
+    <RetryUntilSuccessful num_attempts="{num_goals_to_remove}">
+      <Sequence>
+        <LogTextAction message="[Subtree] Removing a goal point..." interval_s="1.0"/>
+        <RemoveFirstGoalAction input_goals="{goals}" remaining_goals="{goals}"/>
+      </Sequence>
+    </RetryUntilSuccessful>
+  </BehaviorTree>
+
+  <!-- 8) Maneuver routine (internals privatized with '_' prefix) -->
+  <BehaviorTree ID="ManeuverSubtree">
+    <Sequence>
+      <Sequence>
+        <LogTextAction message="[Subtree] Executing Maneuver with planner: {planner_id} and controller: {controller_id}" interval_s="1.0"/>
+        <GetNextFewGoalsAction name="ExtractNextGoals" num_goals="2" input_goals="{goals}" output_goals="{_few_goals}"/>
+        <ComputePathThroughPoses goals="{_few_goals}" path="{_alt_path}" planner_id="{planner_id}" error_code_id="{recovery_compute_path_error_code}"/>
+        <TruncatePathLocal
+          input_path="{_alt_path}"
+          output_path="{_short_path}"
+          distance_forward="1.0"
+          distance_backward="0.0"
+          angular_distance_weight="0.2"
+          max_robot_pose_search_dist="1.0"
+          robot_frame="base_link"
+          transform_tolerance="0.3"/>
+        <SetTruncatedGoalFromPath short_path="{_short_path}" alt_goal="{_alt_goal}"/>
+        <ComputePathToPose goal="{_alt_goal}" path="{_short_path}" planner_id="{planner_id}" error_code_id="{recovery_compute_path_error_code}"/>
+        <FollowPath path="{_short_path}" controller_id="{controller_id}" goal_checker_id="super_relaxed_goal_checker" progress_checker_id="progress_checker" error_code_id="{follow_path_error_code}"/>
+        <LogTextAction message="[Subtree] Maneuver completed successfully." interval_s="1.0"/>
+      </Sequence>
+
+      <!-- Reset selectors + single retry planner recovery (kept) -->
+      <Sequence name="ResetPlannersAndControllers">
+        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
+        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
+        <Wait wait_duration="1.0"/>
+        <RecoveryNode number_of_retries="1" name="ComputePathThroughPoses@Reset">
+          <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+          <Sequence>
+            <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap@ManeuverCtx" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+        </RecoveryNode>
+      </Sequence>
+    </Sequence>
+  </BehaviorTree>
+
+  <!-- 9) Intelligent recovery aggregator -->
+  <BehaviorTree ID="IntelligentRecoverySubtree">
+    <Sequence name="ShortRecoverySequenceTotal">
+      <LogTextAction message="[!!! RECOVERY !!!] Main navigation failed. Initiating intelligent recovery logic." interval_s="1.0"/>
+
+      <!-- Failure type check (for logging/branching) -->
+      <Fallback name="FailureTypeCheck">
+        <LogTextAction message="[!!! RECOVERY !!!] WouldAPlannerRecoveryHelp" interval_s="1.0"/>
+        <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+        <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+        <LogTextAction message="[!!! RECOVERY !!!] Done WouldAControllerRecoveryHelp" interval_s="1.0"/>
+      </Fallback>
+
+      <Fallback name="IntelligentRecoverySelector">
+
+        <!-- Case 0: No valid path (308) -->
+        <Sequence name="NoValidPathCase">
+          <Precondition if="compute_path_error_code == 308" else="FAILURE">
+            <Sequence>
+              <LogTextAction message="[RECOVERY CASE 0] 'No valid path' detected. Resolving..." interval_s="1.0"/>
+              <Fallback>
+                <!-- Goal occupied: wait / remove goals -->
+                <Sequence>
+                  <IsGoalsOccupiedCondition
+                    name="IsGoalSafe"
+                    goals="{goals}"
+                    costmap_topic="local_costmap/costmap_raw"
+                    occupied_cost_threshold="253"
+                    occupied_goals="{obstructed_goals}"
+                    unoccupied_goals="{unoccupied_goals}"/>
+                  <LogTextAction message=" -> Cause: Goal occupied. Waiting or removing goals." interval_s="1.0"/>
+                  <RoundRobin name="GoalOccupiedRecovery">
+                    <Wait name="WaitToClear" wait_duration="1.0"/>
+                    <SubTree ID="RemoveGoalsSubtree" _autoremap="true" num_goals_to_remove="3"/>
+                  </RoundRobin>
+                </Sequence>
+
+                <!-- Goal clear but path blocked: clear costmaps + maneuver -->
+                <Sequence>
+                  <LogTextAction message=" -> Cause: Path blocked but goal clear. Clearing costmaps + maneuver." interval_s="1.0"/>
+                  <RoundRobin name="PathBlockedRecovery">
+                    <SubTree ID="ClearCostmapsPairSubtree" _autoremap="true"/>
+                    <SubTree ID="ManeuverSubtree" _autoremap="true" planner_id="RecoveryGridBased1" controller_id="RecoveryFollowPath1"/>
+                  </RoundRobin>
+                </Sequence>
+              </Fallback>
+            </Sequence>
+          </Precondition>
+        </Sequence>
+
+        <!-- Case 1: Robot is stuck -->
+        <Sequence name="RobotIsStuckCase">
+          <CheckFlagCondition flag_topic="/progress_checker/is_stuck" latch="false" node="{node}"/>
+          <LogTextAction message="[RECOVERY CASE 1] Robot appears stuck. Executing maneuver." interval_s="1.0"/>
+          <RoundRobin name="RobotIsStuckRecoveryActions">
+            <SubTree ID="ManeuverSubtree" _autoremap="true" planner_id="RecoveryGridBased1" controller_id="RecoveryFollowPath1"/>
+            <SubTree ID="ManeuverSubtree" _autoremap="true" planner_id="RecoveryGridBased2" controller_id="RecoveryFollowPath1"/>
+          </RoundRobin>
+        </Sequence>
+
+        <!-- Case 2: Start occupied (305) -->
+        <Sequence name="StartOccupiedPathCase">
+          <Precondition if="compute_path_error_code == 305" else="FAILURE">
+            <Sequence>
+              <LogTextAction message="[RECOVERY CASE] 'StartOccupiedPathCase' detected. Trying maneuvers..." interval_s="1.0"/>
+              <RoundRobin name="StartOccupiedRecovery">
+                <SubTree ID="ManeuverSubtree" _autoremap="true" planner_id="RecoveryGridBased1" controller_id="RecoveryFollowPath1"/>
+                <SubTree ID="ManeuverSubtree" _autoremap="true" planner_id="RecoveryGridBased2" controller_id="RecoveryFollowPath1"/>
+              </RoundRobin>
+            </Sequence>
+          </Precondition>
+        </Sequence>
+
+        <!-- Case 3: Goal occupied (306) -->
+        <Sequence name="GoalOccupiedPathCase">
+          <Precondition if="compute_path_error_code == 306" else="FAILURE">
+            <Sequence>
+              <IsGoalsOccupiedCondition
+                name="IsGoalSafe"
+                goals="{goals}"
+                costmap_topic="local_costmap/costmap_raw"
+                occupied_cost_threshold="253"
+                occupied_goals="{obstructed_goals}"
+                unoccupied_goals="{unoccupied_goals}"/>
+              <LogTextAction message=" -> Cause: Goal occupied. Waiting or removing goals." interval_s="1.0"/>
+              <RoundRobin name="GoalOccupiedRecovery">
+                <Wait name="WaitToClear" wait_duration="1.0"/>
+                <SubTree ID="RemoveGoalsSubtree" _autoremap="true" num_goals_to_remove="3"/>
+              </RoundRobin>
+            </Sequence>
+          </Precondition>
+        </Sequence>
+
+        <!-- Default: general fallback recovery -->
+        <Sequence name="DefaultFailureCase">
+          <LogTextAction message="[RECOVERY CASE 2] Default failure. Running general recovery sequence." interval_s="1.0"/>
+          <RoundRobin name="DefaultFailureRecoveryActions">
+            <SubTree ID="ClearCostmapsPairSubtree" _autoremap="true"/>
+            <Wait name="DefaultWait" wait_duration="1.0"/>
+            <SubTree ID="ManeuverSubtree" _autoremap="true" planner_id="RecoveryGridBased1" controller_id="RecoveryFollowPath1"/>
+            <SubTree ID="ManeuverSubtree" _autoremap="true" planner_id="RecoveryGridBased2" controller_id="RecoveryFollowPath1"/>
+          </RoundRobin>
+        </Sequence>
+
+      </Fallback>
+    </Sequence>
+  </BehaviorTree>
+
+  <!-- =========================== Main Tree =========================== -->
+
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="25" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <SubTree ID="InitSubtree" _autoremap="true"/>
+        <SubTree ID="SelectPluginsSubtree" _autoremap="true"/>
+        <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.7"/>
+        <SubTree ID="ReplanOrReusePathSubtree" _autoremap="true"/>
+        <SubTree ID="FollowWithPauseAndRecoverySubtree" _autoremap="true"/>
+      </PipelineSequence>
+      <!-- On main failure, run the intelligent recovery bundle -->
+      <SubTree ID="IntelligentRecoverySubtree" _autoremap="true"/>
+    </RecoveryNode>
+  </BehaviorTree>
+
+  <!-- =================== Custom Node Model (kept) =================== -->
+
+  <TreeNodesModel>
+    <Action ID="LogTextAction">
+      <input_port name="message" type="std::string"/>
+      <input_port name="interval_s" type="float" default="1.0"/>
+      <input_port name="bb_key" type="std::string"/>
+    </Action>
+    <Condition ID="CheckIsStuck">
+      <!-- NOTE: Example signature placeholder; actual node ports defined in plugin -->
+      <input_port name="flag_topic" type="std::string" default="/progress_checker/is_stuck"/>
+      <input_port name="latch" type="bool" default="false"/>
+      <input_port name="node" type="rclcpp::Node::SharedPtr"/>
+    </Condition>
+    <Action ID="RemoveFirstGoalAction">
+      <input_port  name="input_goals"    type="Goals"/>
+      <output_port name="remaining_goals" type="Goals"/>
+    </Action>
+  </TreeNodesModel>
+
+</root>
+
+
+```
