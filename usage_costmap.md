@@ -1,130 +1,499 @@
-안녕하십니까? Nav2 및 ROS 2 전문가의 관점에서 질문에 답변해 드리겠습니다.
+네, `costmap_2d_publisher.cpp` 소스 코드를 제공해주셔서 감사합니다. 이 코드는 두 토픽의 차이점을 명확하게 설명하는 결정적인 증거를 담고 있습니다. 코드를 기반으로 두 토픽의 정체, 차이점, 그리고 어떤 것을 사용해야 하는지 명확히 설명해 드리겠습니다.
 
-질문하신 내용의 핵심은 `replan_monitor_node`가 경로상의 장애물을 감지하기 위해 `/global_costmap/costmap`과 `/global_costmap/costmap_raw` 중 어느 것을 구독해야 하는지, 그리고 그 이유는 무엇인지에 대한 것입니다. 매우 훌륭하고 중요한 질문입니다.
+다른 코드는 필요 없습니다. 이 파일 하나로 모든 것이 설명됩니다.
 
-결론부터 말씀드리면, 현재 코드에서 `/global_costmap/costmap` 토픽을 구독하는 것이 **올바른 선택**입니다. 질문자님께서 두 토픽의 차이점에 대해 인지하고 계신 것은 맞지만, 각 토픽의 정확한 역할과 데이터의 의미를 조금 더 명확히 하면 왜 `/global_costmap/costmap`이 정답인지 이해하실 수 있습니다.
+### 코드 분석을 통한 `/costmap`과 `/costmap_raw`의 진실
 
-두 토픽의 차이점을 자세히 설명해 드리겠습니다.
+두 토픽은 모두 동일한 원본 데이터, 즉 내부적으로 관리되는 `Costmap2D` 객체(`costmap_` 멤버 변수)로부터 생성됩니다. 하지만 발행(publish) 직전에 **서로 다른 가공 과정**을 거칩니다.
 
-### `/global_costmap/costmap`
+#### 1\. `/costmap` 토픽 (`nav_msgs::msg::OccupancyGrid` 타입)
 
-이 토픽은 Nav2의 Costmap 2D 패키지가 발행하는 **최종적이고 통합된(final, synthesized) 코스트맵**입니다. 이 코스트맵은 설정된 모든 레이어(Layer)의 데이터가 합쳐진 결과물입니다.
+이 토픽은 `prepareGrid()` 함수에서 생성되며, 가장 중요한 부분은 `cost_translation_table_`을 사용한 데이터 변환 과정입니다.
 
-  * **포함되는 내용**:
+**`Costmap2DPublisher` 생성자**를 보면 `cost_translation_table_`이 초기화됩니다.
 
-    1.  **Static Layer**: `map_server`로부터 받은 정적 지도 (`/map` 토픽).
-    2.  **Obstacle Layer(s)**: LiDAR, Depth Camera 등 센서 데이터로부터 감지된 동적/정적 장애물 정보.
-    3.  **Inflation Layer**: 모든 장애물 주변에 설정된 `inflation_radius`에 따라 생성된 '벌점(penalty)' 영역. 로봇이 장애물에 너무 가까이 붙지 않도록 유도하는 역할을 합니다.
-    4.  (필요 시) 기타 커스텀 레이어.
+```cpp
+// ... in constructor
+if (cost_translation_table_ == NULL) {
+    cost_translation_table_ = new char[256];
 
-  * **데이터 값의 의미**:
-    `nav_msgs/msg/OccupancyGrid` 메시지를 사용하지만, 데이터 값(`data` 필드)은 단순한 점유/비점유가 아닙니다. `costmap_2d`에서 정의된 특정 값들을 가집니다.
+    // special values:
+    cost_translation_table_[0] = 0;      // NO obstacle
+    cost_translation_table_[253] = 99;   // INSCRIBED obstacle
+    cost_translation_table_[254] = 100;  // LETHAL obstacle
+    cost_translation_table_[255] = -1;   // UNKNOWN
 
-      * `0`: **FREE\_SPACE** (완전히 자유로운 공간)
-      * `1` - `252`: **INSCRIBED\_INFLATED\_OBSTACLE** (Inflation 영역, 값이 클수록 장애물에 가까움)
-      * `253`: **LETHAL\_OBSTACLE** (실제 장애물이 차지하는 공간, 로봇의 중심이 위치할 수 없음)
-      * `254`: **NO\_INFORMATION** (알 수 없는 공간)
-      * `-1` (Unsigned char로는 `255`): **NO\_INFORMATION**와 동일하게 사용되기도 함.
+    // regular cost values scale the range 1 to 252 ... to fit into 1 to 98
+    for (int i = 1; i < 253; i++) {
+        cost_translation_table_[i] = static_cast<char>(1 + (97 * (i - 1)) / 251);
+    }
+}
+```
 
-  * **주요 사용처**:
+  * **핵심**: 이 코드는 Nav2 내부에서 사용하는 **0\~255 범위의 Cost 값**을 `OccupancyGrid` 표준 메시지에서 사용하는 **-1, 0\~100 범위로 변환(mapping)하는 규칙 테이블**입니다.
+  * **데이터 손실**: 특히 `1`부터 `252`까지의 세밀한 Inflation cost 값들을 `1`부터 `98`까지의 범위로 압축합니다. 이 과정에서 **데이터의 정밀도 손실이 발생**합니다.
 
-      * **Global Planner (e.g., `SmacPlanner`, `NavFn`)**: 이 코스트맵을 기반으로 최적의 경로를 계획합니다.
-      * **RViz 시각화**: 사용자가 현재 로봇이 인식하는 종합적인 환경을 시각적으로 확인하기 위해 사용합니다.
-      * **사용자 정의 노드 (e.g., `replan_monitor_node`)**: 경로가 실제로 유효한지, 장애물에 의해 막혔는지 등을 판단할 때 사용해야 하는 **기준 데이터**입니다.
+그리고 **`prepareGrid()` 함수**에서 이 변환 테이블을 사용합니다.
 
-### `/global_costmap/costmap_raw`
+```cpp
+// ... in prepareGrid()
+unsigned char * data = costmap_->getCharMap();
+for (unsigned int i = 0; i < grid_->data.size(); i++) {
+    grid_->data[i] = cost_translation_table_[data[i]];
+}
+```
 
-이 토픽은 이름에서 알 수 있듯이 "가공되지 않은" 코스트맵입니다. 정확히는 **`StaticLayer` 하나에 의해서만 생성된 코스트맵**을 의미합니다.
+  * **증거**: 원본 `costmap` 데이터(`data[i]`)를 `cost_translation_table_`을 이용해 변환한 뒤 메시지에 담고 있습니다.
 
-  * **포함되는 내용**:
-
-      * 오직 `map_server`가 제공하는 정적 지도 정보만 포함합니다.
-
-  * **데이터 값의 의미**:
-
-      * `map_server`가 발행하는 `/map` 토픽의 `OccupancyGrid` 값과 거의 동일합니다 (0: free, 100: occupied, -1: unknown).
-
-  * **주요 사용처**:
-
-      * 주로 디버깅 용도로 사용됩니다. `StaticLayer`가 지도를 제대로 불러오고 있는지 확인할 때 유용합니다.
-      * 이 코스트맵에는 **동적 장애물 정보나 Inflation 정보가 전혀 포함되어 있지 않습니다.**
-
-### 결론: 왜 `/global_costmap/costmap`이 맞는가?
-
-`replan_monitor_node`의 목적은 \*\*"현재 계획된 경로(`plan`)가 장애물에 의해 막혔는지"\*\*를 판단하는 것입니다. 여기서 '장애물'이란 정적인 벽뿐만 아니라, 센서에 의해 새롭게 감지된 사람, 박스 등의 동적 장애물과 그 주변의 위험지역(Inflation)까지 모두 포함해야 합니다.
-
-  * 만약 `/global_costmap/costmap_raw`를 구독한다면, `replan_monitor_node`는 오직 최초에 주어진 지도 상의 벽만 인지할 수 있습니다. 경로 상에 사람이 나타나거나 박스가 놓여 있어도 이를 전혀 감지하지 못하므로, Re-planning을 트리거할 수 없게 됩니다.
-  * 반면, `/global_costmap/costmap`을 구독하면 Global Planner가 경로 계획 시 사용하는 것과 **동일한 데이터**를 보게 됩니다. 따라서 경로 상의 특정 지점(`pose`)의 `cost` 값이 `cost_threshold_` (코드에서는 20) 이상인지 확인함으로써, 해당 경로가 Inflation 영역에 걸쳐 있거나 혹은 치명적인 장애물(Lethal Obstacle)에 의해 막혔는지를 정확히 판단할 수 있습니다.
-
-질문자님께서 `/global_costmap/costmap`이 RViz 시각화용이라고 생각하신 부분은 매우 합리적인 추론입니다. 실제로 RViz에서 가장 많이 확인하는 토픽이기 때문입니다. 하지만 이는 RViz가 '시각화'를 위해 이 토픽을 사용하는 것일 뿐, 이 토픽의 본질은 \*\*"Nav2 스택의 의사결정을 위한 최종 통합 환경 정보"\*\*라는 점을 기억하시면 좋습니다.
-
-따라서, 제공해주신 코드는 Nav2의 동작 원리에 맞게 올바르게 작성되었습니다.
+**결론**: `/costmap` 토픽은 RViz와 같은 표준 `OccupancyGrid` 시각화 도구와의 호환성을 위해 **원본 데이터를 가공하고 압축한, 정보 손실이 발생한 버전**입니다.
 
 -----
 
-#### 참고 자료
+#### 2\. `/costmap_raw` 토픽 (`nav2_msgs::msg::Costmap` 타입)
 
-  * **Nav2 Concepts - Costmaps**: [https://navigation.ros.org/concepts/index.html\#costmaps](https://www.google.com/search?q=https://navigation.ros.org/concepts/index.html%23costmaps)
-      * Nav2 공식 문서에서 Costmap이 어떻게 여러 레이어로부터 생성되는지에 대한 개념을 확인하실 수 있습니다.
-   
-
-
-네, 아주 예리한 관찰입니다. 두 노드가 유사한 작업을 하는 것처럼 보이지만 구독하는 코스트맵 토픽이 다른 데에는 명확한 **목적과 컨텍스트의 차이**가 있습니다.
-
-핵심적인 차이는 **'무엇을', '언제' 검사하는가**에 있습니다.
-
-  * **`ReplanMonitorNode`**: **"진행 중인 경로(Path)가 동적/정적 장애물을 포함한 위험 지역에 의해 막혔는가?"** 를 **실시간으로 감시**합니다.
-  * **`IsGoalsOccupiedCondition`**: **"목표 지점(Goal Pose)의 좌표가 근본적으로 도달 불가능한 위치(치명적 장애물 내부)에 있는가?"** 를 **탐색 시작 전 또는 목표 선택 시점에 확인**합니다.
-
-이러한 목적의 차이 때문에 구독하는 토픽과 로직이 달라집니다. `IsGoalsOccupiedCondition` 코드를 자세히 분석해 보겠습니다.
-
-### `IsGoalsOccupiedCondition` BT 노드의 목적과 로직 분석
-
-#### 1\. 노드의 역할: 목표 지점의 근본적인 유효성 검사 (Pre-condition Check)
-
-이 노드는 Behavior Tree에서 주로 사용되는 **조건(Condition) 노드**입니다. 즉, 내비게이션과 같은 실제 행동을 시작하기 전에 "주어진 목표 지점들이 유효한가?"를 미리 검사하는 역할을 합니다.
-
-예를 들어, 여러 개의 잠재적 목표 지점(`goals`) 리스트가 있을 때, 이 노드는 그중 어떤 것이 벽 안에 있거나 고정된 장애물 내부에 있는지 판별하여 `occupied_goals`와 `unoccupied_goals`로 분류합니다.
-
-#### 2\. 왜 `.../costmap_raw`를 사용하는가? (Inflation을 제외하려는 의도)
-
-이 노드의 가장 중요한 로직은 다음과 같습니다.
+이 토픽은 `prepareCostmap()` 함수에서 생성됩니다. 데이터 처리 과정을 주목해 주십시오.
 
 ```cpp
-if (costmap->getCost(mx, my) >= threshold)
+// ... in prepareCostmap()
+unsigned char * data = costmap_->getCharMap();
+memcpy(costmap_raw_->data.data(), data, costmap_raw_->data.size());
 ```
 
-여기서 `threshold`의 기본값은 `nav2_costmap_2d::LETHAL_OBSTACLE` (치명적 장애물, 값: 253) 입니다. 이는 **Inflation 영역을 검사에서 제외**하고, 오직 로봇이 절대로 위치할 수 없는 **물리적인 장애물 내부**인지만을 확인하겠다는 강한 의도를 보여줍니다.
+  * **핵심**: `memcpy` 함수를 사용합니다. 이는 메모리를 그대로 복사하는 함수로, **데이터 변환이나 가공을 전혀 하지 않습니다.**
+  * **데이터 보존**: Nav2 내부의 `Costmap2D`가 가진 0\~255 범위의 원본 cost 값을 **아무런 손실 없이 그대로** 메시지에 담습니다.
 
-만약 목표 지점이 벽 바로 옆(Inflation 영역 내부)에 있더라도, 그 지점 자체가 물리적으로 도달 가능한 공간이라면 " 점유되지 않았다(`unoccupied`)"고 판단해야 합니다. 왜냐하면 그 목표 지점까지 가는 경로는 Planner가 Inflation을 고려하여 안전하게 계획할 것이기 때문입니다. 목표 지점 자체가 벽돌 안쪽에이지만 않으면 됩니다.
+**결론**: `/costmap_raw` 토픽은 Nav2가 내부적으로 사용하는 **순수한(raw) costmap 데이터를 손실 없이 그대로 발행**한 버전입니다. 다른 알고리즘이나 노드가 Planner와 동일한 정보를 기반으로 계산을 수행할 수 있도록 하기 위함입니다.
 
-이러한 목적을 달성하기 위해 Inflation Layer가 합쳐지기 전의 Costmap, 즉 `costmap_raw`를 사용하는 것이 합리적일 수 있습니다.
+### 최종 비교 및 사용 가이드
 
-#### 3\. 왜 `local_costmap/...`이 기본값인가? (코드의 한계 또는 특정 의도)
-
-여기가 조금 미묘한 부분입니다. 코드의 기본값이 `local_costmap/costmap_raw`로 설정되어 있습니다.
-
-  * **일반적인 경우**: 표준 Nav2 설정에서 `local_costmap`은 `StaticLayer`를 비활성화하고 `ObstacleLayer`와 `InflationLayer`만 사용합니다. 따라서 `/local_costmap/costmap_raw` 토픽은 아예 발행되지 않을 수 있습니다. 정적 지도는 `global_costmap`이 관리하기 때문입니다.
-  * **코드의 의도 추정**: 이 코드를 작성한 개발자는 아마도 "로봇 주변의 정적 장애물 정보"를 확인하고 싶었을 수 있습니다. 하지만 더 일반적이고 올바른 접근 방식은 `/global_costmap/costmap_raw`를 구독하여 전체 정적 지도에 대해 목표 지점의 유효성을 검사하는 것입니다.
-  * **유연성**: 다행히 이 노드는 `costmap_topic`을 입력 포트(Input Port)로 받기 때문에, BT를 설계하는 사람이 필요에 따라 `/global_costmap/costmap_raw`, `/global_costmap/costmap`, 또는 `/local_costmap/costmap` 등으로 변경하여 사용할 수 있습니다. **기본값은 하나의 제안일 뿐, 절대적인 것이 아닙니다.**
-
-### 두 노드의 비교 요약
-
-| 항목 | `ReplanMonitorNode` | `IsGoalsOccupiedCondition` |
+| 항목 | `/costmap` | `/costmap_raw` |
 | :--- | :--- | :--- |
-| **주요 목적** | **경로의 실시간 유효성** 감시 | **목표 지점의 사전 유효성** 검사 |
-| **검사 대상** | 로봇이 따라갈 **경로(Path)** 전체 | 최종 **목표 지점(Goal Pose)** 좌표 |
-| **필요 정보** | 동적/정적 장애물 + **Inflation** | 주로 **정적/물리적 장애물** (Inflation 제외) |
-| **판단 기준** | 경로가 위험 지역(Inflation 포함)을 지나는가 | 목표 지점이 치명적 장애물(벽 등) 내부에 있는가 |
-| **권장 토픽** | `/global_costmap/costmap` | `/global_costmap/costmap_raw` |
-| **결과** | Re-planning 트리거 여부 결정 | 유효/무효 목표 지점 목록 분류 |
+| **토픽 이름** | `(global/local)_costmap/costmap` | `(global/local)_costmap/costmap_raw` |
+| **메시지 타입**| `nav_msgs::msg::OccupancyGrid` | `nav2_msgs::msg::Costmap` |
+| **데이터 범위**| -1 (Unknown), 0 (Free), 1-100 (Occupied) | 0-255 (Nav2 내부 Cost 값) |
+| **데이터 변환**| **변환 O (Lossy / 손실 압축)** | **변환 X (Lossless / 무손실)** |
+| **주요 목적**| **시각화 (RViz)**, 표준 `OccupancyGrid` 호환 | **알고리즘 연산**, 정밀한 의사결정 |
+| **데이터 정밀도**| 낮음 (Inflation 단계가 압축됨) | **높음 (원본 데이터)** |
 
-### 최종 결론
+### 결론: 어떤 것을 사용해야 하는가?
 
-`replan_monitor`는 주행 중 경로의 안전성을 확보해야 하므로 **Planner와 동일한 시각**, 즉 모든 정보가 통합된 `/global_costmap/costmap`을 봐야 합니다.
+**상황에 따라 명확하게 구분해서 사용해야 합니다.**
 
-반면, `IsGoalsOccupiedCondition`은 특정 좌표가 근본적으로 유효한 위치인지를 판단하는 것이 목적이므로, **Inflation을 제외한** `/global_costmap/costmap_raw`를 사용하여 물리적 장애물 내부인지만 확인하는 것이 더 적합한 경우가 많습니다.
+  * **`/costmap`을 사용해야 할 때:**
 
-코드에 `local_costmap/costmap_raw`가 기본값으로 설정된 것은 특정 상황을 가정한 것이거나 일반적이지 않은 설정일 수 있으며, 실제 사용 시에는 BT XML 파일에서 해당 노드의 `costmap_topic` 포트를 목적에 맞게 (`/global_costmap/costmap_raw` 등으로) 명시적으로 지정해주는 것이 좋습니다.
+      * 단순히 RViz에서 코스트맵을 **시각적으로 확인**하고 싶을 때.
+      * `OccupancyGrid` 메시지 타입만 지원하는 외부 툴과 연동할 때.
+      * Inflation의 세밀한 값은 필요 없고, "여기가 장애물인가 아닌가" 정도의 거친 정보만 필요할 때.
+
+  * **`/costmap_raw`를 사용해야 할 때:**
+
+      * **Nav2의 의사결정에 직접 관여하는 로직을 작성할 때 (가장 중요).**
+      * 질문자님의 `ReplanMonitorNode`, `IsGoalsOccupiedCondition` 노드처럼 경로/목표 지점의 cost를 직접 읽어와 임계값과 비교하는 경우.
+      * **Planner가 보는 것과 100% 동일한 데이터**를 기반으로 판단해야 할 때.
+      * Inflation cost 값의 미세한 차이를 구분해야 하는 정밀한 로직을 구현할 때.
+
+따라서, 질문자님께서 작성하신 두 노드(`ReplanMonitorNode`, `IsGoalsOccupiedCondition`)의 목적을 고려할 때, Planner와 동일한 기준으로 "위험도"를 판단해야 하므로 **데이터 손실이 없는 `/costmap_raw` 토픽을 구독하는 것이 항상 더 안전하고 올바른 선택**입니다.
 
 
+
+네, `costmap_2d_publisher.cpp` 코드 분석을 통해 얻은 새로운 정보를 바탕으로 두 노드의 코드를 다시 검토하고 최종 결론을 내려 드리겠습니다.
+
+### 핵심 원칙 재확인
+
+결정적인 사실은 이것입니다:
+
+  * **`/costmap` (OccupancyGrid)**: RViz 시각화를 위해 **데이터가 가공/압축된(손실된) 버전**.
+  * **`/costmap_raw` (Costmap)**: Planner와 같은 알고리즘이 사용하기 위한 **원본 데이터(무손실) 버전**.
+
+따라서, **Cost 값을 읽어와 어떤 로직에 따라 의사결정을 내리는 모든 노드는 반드시 `_raw` 토픽을 사용해야 합니다.**
+
+### 1\. `ReplanMonitorNode` 재검토
+
+  * **현재 코드의 문제점**:
+
+    ```cpp
+    costmap_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
+      "/global_costmap/costmap", rclcpp::QoS(10), std::bind(&ReplanMonitorNode::costmapCallback, this, std::placeholders::_1), sub_options);
+    ```
+
+    이 노드는 현재 `/global_costmap/costmap` 토픽을 구독하고 있습니다. 즉, **시각화용으로 가공된, 정보 손실이 발생한 데이터를 사용**하고 있습니다.
+
+  * **로직과의 불일치**:
+
+    ```cpp
+    if (cost >= cost_threshold_) { // cost_threshold_ = 20
+    ```
+
+    코드 내에서 cost 값이 20 이상인지를 확인하여 경로가 막혔다고 판단합니다. 하지만 `/costmap` 토픽의 데이터는 1\~252 범위의 Inflation Cost가 1\~98 범위로 압축되어 있습니다. 이로 인해 다음과 같은 심각한 문제가 발생합니다.
+
+    1.  **정확성 저하**: Planner가 위험하다고 판단하는 세밀한 Cost 값의 차이를 이 노드는 알 수 없습니다.
+    2.  **오작동 가능성**: `cost_threshold_` 값 20이 원래 Costmap에서 어떤 값에 해당하는지 정확히 알 수 없으므로, 너무 민감하게 또는 너무 둔감하게 Re-planning을 유발할 수 있습니다.
+
+  * **올바른 수정 방향**:
+    이 노드의 목적은 Planner와 동일한 기준으로 경로의 위험성을 판단하는 것입니다. 따라서 **반드시 `/global_costmap/costmap_raw` 토픽을 구독하도록 코드를 수정해야 합니다.**
+
+    **수정 예시:**
+
+    ```cpp
+    // 1. 메시지 타입을 nav2_msgs::msg::Costmap 으로 변경해야 합니다.
+    #include "nav2_msgs/msg/costmap.hpp" // 헤더 파일에 추가
+
+    // 2. 콜백 함수와 구독자 멤버 변수 타입 변경
+    // private:
+    //  void costmapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg); ->
+    void costmapCallback(const nav2_msgs::msg::Costmap::SharedPtr msg);
+    //  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr costmap_sub_; ->
+    rclcpp::Subscription<nav2_msgs::msg::Costmap>::SharedPtr costmap_sub_;
+    //  nav_msgs::msg::OccupancyGrid current_costmap_; ->
+    //  nav2_costmap_2d::Costmap2D current_costmap_; // Costmap2D 객체로 직접 관리하는 것이 더 효율적입니다.
+
+    // 3. 구독 부분 수정
+    costmap_sub_ = this->create_subscription<nav2_msgs::msg::Costmap>( // 타입 변경
+      "/global_costmap/costmap_raw", rclcpp::QoS(10), ...); // 토픽 이름 변경
+    ```
+
+### 2\. `IsGoalsOccupiedCondition` 재검토
+
+  * **현재 코드의 장점과 단점**:
+
+    ```cpp
+    // 기본 토픽 이름
+    costmap_topic = "local_costmap/costmap_raw";
+
+    // 구독
+    costmap_sub_ = node_->create_subscription<nav2_msgs::msg::Costmap>(
+      costmap_topic, qos, ...);
+    ```
+
+    이 노드는 기본적으로 `_raw` 토픽을 사용하고 `nav2_msgs::msg::Costmap` 메시지를 구독하므로, **데이터를 손실 없이 올바르게 받고 있습니다.** 이는 매우 잘 된 부분입니다. `LETHAL_OBSTACLE`(값 253)과 같이 특정 Cost 값을 정확하게 비교해야 하는 로직에 완벽하게 부합합니다.
+
+    **하지만, 기본 토픽 이름이 `local_costmap/costmap_raw`인 것은 대부분의 경우에 부적절합니다.**
+
+      * \*\*목표 지점(Goal)\*\*은 보통 로봇에서 멀리 떨어져 있어 `local_costmap`의 범위를 벗어납니다.
+      * 목표 지점이 물리적으로 불가능한 위치(예: 지도 상의 벽 내부)인지를 검사하려면 **전체 지도를 담고 있는 `global_costmap`을 봐야 합니다.**
+
+  * **올바른 사용법**:
+    이 노드의 코드는 수정할 필요가 없습니다. `costmap_topic`을 외부에서 주입받을 수 있도록 설계되었기 때문입니다.
+    대신, 이 BT 노드를 사용하는 **Behavior Tree XML 파일에서 토픽 이름을 명시적으로 `/global_costmap/costmap_raw`로 지정**해주어야 합니다.
+
+    **BT XML 사용 예시:**
+
+    ```xml
+    <IsGoalsOccupiedCondition
+        goals="{goals}"
+        occupied_goals="{occupied_goals}"
+        unoccupied_goals="{unoccupied_goals}"
+        costmap_topic="/global_costmap/costmap_raw" />
+    ```
+
+### 최종 결론 및 권장사항
+
+| 노드 이름 | 현재 구현 | 문제점 | **올바른 방향** |
+| :--- | :--- | :--- | :--- |
+| **`ReplanMonitorNode`** | `/global_costmap/costmap` (`OccupancyGrid`) 구독 | **잘못됨.** 시각화용 데이터를 사용해 Planner와 다른 기준으로 판단함. | **코드를 수정**하여 `/global_costmap/costmap_raw` (`Costmap`)를 구독해야 함. |
+| **`IsGoalsOccupiedCondition`** | `.../costmap_raw` (`Costmap`) 구독 | **올바름.** 무손실 데이터를 사용. (단, 기본 토픽 이름이 부적절) | 코드는 그대로 두고, **BT XML에서 토픽을 `/global_costmap/costmap_raw`로 지정**하여 사용해야 함. |
+
+요약하자면, 의사결정을 위한 로직에는 항상 **원본 데이터를 담고 있는 `_raw` 토픽을 사용하는 것이 철칙**입니다. `ReplanMonitorNode`는 이 원칙을 위배했으므로 반드시 수정되어야 하고, `IsGoalsOccupiedCondition`은 원칙을 잘 따랐으나 실제 사용 시 적절한 토픽을 지정해주는 주의가 필요합니다.
+
+
+
+
+네, `costmap_raw` 토픽을 사용하도록 `ReplanMonitorNode`의 전체 코드를 수정하여 제공해 드리겠습니다.
+
+수정된 코드는 Planner가 사용하는 원본 데이터를 직접 사용하므로 훨씬 더 정확하고 안정적으로 동작할 것입니다. 코드의 주요 변경 사항은 다음과 같습니다.
+
+### 주요 변경 사항 요약
+
+1.  **토픽 및 메시지 타입 변경**: `/global_costmap/costmap` (`nav_msgs::msg::OccupancyGrid`) 대신 `/global_costmap/costmap_raw` (`nav2_msgs::msg::Costmap`) 토픽을 구독합니다.
+2.  **내부 데이터 형식 변경**: 수신한 `Costmap` 메시지를 `nav2_costmap_2d::Costmap2D` 객체로 변환하여 내부적으로 관리합니다. 이를 통해 `worldToMap`, `getCost`와 같은 편리하고 안전한 유틸리티 함수를 사용할 수 있습니다.
+3.  **Costmap 콜백 로직 수정**: 메시지를 `Costmap2D` 객체로 역직렬화(deserialize)하는 로직을 구현합니다.
+4.  **Cost 계산 로직 수정**: 수동으로 월드 좌표를 맵 좌표로 변환하는 대신, `Costmap2D` 객체의 내장 함수를 사용하여 더 안정적이고 명확하게 Cost를 가져옵니다.
+
+-----
+
+### 수정된 코드 (`replan_monitor_node.hpp`)
+
+```cpp
+#ifndef REPLAN_MONITOR_NODE_HPP
+#define REPLAN_MONITOR_NODE_HPP
+
+#include "rclcpp/rclcpp.hpp"
+#include "nav_msgs/msg/path.hpp"
+#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "std_msgs/msg/bool.hpp"
+#include <unordered_map>
+#include <mutex>
+#include <cmath>
+#include <limits>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+
+// ADDED: nav2_costmap_2d와 nav2_msgs::msg::Costmap 헤더 포함
+#include "nav2_costmap_2d/costmap_2d.hpp"
+#include "nav2_msgs/msg/costmap.hpp"
+
+class ReplanMonitorNode : public rclcpp::Node {
+public:
+    ReplanMonitorNode();
+
+private:
+    void pathCallback(const nav_msgs::msg::Path::SharedPtr msg);
+    // CHANGED: 콜백 함수의 파라미터 타입 변경
+    void costmapCallback(const nav2_msgs::msg::Costmap::SharedPtr msg);
+    void evaluateReplanCondition();
+    bool getCurrentPoseFromTF(geometry_msgs::msg::Pose &pose_out);
+
+    // CHANGED: 구독자 타입 변경
+    rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
+    rclcpp::Subscription<nav2_msgs::msg::Costmap>::SharedPtr costmap_sub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr replan_pub_;
+    rclcpp::TimerBase::SharedPtr timer_;
+
+    nav_msgs::msg::Path current_path_;
+    // CHANGED: Costmap을 nav2_costmap_2d::Costmap2D 객체로 관리
+    std::shared_ptr<nav2_costmap_2d::Costmap2D> costmap_;
+    std::string costmap_frame_;
+
+    rclcpp::Time last_replan_time_;
+
+    std::unordered_map<int, rclcpp::Time> obstacle_seen_time_;
+    std::unordered_map<int, double> obstacle_distance_history_;
+    std::mutex data_mutex_;
+    size_t closest_index = 0;
+
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    std::string target_frame_ = "base_link";
+    std::string source_frame_ = "map";
+
+    // Parameters
+    double cooldown_sec_ = 1.0;
+    size_t blocked_threshold_ = 2;
+    double passed_pose_ignore_dist_ = 0.9;
+    double obstacle_duration_threshold_sec_ = 0.5;
+    double approach_threshold_dist_ = 0.1;
+    double max_speed_ = 0.5;
+    double lookahead_time_sec_ = 15;
+    double goal_ignore_radius_ = 0.2;
+    // NOTE: 이 값은 이제 0~255 스케일의 raw cost와 비교됩니다.
+    double cost_threshold_ = 20; // e.g., nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE (253) 보다 낮은 값
+    double immediate_block_dist_ = 0.7;
+    bool immediate_replan = false;
+};
+
+#endif // REPLAN_MONITOR_NODE_HPP
+```
+
+### 수정된 코드 (`replan_monitor_node.cpp`)
+
+```cpp
+#include "replan_monitor/replan_monitor_node.hpp"
+#include "nav2_costmap_2d/cost_values.hpp" // ADDED: LETHAL_OBSTACLE 등 cost 값 상수를 사용하기 위함
+
+ReplanMonitorNode::ReplanMonitorNode()
+: Node("replan_monitor_node") {
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+    rclcpp::SubscriptionOptions sub_options;
+    auto callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    sub_options.callback_group = callback_group;
+
+    path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
+        "/plan", rclcpp::QoS(10), std::bind(&ReplanMonitorNode::pathCallback, this, std::placeholders::_1), sub_options);
+
+    // CHANGED: 구독 토픽과 메시지 타입 변경
+    costmap_sub_ = this->create_subscription<nav2_msgs::msg::Costmap>(
+        "/global_costmap/costmap_raw", rclcpp::QoS(rclcpp::SystemDefaultsQoS()).transient_local().reliable(), 
+        std::bind(&ReplanMonitorNode::costmapCallback, this, std::placeholders::_1), sub_options);
+
+    replan_pub_ = this->create_publisher<std_msgs::msg::Bool>("/replan_flag", 10);
+
+    timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(500),
+        std::bind(&ReplanMonitorNode::evaluateReplanCondition, this));
+
+    last_replan_time_ = this->now();
+    RCLCPP_INFO(this->get_logger(), "ReplanMonitorNode initialized");
+}
+
+void ReplanMonitorNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg) {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    current_path_ = *msg;
+    closest_index = 0;
+    obstacle_seen_time_.clear();
+    obstacle_distance_history_.clear();
+}
+
+// CHANGED: 콜백 함수 전체 로직 변경
+void ReplanMonitorNode::costmapCallback(const nav2_msgs::msg::Costmap::SharedPtr msg) {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    // Costmap 메시지를 nav2_costmap_2d::Costmap2D 객체로 변환
+    costmap_ = std::make_shared<nav2_costmap_2d::Costmap2D>(
+        msg->metadata.size_x, msg->metadata.size_y,
+        msg->metadata.resolution, msg->metadata.origin.position.x,
+        msg->metadata.origin.position.y);
+    
+    // memcpy를 사용하여 원본 cost 데이터를 복사
+    unsigned char* char_map = costmap_->getCharMap();
+    memcpy(char_map, &msg->data[0], msg->data.size() * sizeof(unsigned char));
+    costmap_frame_ = msg->header.frame_id;
+}
+
+bool ReplanMonitorNode::getCurrentPoseFromTF(geometry_msgs::msg::Pose &pose_out) {
+    try {
+        geometry_msgs::msg::TransformStamped tf = tf_buffer_->lookupTransform(
+            source_frame_, target_frame_, tf2::TimePointZero, tf2::durationFromSec(0.1));
+
+        pose_out.position.x = tf.transform.translation.x;
+        pose_out.position.y = tf.transform.translation.y;
+        pose_out.position.z = tf.transform.translation.z;
+        pose_out.orientation = tf.transform.rotation;
+        return true;
+    } catch (const tf2::TransformException &ex) {
+        RCLCPP_WARN(this->get_logger(), "TF transform failed: %s", ex.what());
+        return false;
+    }
+}
+
+void ReplanMonitorNode::evaluateReplanCondition() {
+    std::unique_lock<std::mutex> lock(data_mutex_);
+
+    // 로컬 스코프에 costmap 포인터를 복사하여 안전하게 사용
+    auto costmap = costmap_;
+    if (current_path_.poses.empty() || !costmap) {
+        return;
+    }
+
+    geometry_msgs::msg::Pose current_pose;
+    if (!getCurrentPoseFromTF(current_pose)) {
+        return;
+    }
+
+    lock.unlock(); // TF 조회 후 뮤텍스 락 해제 (긴 계산 동안 다른 콜백 방해하지 않도록)
+
+    immediate_replan = false;
+    std_msgs::msg::Bool flag_msg;
+    flag_msg.data = false;
+
+    // ... (가장 가까운 경로점 찾는 로직은 동일)
+    size_t closest_index_start = (closest_index > 5) ? closest_index - 5 : 0;
+    double min_dist = std::numeric_limits<double>::max();
+    for (size_t i = closest_index_start; i < current_path_.poses.size(); ++i) {
+        const auto &p = current_path_.poses[i].pose;
+        double dx = p.position.x - current_pose.position.x;
+        double dy = p.position.y - current_pose.position.y;
+        double dist = std::hypot(dx, dy);
+        if (dist < min_dist) {
+            min_dist = dist;
+            this->closest_index = i; // Use member variable
+        }
+    }
+    
+    rclcpp::Time now = this->now();
+    double lookahead_distance = max_speed_ * lookahead_time_sec_;
+    const auto &goal_pose = current_path_.poses.back().pose;
+    if (!std::isfinite(goal_pose.position.x) || !std::isfinite(goal_pose.position.y)) return;
+    size_t blocked = 0;
+
+    for (size_t i = this->closest_index; i < current_path_.poses.size(); ++i) {
+        const auto &pose = current_path_.poses[i].pose;
+        double dist = std::hypot(pose.position.x - current_pose.position.x, pose.position.y - current_pose.position.y);
+        if (dist < passed_pose_ignore_dist_ || dist > lookahead_distance) continue;
+
+        double goal_dist = std::hypot(pose.position.x - goal_pose.position.x, pose.position.y - goal_pose.position.y);
+        if (goal_dist < goal_ignore_radius_) continue;
+
+        // CHANGED: Costmap2D 유틸리티를 사용하여 cost 값 획득
+        unsigned int mx, my;
+        if (!costmap->worldToMap(pose.position.x, pose.position.y, mx, my)) {
+            continue; // 경로가 costmap 밖에 있는 경우 무시
+        }
+        
+        unsigned char cost = costmap->getCost(mx, my);
+        int index = costmap->getIndex(mx, my); // 고유 식별을 위해 맵 인덱스 사용
+
+        if (cost >= cost_threshold_) {
+            if (dist < immediate_block_dist_) {
+                immediate_replan = true;
+            }
+            // ... (나머지 장애물 지속 시간 및 접근 감지 로직은 동일)
+            auto it = obstacle_seen_time_.find(index);
+            if (it == obstacle_seen_time_.end()) {
+                obstacle_seen_time_[index] = now;
+                obstacle_distance_history_[index] = dist;
+                continue;
+            }
+
+            rclcpp::Duration duration = now - it->second;
+            bool is_approaching = false;
+            if (obstacle_distance_history_.count(index)) {
+                double prev_dist = obstacle_distance_history_[index];
+                if (prev_dist - dist > approach_threshold_dist_) is_approaching = true;
+                obstacle_distance_history_[index] = dist;
+            }
+            
+            if (duration.seconds() >= obstacle_duration_threshold_sec_ && is_approaching) {
+                blocked++;
+            }
+        } else {
+            obstacle_seen_time_.erase(index);
+            obstacle_distance_history_.erase(index);
+        }
+
+        if (immediate_replan) {
+            flag_msg.data = true;
+            break; // 즉시 replan이므로 더 이상 검사할 필요 없음
+        }
+    }
+
+    // ... (replan 발행 로직은 거의 동일, last_replan_time_ 접근 시 뮤텍스 필요)
+    lock.lock(); // 멤버 변수 접근 전 다시 락
+    if (flag_msg.data || (blocked >= blocked_threshold_ && (now - last_replan_time_).seconds() > cooldown_sec_)) {
+        flag_msg.data = true;
+        last_replan_time_ = now;
+        replan_pub_->publish(flag_msg);
+        if (immediate_replan) {
+            RCLCPP_WARN(this->get_logger(), "Triggering replan: immediate block detected.");
+        } else {
+            RCLCPP_WARN(this->get_logger(), "Triggering replan: %zu path points consistently blocked.", blocked);
+        }
+    }
+}
+```
+
+### `cost_threshold_` 파라미터에 대한 중요 정보
+
+이제 코드는 0\~255 범위의 원본 cost 값을 사용합니다. 따라서 `cost_threshold_` 파라미터의 의미가 달라졌습니다.
+
+  * `0`: `FREE_SPACE`
+  * `1` \~ `252`: `INSCRIBED_INFLATED_OBSTACLE` (Inflation 영역, 숫자가 클수록 장애물에 가까움)
+  * `253`: `LETHAL_OBSTACLE` (실제 장애물)
+  * `254`: `NO_INFORMATION` (알 수 없는 영역)
+
+기존의 `cost_threshold_ = 20`은 inflation 영역의 낮은 cost 구역을 의미합니다. 이는 여전히 유효할 수 있지만, 이제는 `nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE` (253)과 같은 명시적인 값을 기준으로 파라미터를 설정하는 것을 고려할 수 있습니다. 예를 들어, 로봇의 내접 반경(inscribed radius)이 닿는 영역부터 replan을 고려하고 싶다면 `cost_threshold_`를 `253`에 가깝게 설정할 수 있습니다.
+
+### 빌드 설정 업데이트
+
+이 코드를 빌드하려면 `nav2_msgs` 패키지에 대한 의존성을 추가해야 합니다.
+
+**`package.xml`**
+
+```xml
+<depend>nav2_msgs</depend>
+```
+
+**`CMakeLists.txt`**
+
+```cmake
+find_package(nav2_msgs REQUIRED)
+# ...
+ament_target_dependencies(replan_monitor_node
+  # ... other dependencies
+  nav2_msgs
+)
+```
+
+이제 이 코드는 Nav2 Planner와 동일한 데이터를 사용하여 훨씬 더 정확하게 Re-planning 시점을 결정할 수 있습니다.
