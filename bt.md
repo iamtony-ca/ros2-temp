@@ -1373,3 +1373,348 @@ Subtree를 활용하여 모듈화하고 가독성을 높이는 방향으로 코�
 
 이렇게 해두면 Groot/로그에서 **브랜치와 실패 지점을 바로 식별**하기 좋아지고, 런타임 프로파일링·디버깅이 수월해져.
 더 바꾸고 싶은 네이밍 스타일(예: 접두사 규칙, 스네이크/카멜) 있으면 말해줘—한 번에 전체 리네이밍 맞춰줄게.
+
+
+
+
+
+###########
+
+```xml
+<root BTCPP_format="4" main_tree_to_execute="MainTree">  <!-- ===================================================== -->  <!-- Optimized & Parameterized Nav2 BT (v4) – 2025-09-10
+       - Replaced hardcoded literals with blackboard-driven cfg.* keys
+       - Kept private temps (_*) and immediate Unset for memory hygiene
+       - Added descriptive names for introspection
+       - Behavior preserved
+  -->  <!-- ===================================================== -->  <!-- ========================== Config ========================== -->  <!-- Central place to define tunables / topics / services / IDs -->  <BehaviorTree ID="ConfigSubtree">
+    <RunNTimesDecorator num_ticks="1" name="ConfigOnce">
+      <Sequence name="Config">
+        <!-- rates -->
+        <SetBlackboard name="Cfg-replan-hz"      output_key="{cfg.replan_hz}"      value="5.0"/>
+        <!-- truncation & geometry -->
+        <SetBlackboard name="Cfg-trunc-fwd-long" output_key="{cfg.trunc_forward_long}" value="50.0"/>
+        <SetBlackboard name="Cfg-trunc-fwd-short"output_key="{cfg.trunc_forward_short}"value="3.0"/>
+        <SetBlackboard name="Cfg-ang-weight"     output_key="{cfg.angular_weight}"  value="0.2"/>
+        <SetBlackboard name="Cfg-search-long"    output_key="{cfg.search_dist_long}" value="2.0"/>
+        <SetBlackboard name="Cfg-search-short"   output_key="{cfg.search_dist_short}"value="2.0"/>
+        <SetBlackboard name="Cfg-search-maneuver"output_key="{cfg.search_dist_mnv}"  value="1.0"/>
+        <SetBlackboard name="Cfg-robot-frame"    output_key="{cfg.robot_frame}"      value="base_link"/>
+        <SetBlackboard name="Cfg-tf-tol"         output_key="{cfg.tf_tolerance}"     value="0.3"/>
+        <!-- publishers -->
+        <SetBlackboard name="Cfg-pub-period"     output_key="{cfg.publish_period}"   value="0.5"/>
+        <SetBlackboard name="Cfg-topic-pruned"   output_key="{cfg.topic_pruned}"     value="/plan_pruned"/>
+        <SetBlackboard name="Cfg-topic-short"    output_key="{cfg.topic_short}"      value="/plan_truncated_short"/>
+        <!-- services -->
+        <SetBlackboard name="Cfg-srv-clear-local"  output_key="{cfg.srv_clear_local}"  value="local_costmap/clear_entirely_local_costmap"/>
+        <SetBlackboard name="Cfg-srv-clear-global" output_key="{cfg.srv_clear_global}" value="global_costmap/clear_entirely_global_costmap"/>
+        <!-- waits -->
+        <SetBlackboard name="Cfg-wait-pause"     output_key="{cfg.wait_pause}"       value="0.1"/>
+        <SetBlackboard name="Cfg-wait-default"   output_key="{cfg.wait_default}"     value="1.0"/>
+        <!-- filters / radii -->
+        <SetBlackboard name="Cfg-remove-radius"  output_key="{cfg.remove_passed_radius}" value="0.7"/>
+        <!-- occupancy check -->
+        <SetBlackboard name="Cfg-costmap-topic"  output_key="{cfg.costmap_topic}"    value="local_costmap/costmap_raw"/>
+        <SetBlackboard name="Cfg-occupied-th"    output_key="{cfg.occupied_threshold}" value="253"/>
+        <!-- controller/planner defaults -->
+        <SetBlackboard name="Cfg-def-controller" output_key="{cfg.def_controller}"   value="FollowPath"/>
+        <SetBlackboard name="Cfg-def-planner"    output_key="{cfg.def_planner}"      value="GridBased"/>
+        <SetBlackboard name="Cfg-recov-planner-A" output_key="{cfg.recov_planner_A}" value="RecoveryGridBased1"/>
+        <SetBlackboard name="Cfg-recov-planner-B" output_key="{cfg.recov_planner_B}" value="RecoveryGridBased2"/>
+        <SetBlackboard name="Cfg-recov-controller"output_key="{cfg.recov_controller}" value="RecoveryFollowPath1"/>
+        <!-- checker IDs -->
+        <SetBlackboard name="Cfg-goal-checker"   output_key="{cfg.goal_checker}"     value="precise_goal_checker"/>
+        <SetBlackboard name="Cfg-progress-checker"output_key="{cfg.progress_checker}" value="progress_checker"/>
+        <SetBlackboard name="Cfg-relaxed-checker" output_key="{cfg.relaxed_checker}" value="super_relaxed_goal_checker"/>
+        <!-- error code constants -->
+        <SetBlackboard name="Cfg-err-no-valid"   output_key="{cfg.err_no_valid}"     value="308"/>
+        <SetBlackboard name="Cfg-err-start-occ"  output_key="{cfg.err_start_occ}"    value="305"/>
+        <SetBlackboard name="Cfg-err-goal-occ"   output_key="{cfg.err_goal_occ}"     value="306"/>
+      </Sequence>
+    </RunNTimesDecorator>
+  </BehaviorTree>  <!-- ================= Common / Helper Subtrees ================= -->  <!-- 1) Initialization: run exactly once at session start -->  <BehaviorTree ID="InitSubtree">
+    <RunNTimesDecorator num_ticks="1" name="InitializingOnce">
+      <Sequence name="InitSequence">
+        <LogTextAction name="InitLog" message="Initializing..." interval_s="0.0"/>
+        <ClearEntireCostmap name="ClearGlobal@Init" service_name="{cfg.srv_clear_global}"/>
+        <!-- Canonical keys cleared -->
+        <UnsetBlackboard name="Unset-path" key="path"/>
+        <UnsetBlackboard name="Unset-pruned_path" key="pruned_path"/>
+        <UnsetBlackboard name="Unset-compute_path_error_code" key="compute_path_error_code"/>
+        <UnsetBlackboard name="Unset-follow_path_error_code" key="follow_path_error_code"/>
+        <UnsetBlackboard name="Unset-obstructed_goals" key="obstructed_goals"/>
+        <UnsetBlackboard name="Unset-unoccupied_goals" key="unoccupied_goals"/>
+        <!-- Defensive clear for any leftover private temps from prior runs -->
+        <UnsetBlackboard name="Unset-priv-truncated_short" key="_truncated_short_path"/>
+        <UnsetBlackboard name="Unset-priv-few_goals" key="_few_goals"/>
+        <UnsetBlackboard name="Unset-priv-alt_path" key="_alt_path"/>
+        <UnsetBlackboard name="Unset-priv-short_path" key="_short_path"/>
+        <UnsetBlackboard name="Unset-priv-alt_goal" key="_alt_goal"/>
+      </Sequence>
+    </RunNTimesDecorator>
+  </BehaviorTree>  <!-- 2) Controller / Planner selectors (parameterized defaults) -->  <BehaviorTree ID="SelectPluginsSubtree">
+    <Sequence name="SelectPlugins">
+      <ControllerSelector name="SelectController" selected_controller="{selected_controller}"
+        default_controller="{cfg.def_controller}" topic_name="controller_selector"/>
+      <PlannerSelector name="SelectPlanner" selected_planner="{selected_planner}"
+        default_planner="{cfg.def_planner}" topic_name="planner_selector"/>
+    </Sequence>
+  </BehaviorTree>  <!-- 3) Path truncate & publish (internal short-path is private and cleared) -->  <BehaviorTree ID="TruncateAndPublishSubtree">
+    <Sequence name="TruncateAndPublish">
+      <TruncatePathLocal name="TruncateLong"
+        input_path="{path}"
+        output_path="{pruned_path}"
+        distance_forward="{cfg.trunc_forward_long}"
+        distance_backward="0.0"
+        angular_distance_weight="{cfg.angular_weight}"
+        max_robot_pose_search_dist="{cfg.search_dist_long}"
+        robot_frame="{cfg.robot_frame}"
+        transform_tolerance="{cfg.tf_tolerance}"/><TruncatePathLocal name="TruncateShort"
+    input_path="{pruned_path}"
+    output_path="{_truncated_short_path}"
+    distance_forward="{cfg.trunc_forward_short}"
+    distance_backward="0.0"
+    angular_distance_weight="{cfg.angular_weight}"
+    max_robot_pose_search_dist="{cfg.search_dist_short}"
+    robot_frame="{cfg.robot_frame}"
+    transform_tolerance="{cfg.tf_tolerance}"/>
+
+  <PathPublisherAction name="PubPrunedPlan" input_path="{pruned_path}" topic_name="{cfg.topic_pruned}"
+    publish_period="{cfg.publish_period}" node="{node}"/>
+  <PathPublisherAction name="PubShortPlan" input_path="{_truncated_short_path}" topic_name="{cfg.topic_short}"
+    publish_period="{cfg.publish_period}" node="{node}"/>
+  <UnsetBlackboard name="Unset-priv-truncated_short@TP" key="_truncated_short_path"/>
+</Sequence>
+
+  </BehaviorTree>  <!-- 4) Clear local+global costmaps together -->  <BehaviorTree ID="ClearCostmapsPairSubtree">
+    <Sequence name="ClearCostmapsPair">
+      <ClearEntireCostmap name="ClearLocal@Pair"  service_name="{cfg.srv_clear_local}"/>
+      <ClearEntireCostmap name="ClearGlobal@Pair" service_name="{cfg.srv_clear_global}"/>
+    </Sequence>
+  </BehaviorTree>  <!-- 5) Gate: reuse valid path or replan (publishes error codes on failure) -->  <BehaviorTree ID="ReplanOrReusePathSubtree">
+    <Fallback name="PlannerLogic">
+      <Sequence name="CheckPathAndConditions">
+        <IsPathValidCustomCondition name="IsPathValid" path="{path}"/>
+        <Inverter name="NotReplanFlag">
+          <CheckFlagCondition name="ReplanFlag" flag_topic="/replan_flag" latch="false" node="{node}"/>
+        </Inverter>
+        <Inverter name="NotPlannerChanged">
+          <IsBlackboardChangedCondition name="PlannerChanged" blackboard_entry="{selected_planner}"/>
+        </Inverter>
+      </Sequence><Sequence name="ReplanAndHandleError">
+    <UnsetBlackboard name="Unset-compute_err@replan" key="compute_path_error_code"/>
+    <LogTextAction name="ReplanLog" message="Path invalid or replan triggered. Re-computing path..."/>
+    <Fallback name="PlannerTryOrEscalate">
+      <ComputePathThroughPoses name="ComputePathThroughPoses-Main" goals="{goals}" path="{path}"
+        planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+      <Sequence name="PlannerEscalate">
+        <LogTextAction name="PlannerCriticalLog" message="[CRITICAL] Planner unrecoverable error: {compute_path_error_code}. Triggering recovery."/>
+        <ErrorCodePublisherAction name="PubPlannerError" topic_name="/bt_error_code" error_code="{compute_path_error_code}" node="{node}"/>
+        <ErrorCodePublisherAction name="PubFollowError"  topic_name="/bt_error_code" error_code="{follow_path_error_code}"  node="{node}"/>
+        <AlwaysFailure name="ForceFailure@Planner"/>
+      </Sequence>
+    </Fallback>
+  </Sequence>
+</Fallback>
+
+  </BehaviorTree>  <!-- 6) Pause/Resume + FollowPath (with recovery) -->  <BehaviorTree ID="FollowWithPauseAndRecoverySubtree">
+    <ReactiveFallback name="PauseAndResume">
+      <Sequence name="PauseBranch">
+        <CheckFlagCondition name="PauseFlag" flag_topic="/controller_pause_flag" latch="true" node="{node}"/>
+        <LogTextAction name="PausedLog" message="[PAUSED] Controller paused. Halting motion." interval_s="1.0"/>
+        <SequenceWithMemory name="PauseHold">
+          <CancelControl name="CancelControl"/>
+          <Repeat name="PauseLoop" num_cycles="-1">
+            <Sequence name="PausePoll">
+              <CheckFlagCondition name="PauseFlagLatched" flag_topic="/controller_pause_flag" latch="true" node="{node}"/>
+              <Wait name="PauseSleep" wait_duration="{cfg.wait_pause}"/>
+            </Sequence>
+          </Repeat>
+        </SequenceWithMemory>
+      </Sequence><RecoveryNode number_of_retries="1" name="FollowPathRecovery">
+    <PipelineSequence name="FollowAndMonitorPipe">
+      <LogTextAction name="FollowLog" message="Path valid. Truncating, publishing, then following." interval_s="1.0"/>
+      <SubTree name="TP-Subtree" ID="TruncateAndPublishSubtree" _autoremap="true"/>
+      <Sequence name="FollowSequence">
+        <UnsetBlackboard name="Unset-follow_err@follow" key="follow_path_error_code"/>
+        <LogTextAction name="FollowBanner" message="############ FollowPath #########"/>
+        <Fallback name="TryFollow">
+          <FollowPath name="FollowPath-Main" path="{pruned_path}" controller_id="{selected_controller}"
+            goal_checker_id="{cfg.goal_checker}" progress_checker_id="{cfg.progress_checker}"
+            error_code_id="{follow_path_error_code}"/>
+          <Sequence name="ControllerEscalate">
+            <LogTextAction name="ControllerCriticalLog" message="[CRITICAL] Controller unrecoverable error: {follow_path_error_code}. Triggering recovery."/>
+            <ErrorCodePublisherAction name="PubPlannerError@Follow" topic_name="/bt_error_code" error_code="{compute_path_error_code}" node="{node}"/>
+            <ErrorCodePublisherAction name="PubFollowError@Follow"  topic_name="/bt_error_code" error_code="{follow_path_error_code}"  node="{node}"/>
+            <AlwaysFailure name="ForceFailure@Controller"/>
+          </Sequence>
+        </Fallback>
+      </Sequence>
+    </PipelineSequence>
+    <Sequence name="FollowRecoveryCtx">
+      <WouldAControllerRecoveryHelp name="WouldControllerHelp" error_code="{follow_path_error_code}"/>
+      <ClearEntireCostmap name="ClearLocalCostmap@FollowCtx" service_name="{cfg.srv_clear_local}"/>
+    </Sequence>
+  </RecoveryNode>
+</ReactiveFallback>
+
+  </BehaviorTree>  <!-- 7) Remove N goals (reused routine) -->  <BehaviorTree ID="RemoveGoalsSubtree">
+    <RetryUntilSuccessful name="RemoveGoalsRetry" num_attempts="{num_goals_to_remove}">
+      <Sequence name="RemoveGoalsSeq">
+        <LogTextAction name="RemoveGoalLog" message="[Subtree] Removing a goal point..." interval_s="1.0"/>
+        <RemoveFirstGoalAction name="RemoveFirstGoal" input_goals="{goals}" remaining_goals="{goals}"/>
+      </Sequence>
+    </RetryUntilSuccessful>
+  </BehaviorTree>  <!-- 8) Maneuver routine (internals privatized with '_' prefix + cleaned after use) -->  <BehaviorTree ID="ManeuverSubtree">
+    <Sequence name="ManeuverSeq">
+      <Sequence name="ManeuverCore">
+        <LogTextAction name="ManeuverLog" message="[Subtree] Executing Maneuver with planner: {planner_id} and controller: {controller_id}" interval_s="1.0"/>
+        <GetNextFewGoalsAction name="ExtractNextGoals" num_goals="2" input_goals="{goals}" output_goals="{_few_goals}"/>
+        <UnsetBlackboard name="Unset-recovery_compute_err" key="recovery_compute_path_error_code"/>
+        <ComputePathThroughPoses name="ComputeAltPath" goals="{_few_goals}" path="{_alt_path}" planner_id="{planner_id}" error_code_id="{recovery_compute_path_error_code}"/>
+        <TruncatePathLocal name="TruncateAltShort"
+          input_path="{_alt_path}"
+          output_path="{_short_path}"
+          distance_forward="1.0"
+          distance_backward="0.0"
+          angular_distance_weight="{cfg.angular_weight}"
+          max_robot_pose_search_dist="{cfg.search_dist_mnv}"
+          robot_frame="{cfg.robot_frame}"
+          transform_tolerance="{cfg.tf_tolerance}"/>
+        <SetTruncatedGoalFromPath name="EmitAltGoal" short_path="{_short_path}" alt_goal="{_alt_goal}"/>
+        <ComputePathToPose name="ComputeShortToAltGoal" goal="{_alt_goal}" path="{_short_path}" planner_id="{planner_id}" error_code_id="{recovery_compute_path_error_code}"/>
+        <UnsetBlackboard name="Unset-follow_err@maneuver" key="follow_path_error_code"/>
+        <FollowPath name="FollowShort" path="{_short_path}" controller_id="{controller_id}" goal_checker_id="{cfg.relaxed_checker}" progress_checker_id="{cfg.progress_checker}" error_code_id="{follow_path_error_code}"/>
+        <LogTextAction name="ManeuverDoneLog" message="[Subtree] Maneuver completed successfully." interval_s="1.0"/>
+        <!-- Free private temps immediately -->
+        <UnsetBlackboard name="Unset-priv-few_goals@M" key="_few_goals"/>
+        <UnsetBlackboard name="Unset-priv-alt_path@M" key="_alt_path"/>
+        <UnsetBlackboard name="Unset-priv-short_path@M" key="_short_path"/>
+        <UnsetBlackboard name="Unset-priv-alt_goal@M" key="_alt_goal"/>
+      </Sequence><Sequence name="ResetPlannersAndControllers">
+    <ControllerSelector name="SelectController@Reset" selected_controller="{selected_controller}" default_controller="{cfg.def_controller}" topic_name="controller_selector"/>
+    <PlannerSelector name="SelectPlanner@Reset" selected_planner="{selected_planner}" default_planner="{cfg.def_planner}" topic_name="planner_selector"/>
+    <Wait name="ResetWait" wait_duration="{cfg.wait_default}"/>
+    <RecoveryNode number_of_retries="1" name="PlannerRecovery@Reset">
+      <UnsetBlackboard name="Unset-compute_err@reset" key="compute_path_error_code"/>
+      <ComputePathThroughPoses name="ComputePath-Reset" goals="{goals}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+      <Sequence name="ResetRecoveryCtx">
+        <WouldAPlannerRecoveryHelp name="WouldPlannerHelp@Reset" error_code="{compute_path_error_code}"/>
+        <ClearEntireCostmap name="ClearGlobalCostmap@ManeuverCtx" service_name="{cfg.srv_clear_global}"/>
+      </Sequence>
+    </RecoveryNode>
+  </Sequence>
+</Sequence>
+
+  </BehaviorTree>  <!-- 9) Intelligent recovery aggregator -->  <BehaviorTree ID="IntelligentRecoverySubtree">
+    <Sequence name="ShortRecoverySequenceTotal">
+      <LogTextAction name="RecoveryBanner" message="[!!! RECOVERY !!!] Main navigation failed. Initiating intelligent recovery logic." interval_s="1.0"/><Fallback name="FailureTypeCheck">
+    <LogTextAction name="WouldPlannerHelpBanner" message="[!!! RECOVERY !!!] WouldAPlannerRecoveryHelp" interval_s="1.0"/>
+    <WouldAPlannerRecoveryHelp name="WouldPlannerHelp" error_code="{compute_path_error_code}"/>
+    <WouldAControllerRecoveryHelp name="WouldControllerHelp" error_code="{follow_path_error_code}"/>
+    <LogTextAction name="DoneWouldController" message="[!!! RECOVERY !!!] Done WouldAControllerRecoveryHelp" interval_s="1.0"/>
+  </Fallback>
+
+  <Fallback name="IntelligentRecoverySelector">
+
+    <Sequence name="NoValidPathCase">
+      <Precondition name="NoValidPathPrecondition" if="compute_path_error_code == {cfg.err_no_valid}" else="FAILURE">
+        <Sequence name="NoValidPathActions">
+          <LogTextAction name="NoValidPathLog" message="[RECOVERY CASE 0] 'No valid path' detected. Resolving..." interval_s="1.0"/>
+          <Fallback name="NoValidPathResolution">
+            <Sequence name="GoalOccupiedBranch">
+              <IsGoalsOccupiedCondition
+                name="IsGoalSafe"
+                goals="{goals}"
+                costmap_topic="{cfg.costmap_topic}"
+                occupied_cost_threshold="{cfg.occupied_threshold}"
+                occupied_goals="{obstructed_goals}"
+                unoccupied_goals="{unoccupied_goals}"/>
+              <LogTextAction name="GoalOccupiedLog" message=" -> Cause: Goal occupied. Waiting or removing goals." interval_s="1.0"/>
+              <RoundRobin name="GoalOccupiedRecovery">
+                <Wait name="WaitToClear" wait_duration="{cfg.wait_default}"/>
+                <SubTree name="RemoveGoals-3" ID="RemoveGoalsSubtree" _autoremap="true" num_goals_to_remove="3"/>
+              </RoundRobin>
+            </Sequence>
+
+            <Sequence name="PathBlockedBranch">
+              <LogTextAction name="PathBlockedLog" message=" -> Cause: Path blocked but goal clear. Clearing costmaps + maneuver." interval_s="1.0"/>
+              <RoundRobin name="PathBlockedRecovery">
+                <SubTree name="ClearPair" ID="ClearCostmapsPairSubtree" _autoremap="true"/>
+                <SubTree name="Maneuver-PlanA" ID="ManeuverSubtree" _autoremap="true" planner_id="{cfg.recov_planner_A}" controller_id="{cfg.recov_controller}"/>
+              </RoundRobin>
+            </Sequence>
+          </Fallback>
+        </Sequence>
+      </Precondition>
+    </Sequence>
+
+    <Sequence name="RobotIsStuckCase">
+      <CheckFlagCondition name="IsStuckFlag" flag_topic="/progress_checker/is_stuck" latch="false" node="{node}"/>
+      <LogTextAction name="RobotStuckLog" message="[RECOVERY CASE 1] Robot appears stuck. Executing maneuver." interval_s="1.0"/>
+      <RoundRobin name="RobotIsStuckRecoveryActions">
+        <SubTree name="Maneuver-PlanA@Stuck" ID="ManeuverSubtree" _autoremap="true" planner_id="{cfg.recov_planner_A}" controller_id="{cfg.recov_controller}"/>
+        <SubTree name="Maneuver-PlanB@Stuck" ID="ManeuverSubtree" _autoremap="true" planner_id="{cfg.recov_planner_B}" controller_id="{cfg.recov_controller}"/>
+      </RoundRobin>
+    </Sequence>
+
+    <Sequence name="StartOccupiedPathCase">
+      <Precondition name="StartOccupiedPrecondition" if="compute_path_error_code == {cfg.err_start_occ}" else="FAILURE">
+        <Sequence name="StartOccupiedActions">
+          <LogTextAction name="StartOccupiedLog" message="[RECOVERY CASE] 'StartOccupiedPathCase' detected. Trying maneuvers..." interval_s="1.0"/>
+          <RoundRobin name="StartOccupiedRecovery">
+            <SubTree name="Maneuver-PlanA@Start" ID="ManeuverSubtree" _autoremap="true" planner_id="{cfg.recov_planner_A}" controller_id="{cfg.recov_controller}"/>
+            <SubTree name="Maneuver-PlanB@Start" ID="ManeuverSubtree" _autoremap="true" planner_id="{cfg.recov_planner_B}" controller_id="{cfg.recov_controller}"/>
+          </RoundRobin>
+        </Sequence>
+      </Precondition>
+    </Sequence>
+
+    <Sequence name="GoalOccupiedPathCase">
+      <Precondition name="GoalOccupiedPrecondition" if="compute_path_error_code == {cfg.err_goal_occ}" else="FAILURE">
+        <Sequence name="GoalOccupiedActions">
+          <IsGoalsOccupiedCondition
+            name="IsGoalSafe@GoalCase"
+            goals="{goals}"
+            costmap_topic="{cfg.costmap_topic}"
+            occupied_cost_threshold="{cfg.occupied_threshold}"
+            occupied_goals="{obstructed_goals}"
+            unoccupied_goals="{unoccupied_goals}"/>
+          <LogTextAction name="GoalOccupiedLog2" message=" -> Cause: Goal occupied. Waiting or removing goals." interval_s="1.0"/>
+          <RoundRobin name="GoalOccupiedRecovery2">
+            <Wait name="WaitToClear2" wait_duration="{cfg.wait_default}"/>
+            <SubTree name="RemoveGoals-3@GoalCase" ID="RemoveGoalsSubtree" _autoremap="true" num_goals_to_remove="3"/>
+          </RoundRobin>
+        </Sequence>
+      </Precondition>
+    </Sequence>
+
+    <Sequence name="DefaultFailureCase">
+      <LogTextAction name="DefaultFailureLog" message="[RECOVERY CASE 2] Default failure. Running general recovery sequence." interval_s="1.0"/>
+      <RoundRobin name="DefaultFailureRecoveryActions">
+        <SubTree name="ClearPair@Default" ID="ClearCostmapsPairSubtree" _autoremap="true"/>
+        <Wait name="DefaultWait" wait_duration="{cfg.wait_default}"/>
+        <SubTree name="Maneuver-PlanA@Default" ID="ManeuverSubtree" _autoremap="true" planner_id="{cfg.recov_planner_A}" controller_id="{cfg.recov_controller}"/>
+        <SubTree name="Maneuver-PlanB@Default" ID="ManeuverSubtree" _autoremap="true" planner_id="{cfg.recov_planner_B}" controller_id="{cfg.recov_controller}"/>
+      </RoundRobin>
+    </Sequence>
+
+  </Fallback>
+</Sequence>
+
+  </BehaviorTree>  <!-- =========================== Main Tree =========================== -->  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="25" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <SubTree name="Config" ID="ConfigSubtree" _autoremap="true"/>
+        <SubTree name="Init" ID="InitSubtree" _autoremap="true"/>
+        <SubTree name="SelectPlugins" ID="SelectPluginsSubtree" _autoremap="true"/>
+        <RemovePassedGoals name="CullPassedGoals" input_goals="{goals}" output_goals="{goals}" radius="{cfg.remove_passed_radius}"/>
+        <RateController name="ReplanGateRate" hz="{cfg.replan_hz}">
+          <SubTree name="ReplanOrReuse" ID="ReplanOrReusePathSubtree" _autoremap="true"/>
+        </RateController>
+        <SubTree name="FollowWithPauseAndRecovery" ID="FollowWithPauseAndRecoverySubtree" _autoremap="true"/>
+      </PipelineSequence>
+      <SubTree name="IntelligentRecovery" ID="IntelligentRecoverySubtree" _autoremap="true"/>
+    </RecoveryNode>
+  </BehaviorTree></root>
+
+```
