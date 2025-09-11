@@ -465,3 +465,126 @@ voxel_ptr->weight = weight;
       - 따라서, 측정된 표면 뒤쪽으로 **최대 12 복셀 두께에 해당하는 복셀들**이 `(4)번` 조건문을 통과하고, `(6)번` 로직에 의해 **모두 음(-)의 TSDF 값을 할당받게 됩니다.**
 
 결과적으로, `truncation_distance_vox`를 늘리는 것은 **'occupied'로 간주될 영역의 두께를 직접적으로 확장**하는 효과를 가져옵니다. 이전에는 'Unknown' 그림자 영역이었던 공간의 일부가, 이제는 명시적으로 '장애물의 일부(occupied)'로 재구성되는 것입니다. 이것이 개발자님께서 파라미터 조정 시 장애물 뒤 영역의 사이즈가 변경되는 것을 관찰하신 현상의 정확한 코드 레벨의 이유입니다.
+
+#########################
+
+네, 2025년 9월 12일 금요일 새벽 1시 50분, 개발자님의 깊은 기술적 호기심을 해결해 드리기 위해, **값이 저장되고 코드 모듈 간에 전달되는 C++ 메커니즘**에 초점을 맞추어 코드 기반으로 더욱 상세하게 설명해 드리겠습니다.
+
+YAML 파일의 텍스트가 GPU의 연산에 사용되기까지, 값은 여러 C++ 객체와 함수를 거치며 '저장'되고 '전달'됩니다. 이 과정을 한 단계씩 따라가 보겠습니다.
+
+-----
+
+### 1단계: 값의 탄생과 첫 번째 저장 (객체에 값 할당)
+
+**파일:** `nvblox_ros/src/lib/mapper_initialization.cpp`
+
+이 단계에서는 ROS 파라미터 서버로부터 온 값을 임시 C++ 구조체(struct)에 저장합니다.
+
+```cpp
+// 함수: MapperParams getMapperParamsFromROS(...)
+
+// (A) MapperParams 라는 지역 변수(객체) 생성
+MapperParams params;
+
+// ...
+
+// (B) set_parameter 함수 호출
+set_parameter<float>(
+    mapper_name, kProjectiveIntegratorTruncationDistanceVoxParamDesc.name,
+    // (C) 람다 함수(Lambda Function) 전달
+    [&](auto value) {
+        // (D) 멤버 변수에 값 할당 (Assignment)
+        params.projective_integrator_params.projective_integrator_truncation_distance_vox = value;
+    }, node);
+
+// ...
+
+// (E) 값이 채워진 객체를 반환 (Return by Value)
+return params;
+```
+
+**상세 설명:**
+
+  - **(A) `MapperParams params;`**: `getMapperParamsFromROS` 함수가 시작될 때, 모든 파라미터를 담을 `MapperParams` 타입의 객체 `params`가 스택(stack) 메모리에 생성됩니다. 지금은 비어있는 상태입니다.
+
+  - **(B) `set_parameter<...>`**: 이 템플릿 함수는 ROS 파라미터 서버에 접근하여 `"static_mapper.projective_integrator_truncation_distance_vox"`라는 이름의 값을 찾아옵니다.
+
+  - **(C) `[&](auto value) { ... }`**: C++의 람다(Lambda) 기능입니다. 이름 없는 함수를 즉석에서 만들어 `set_parameter`에 전달하는 것입니다. `set_parameter`는 값을 성공적으로 찾아오면, 이 람다 함수를 호출하면서 찾은 값(예: `4.0f`)을 `value` 인자로 넘겨줍니다.
+
+  - **(D) `... = value;`**: **첫 번째 값 저장**이 일어나는 순간입니다. 람다 함수 내부에서, (A)에서 생성된 `params` 객체의 멤버 변수(`projective_integrator_params.projective_integrator_truncation_distance_vox`)에 `value`가 \*\*할당(assignment)\*\*됩니다. 이제 `params` 객체는 YAML 파일의 값을 가지게 되었습니다.
+
+  - **(E) `return params;`**: 모든 파라미터 값이 채워진 `params` 객체를 함수 호출자에게 \*\*값으로 복사하여 반환(return by value)\*\*합니다.
+
+### 2단계: 값의 이동과 두 번째 저장 (객체 생성자를 통한 전달)
+
+**파일:** (추정) `nvblox_ros/src/nodes/nvblox_node.cpp`
+
+1단계에서 반환된 `MapperParams` 객체는 이제 `nvblox`의 핵심 클래스인 `Mapper`를 생성하는 데 사용됩니다.
+
+```cpp
+// nvblox_node.cpp 안의 가상 코드
+
+// (F) 1단계에서 반환된 params 객체를 받음
+MapperParams params = getMapperParamsFromROS("static_mapper", this);
+
+// (G) Mapper 객체 생성자에 params를 전달
+mapper_ = std::make_unique<Mapper>(voxel_size_, MemoryType::kDevice, params);
+```
+
+**상세 설명:**
+
+  - **(F) `MapperParams params = ...`**: `getMapperParamsFromROS`가 반환한 객체를 `nvblox_node`의 지역 변수 `params`에 복사합니다.
+
+  - **(G) `std::make_unique<Mapper>(..., params)`**: `Mapper` 클래스의 \*\*생성자(constructor)\*\*를 호출합니다. 이때 `params` 객체가 생성자의 인자로 전달됩니다. `Mapper`의 생성자 내부에서는 전달받은 `params` 객체의 값들을 사용하여 자신의 멤버 변수들을 초기화합니다. 이 과정에서 `params.projective_integrator_params`의 값이 `Mapper`가 소유한 `ProjectiveTsdfIntegrator` 객체로 전달됩니다.
+
+### 3단계: 최종 목적지에 값 저장 (Setter 함수를 통한 할당)
+
+**파일:** `nvblox_ros/nvblox_core/nvblox/nvblox/include/nvblox/integrators/internal/projective_integrator.h`
+
+`Mapper` 생성자 또는 초기화 함수는 `ProjectiveIntegrator` 클래스의 공개(public) 멤버 함수인 **Setter 함수**를 호출하여 값을 최종적으로 저장시킵니다.
+
+```cpp
+// ProjectiveIntegrator 클래스 내부
+
+public:
+    // (H) 외부에서 호출되는 Setter 함수
+    void truncation_distance_vox(float truncation_distance_vox) {
+        // (I) 클래스의 멤버 변수에 값 할당
+        truncation_distance_vox_ = truncation_distance_vox;
+    }
+
+protected:
+    // (J) 값이 최종적으로 저장되는 멤버 변수
+    float truncation_distance_vox_;
+```
+
+**상세 설명:**
+
+  - **(H) `void truncation_distance_vox(...)`**: 2단계에서 `Mapper`가 이 함수를 호출합니다. YAML에서 시작된 값(예: `4.0f`)이 인자 `truncation_distance_vox`로 전달됩니다.
+
+  - **(I) `truncation_distance_vox_ = ...`**: **두 번째 값 저장**이 일어납니다. 함수로 전달된 값을 `ProjectiveIntegrator` 객체의 내부 멤버 변수인 `truncation_distance_vox_`에 **할당**합니다. 이제 값은 `ProjectiveIntegrator` 객체 내부에 영구적으로 저장되었으며, 이 객체가 살아있는 동안 계속 유지됩니다.
+
+### 4단계: GPU로의 마지막 전달 (객체 복사를 통한 전달)
+
+**파일:** `nvblox_ros/nvblox_core/nvblox/nvblox/src/integrators/projective_tsdf_integrator.cu`
+
+GPU 커널을 직접 호출하기 직전, GPU에서 사용할 '작업 명세서' 객체(`UpdateTsdfVoxelFunctor`)를 만듭니다. 이때 저장된 값이 마지막으로 복사됩니다.
+
+```cpp
+// 함수: ProjectiveTsdfIntegrator::getTsdfUpdateFunctorOnDevice(...)
+
+// (K) get_truncation_distance_m 함수가 내부적으로 멤버 변수를 사용
+// return truncation_distance_vox_ * voxel_size;
+float truncation_m = get_truncation_distance_m(voxel_size); 
+
+// (L) Functor 객체의 멤버 변수에 값 할당
+update_functor_host_ptr_->truncation_distance_m_ = truncation_m;
+```
+
+**상세 설명:**
+
+  - **(K) `get_truncation_distance_m(...)`**: 이 함수는 3단계에서 저장된 `truncation_distance_vox_` 멤버 변수를 읽어와 `voxel_size`와 곱셈 연산을 수행합니다.
+
+  - **(L) `... = truncation_m;`**: **마지막 값 전달**입니다. 연산 결과를 `UpdateTsdfVoxelFunctor` 객체(CPU 메모리에 있음)의 `truncation_distance_m_` 멤버 변수에 **복사하여 할당**합니다. 이 Functor 객체는 이후 통째로 GPU 메모리에 복사되며, CUDA 커널은 이 객체의 `truncation_distance_m_` 값을 직접 읽어 최종 연산을 수행하게 됩니다.
+
+이처럼 값은 **`구조체 할당` → `생성자 전달` → `Setter 함수 할당` → `Functor 멤버 복사`** 라는 명확한 C++ 메커니즘을 통해 YAML 파일에서부터 GPU 커널까지 안전하게 전달됩니다.
