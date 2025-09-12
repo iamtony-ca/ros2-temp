@@ -8,7 +8,7 @@ reset 포트가 true이면 latch 여부와 무관하게 즉시 latched 상태를
 
 
 ---
-
+```cpp
 check_flag_condition.hpp
 
 #pragma once
@@ -73,9 +73,10 @@ private:
 
 } // namespace amr_bt_nodes
 
-
+```
 ---
 
+```cpp
 check_flag_condition.cpp
 
 #include "amr_bt_nodes/check_flag_condition.hpp"
@@ -161,10 +162,11 @@ BT::NodeStatus CheckFlagCondition::tick()
 }
 
 } // namespace amr_bt_nodes
-
+```
 
 ---
 
+```cpp
 플러그인 등록
 
 #include "behaviortree_cpp/bt_factory.h"
@@ -174,12 +176,12 @@ extern "C" void BT_RegisterNodesFromPlugin(BT::BehaviorTreeFactory &factory)
 {
   factory.registerNodeType<amr_bt_nodes::CheckFlagCondition>("CheckFlagCondition");
 }
-
+```
 
 ---
 
 BT XML 사용 예 (reset = 블랙보드 변수 1개)
-
+```xml
 <Sequence>
   <!-- 최초 체크 (reset 포트 연결) -->
   <CheckFlagCondition
@@ -210,7 +212,7 @@ BT XML 사용 예 (reset = 블랙보드 변수 1개)
     </Repeat>
   </SequenceWithMemory>
 </Sequence>
-
+```
 controller_pause_reset(블랙보드 단 하나의 변수)을 true로 올리면, 해당 tick에서 즉시 초기화됩니다.
 
 이후 필요 시 <Script code="controller_pause_reset := false"/>로 내리면 됩니다.
