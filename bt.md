@@ -1718,3 +1718,114 @@ Subtree를 활용하여 모듈화하고 가독성을 높이는 방향으로 코�
   </BehaviorTree></root>
 
 ```
+########################
+
+
+네, 아주 예리한 관찰입니다. BT의 동작을 정확히 이해하고 계시기 때문에 나올 수 있는 질문입니다.
+
+`/behavior_tree_log`에서 보신 것처럼 복구 동작 자체는 실패했는데 `ShortRecoverySequenceTotal1`이 `SUCCESS`를 반환하는 것은 명백한 모순처럼 보입니다. 하지만 이것은 BehaviorTree.Cpp의 제어 흐름 노드(Control Flow Node)들의 동작 방식을 이해하면 명확하게 설명됩니다.
+
+**결론부터 말씀드리면, 이 현상의 핵심 원인은 `IntelligentRecoverySelector`라는 `Fallback` 노드와 그 자식으로 사용된 `RoundRobin` 노드들의 동작 방식에 있습니다.**
+
+### 원인 분석: 단계별 흐름
+
+문제를 이해하기 위해 `ShortRecoverySequenceTotal1`의 구조를 살펴보겠습니다.
+
+```xml
+<BehaviorTree ID="IntelligentRecoverySubtree">
+  <Sequence name="ShortRecoverySequenceTotal1">
+    <LogTextAction ... />
+    
+    <Fallback name="IntelligentRecoverySelector">
+    
+      <Sequence name="NoValidPathCase">
+        <Precondition ...>
+          <Fallback>
+            <Sequence>
+              <RoundRobin name="GoalOccupiedRecovery"> ... </RoundRobin>
+            </Sequence>
+          </Fallback>
+        </Precondition>
+      </Sequence>
+      
+      <Sequence name="DefaultFailureCase">
+        <RoundRobin name="DefaultFailureRecoveryActions">
+          <SubTree name="ClearPair@Default" ... />
+          <Wait name="DefaultWait" ... />
+          <SubTree name="Maneuver_PlanA@Default" ... />
+          <SubTree name="Maneuver_PlanB@Default" ... />
+        </RoundRobin>
+      </Sequence>
+      
+    </Fallback>
+  </Sequence>
+</BehaviorTree>
+```
+
+이제 주행이 실패하여 이 복구 로직이 실행될 때의 흐름을 따라가 보겠습니다.
+
+1.  **`ShortRecoverySequenceTotal1` (`Sequence`) 실행**:
+
+      * `Sequence` 노드는 모든 자식이 `SUCCESS`를 반환해야만 `SUCCESS`를 반환합니다.
+      * 첫 번째 자식인 `LogTextAction`은 항상 `SUCCESS`를 반환합니다.
+      * 따라서 `ShortRecoverySequenceTotal1`의 최종 상태는 두 번째 자식인 `IntelligentRecoverySelector` (`Fallback`)의 반환 값에 따라 결정됩니다.
+
+2.  **`IntelligentRecoverySelector` (`Fallback`) 실행**:
+
+      * `Fallback` 노드는 자식 중 **하나라도 `SUCCESS`를 반환하면** 즉시 실행을 멈추고 `SUCCESS`를 반환합니다.
+      * 이 `Fallback`은 위에서부터 `NoValidPathCase`, `RobotIsStuckCase` 등을 순서대로 시도합니다.
+      * 만약 모든 특정 조건의 복구 시나리오가 실패하면 (예: 에러 코드가 맞지 않음), `Fallback`은 마지막 자식인 `DefaultFailureCase`를 실행하게 됩니다.
+
+3.  **`DefaultFailureCase` (`Sequence`) 와 `RoundRobin` 실행 (핵심 원인)**:
+
+      * `DefaultFailureCase` 시퀀스는 `RoundRobin` 노드를 실행합니다.
+      * `RoundRobin` 노드는 "회전 목마"처럼 자신의 자식들을 순서대로 한 번씩 실행하는 역할을 합니다.
+      * 사용자님께서 복구 로직이 실패했다고 말씀하셨으니, `RoundRobin`의 자식들인 `ClearCostmapsPairSubtree`, `Wait`, `ManeuverSubtree` 등이 차례로 실행되었지만 모두 `FAILURE`를 반환했을 것입니다.
+      * **가장 중요한 점은, `RoundRobin`이 자신의 모든 자식 노드를 한 번씩 다 시도하고 나면 (즉, 한 사이클이 끝나면), 자신에게 주어진 임무(모든 옵션을 시도하는 것)를 완수했다고 판단하여 `SUCCESS`를 반환한다는 것입니다.**
+
+즉, **개별적인 복구 "행동"(`ManeuverSubtree` 등)은 실패했지만, 여러 행동을 순서대로 시도하는 "전략"(`RoundRobin`)은 성공적으로 완료된 것**입니다.
+
+### 전체 흐름 요약
+
+1.  `ManeuverSubtree`가 실패하고 `FAILURE`를 반환합니다.
+2.  부모인 `RoundRobin`은 이 실패를 받고, 다음 자식(다른 `ManeuverSubtree`)을 시도합니다. 그 역시 `FAILURE`를 반환합니다.
+3.  `RoundRobin`이 모든 자식을 다 시도했으므로, 자신의 임무를 마쳤다고 판단하고 \*\*`SUCCESS`\*\*를 반환합니다.
+4.  `RoundRobin`의 부모인 `DefaultFailureCase` (`Sequence`)는 자식이 `SUCCESS`를 반환했으므로 \*\*`SUCCESS`\*\*를 반환합니다.
+5.  `DefaultFailureCase`의 부모인 `IntelligentRecoverySelector` (`Fallback`)는 자식이 `SUCCESS`를 반환했으므로 즉시 \*\*`SUCCESS`\*\*를 반환합니다.
+6.  최종적으로 `ShortRecoverySequenceTotal1` (`Sequence`)는 자식인 `Fallback`이 `SUCCESS`를 반환했으므로 \*\*`SUCCESS`\*\*를 반환합니다.
+
+이것이 바로 로그에서는 `ShortRecoverySequenceTotal1`이 항상 `SUCCESS`를 반환하는 이유입니다.
+
+### 해결 방안 (만약 실패를 전파하고 싶다면)
+
+만약 모든 복구 시도가 실패했을 때, 복구 로직 전체가 `FAILURE`를 반환하도록 만들고 싶다면 `RoundRobin`을 다른 노드로 교체해야 합니다. 가장 적합한 대안은 **`Fallback`** 입니다.
+
+예를 들어 `DefaultFailureCase`를 이렇게 수정할 수 있습니다.
+
+**기존:**
+
+```xml
+<Sequence name="DefaultFailureCase">
+  <LogTextAction ... />
+  <RoundRobin name="DefaultFailureRecoveryActions">
+    <SubTree ... />
+    <Wait ... />
+    <SubTree ... />
+  </RoundRobin>
+</Sequence>
+```
+
+**수정 제안:**
+
+```xml
+<Sequence name="DefaultFailureCase">
+  <LogTextAction ... />
+  <Fallback name="DefaultFailureRecoveryAttempts">
+    <SubTree name="ClearPair@Default" ID="ClearCostmapsPairSubtree" _autoremap="true" />
+    <SubTree name="Maneuver_PlanA@Default" ID="ManeuverSubtree" ... />
+    <SubTree name="Maneuver_PlanB@Default" ID="ManeuverSubtree" ... />
+  </Fallback>
+</Sequence>
+```
+
+이렇게 바꾸면, `Maneuver_PlanB@Default`까지 모두 `FAILURE`를 반환해야만 `Fallback` 전체가 `FAILURE`를 반환하게 되어, 의도대로 복구 실패를 상위로 전파할 수 있습니다.
