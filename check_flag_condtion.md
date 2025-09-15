@@ -464,3 +464,83 @@ extern "C" void BT_RegisterNodesFromPlugin(BT::BehaviorTreeFactory &factory)
 
 필요하면 CMakeLists에 새 파일들 추가만 해주면 끝!
 
+
+
+#########################
+
+
+좋은 질문이에요. 그 코드는 \*\*“레벨 트리거(level-triggered) 강제 초기화”\*\*를 구현합니다. 흐름을 한 줄씩 풀면:
+
+```cpp
+bool do_reset = false;
+if (getInput("reset", do_reset) && do_reset) {
+  last_flag_.store(false, std::memory_order_relaxed);
+}
+```
+
+* `getInput("reset", do_reset)` : 블랙보드의 `reset` 변수를 읽어옵니다.
+* `&& do_reset` : 그 값이 \*\*true인 “상태(레벨)”\*\*이면,
+* `last_flag_.store(false, ...)` : 내부 latched 상태(`last_flag_`)를 **무조건 false로 강제로 클리어**합니다.
+  → 이 순간부터 아래 latch 로직과 무관하게, 이번 tick에서는 `SUCCESS`가 아니라 `FAILURE`로 떨어지게 됩니다.
+
+핵심은 \*\*“레벨 트리거”\*\*라는 점이에요.
+
+* `reset`이 **true로 유지되어 있는 동안**엔 매 tick 마다 `last_flag_`가 계속 `false`로 강제 초기화됩니다.
+  → 즉, **리셋 유지(hold reset)** 효과가 납니다.
+* `reset`을 **false로 내려야**만, 이후부터 다시 토픽에서 온 `true`를 반영해 `SUCCESS`가 가능해집니다.
+
+그래서, 만약 의도가 \*\*“한 번만 초기화(펄스)하고 바로 원래 모드로 복귀”\*\*라면 아래 중 하나로 바꾸는 게 더 직관적입니다.
+
+---
+
+### 옵션 1) “엣지 트리거(상승 에지)”로 바꾸기
+
+`reset`이 **false→true**로 바뀌는 **순간**에만 초기화하고, true가 계속 유지돼도 추가 초기화는 하지 않음.
+
+```cpp
+// 클래스 멤버
+bool prev_reset_ {false};
+
+// tick() 안
+bool reset_in = false;
+getInput("reset", reset_in);
+if (reset_in && !prev_reset_) {                // false -> true 상승 에지에서만
+  last_flag_.store(false, std::memory_order_relaxed);
+}
+prev_reset_ = reset_in;
+```
+
+* 장점: BT에서 `reset`을 길게 true로 둬도 **한 번만** 초기화됩니다.
+* 단점: 다시 초기화하려면 `reset`을 **false로 내렸다가** 다시 **true로 올려야** 합니다.
+
+---
+
+### 옵션 2) “카운터(단일 변수 int)”로 바꾸기
+
+여전히 **변수는 1개**만 쓰면서, 값이 **변할 때마다** 초기화:
+
+```cpp
+// 포트: BT::InputPort<int>("reset_seq", 0, "...");
+// 멤버
+int last_seen_reset_seq_ {-1};
+
+// tick() 안
+int seq = 0;
+if (getInput("reset_seq", seq) && seq != last_seen_reset_seq_) {
+  last_seen_reset_seq_ = seq;
+  last_flag_.store(false, std::memory_order_relaxed);
+}
+```
+
+* 장점: BT에서 `<Script code="reset_seq := reset_seq + 1"/>` 한 줄만 쓰면 **매번 “한 번만”** 깔끔히 초기화됩니다(되돌릴 필요 없음).
+* 단점: bool이 아니라 int지만, **여전히 블랙보드 변수는 1개**입니다.
+
+---
+
+### 언제 레벨 트리거가 유용한가?
+
+* “취소/중단 구간 동안은 **계속** 해제 상태를 유지하고 싶다” 같이 **구간 보장**이 필요할 때.
+* 예: `<Repeat num_cycles="-1">` 루프 내부에서 잠시 멈춤을 강제 유지하고 싶으면 `reset=true`를 유지하면 됩니다.
+
+반대로, **한 번만 초기화하고 바로 원래 동작으로 돌아가고 싶다면** 레벨 트리거(현재 코드)는 적합하지 않고, **엣지 트리거(옵션 1)** 또는 \*\*카운터(옵션 2)\*\*가 의도에 더 맞습니다.
+
