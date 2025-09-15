@@ -251,3 +251,239 @@ BT::NodeStatus SelectRecoveryStrategy::tick()
 ```
 
 이 구조를 적용하시면, 훨씬 더 예측 가능하고, 디버깅이 쉬우며, 견고한 복구 시스템을 갖추게 될 것입니다.
+
+##################
+
+네, 알겠습니다. 요청하신 대로 네임스페이스를 `amr_bt_nodes`로, 클래스 이름을 `SelectRecoveryStrategyAction`으로 변경하여 완벽하게 다듬어진 최종 코드를 제공해 드리겠습니다.
+
+-----
+
+### 1\. 커스텀 노드 최종 소스코드
+
+#### **`select_recovery_strategy_action.hpp` (헤더 파일)**
+
+```cpp
+#pragma once
+
+#include <string>
+#include <atomic>
+
+#include "behaviortree_cpp/action_node.h"
+#include "rclcpp/rclcpp.hpp"
+#include "std_msgs/msg/bool.hpp"
+
+namespace amr_bt_nodes
+{
+
+/**
+ * @class SelectRecoveryStrategyAction
+ * @brief A BT::SyncActionNode that selects an appropriate recovery strategy
+ * based on planner/controller error codes and robot status flags.
+ *
+ * This node reads various error codes and status flags from the blackboard,
+ * evaluates them based on a predefined priority, and outputs the name of the
+ * selected recovery strategy as a string to the `selected_strategy` port.
+ * It is designed to be the first child of a <Switch> node to enable
+ * deterministic, condition-based recovery behaviors.
+ */
+class SelectRecoveryStrategyAction : public BT::SyncActionNode
+{
+public:
+  /**
+   * @brief A constructor for amr_bt_nodes::SelectRecoveryStrategyAction
+   * @param name The name of the node
+   * @param config The node configuration
+   * @param node A shared pointer to the ROS 2 node
+   */
+  SelectRecoveryStrategyAction(
+    const std::string & name,
+    const BT::NodeConfiguration & config,
+    rclcpp::Node::SharedPtr node);
+
+  /**
+   * @brief Defines the ports that this node uses.
+   * @return BT::PortsList The list of ports.
+   */
+  static BT::PortsList providedPorts();
+
+  /**
+   * @brief The main execution logic of the node.
+   * @return BT::NodeStatus SUCCESS after selecting a strategy.
+   */
+  BT::NodeStatus tick() override;
+
+private:
+  rclcpp::Node::SharedPtr node_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr is_stuck_sub_;
+  std::atomic<bool> is_stuck_;
+};
+
+}  // namespace amr_bt_nodes
+```
+
+#### **`select_recovery_strategy_action.cpp` (구현 파일)**
+
+```cpp
+#include "amr_bt_nodes/select_recovery_strategy_action.hpp"
+
+namespace amr_bt_nodes
+{
+
+SelectRecoveryStrategyAction::SelectRecoveryStrategyAction(
+  const std::string & name,
+  const BT::NodeConfiguration & config,
+  rclcpp::Node::SharedPtr node)
+: BT::SyncActionNode(name, config),
+  node_(node),
+  is_stuck_{false}
+{
+  // Subscribe to the /progress_checker/is_stuck topic to monitor robot's state.
+  is_stuck_sub_ = node_->create_subscription<std_msgs::msg::Bool>(
+    "/progress_checker/is_stuck",
+    rclcpp::SystemDefaultsQoS(),
+    [this](const std_msgs::msg::Bool::SharedPtr msg) {
+      // Store the received value atomically.
+      this->is_stuck_.store(msg->data, std::memory_order_release);
+    });
+  
+  RCLCPP_INFO(node_->get_logger(), R"(Initialized BT node "SelectRecoveryStrategyAction")");
+}
+
+BT::PortsList SelectRecoveryStrategyAction::providedPorts()
+{
+  return {
+    // Input Ports to read from the Blackboard
+    BT::InputPort<int>("compute_path_error_code", 0, "Planner-side error code"),
+    BT::InputPort<int>("follow_path_error_code", 0, "Controller-side error code"),
+    
+    // Error code constants to compare against, also read from the Blackboard
+    BT::InputPort<int>("cfg_err_no_valid"),
+    BT::InputPort<int>("cfg_err_start_occ"),
+    BT::InputPort<int>("cfg_err_goal_occ"),
+    // Example controller error codes. Modify as needed for your specific controller.
+    BT::InputPort<int>("cfg_err_oscillation", 501, "Example controller oscillation error"),
+    BT::InputPort<int>("cfg_err_path_tolerance", 502, "Example path tolerance error"),
+
+    // Output Port to write the result to the Blackboard
+    BT::OutputPort<std::string>("selected_strategy", "The name of the recovery case to execute")
+  };
+}
+
+BT::NodeStatus SelectRecoveryStrategyAction::tick()
+{
+  // Read error codes and configuration values from the input ports.
+  const auto compute_error = getInput<int>("compute_path_error_code");
+  const auto follow_error = getInput<int>("follow_path_error_code");
+
+  const auto no_valid_err = getInput<int>("cfg_err_no_valid");
+  const auto start_occ_err = getInput<int>("cfg_err_start_occ");
+  const auto goal_occ_err = getInput<int>("cfg_err_goal_occ");
+  const auto oscillation_err = getInput<int>("cfg_err_oscillation");
+  const auto tolerance_err = getInput<int>("cfg_err_path_tolerance");
+
+  std::string selected_strategy = "DEFAULT"; // Default strategy if no other condition is met.
+
+  // --- Recovery Strategy Selection Logic (Priority is important) ---
+
+  // 1. Planner failures are the most critical, so check them first.
+  if (compute_error && compute_error.value() != 0) {
+    if (compute_error.value() == no_valid_err.value()) {
+      selected_strategy = "NO_VALID_PATH";
+    } else if (compute_error.value() == start_occ_err.value()) {
+      selected_strategy = "START_OCCUPIED";
+    } else if (compute_error.value() == goal_occ_err.value()) {
+      selected_strategy = "GOAL_OCCUPIED";
+    }
+  }
+  // 2. A physically stuck robot is the next priority.
+  //    The exchange() operation atomically reads the current value and sets it to false,
+  //    effectively "consuming" the flag for this tick.
+  else if (is_stuck_.exchange(false, std::memory_order_acq_rel))
+  {
+    selected_strategy = "ROBOT_STUCK";
+  }
+  // 3. Controller failures during path following are checked last.
+  else if (follow_error && follow_error.value() != 0) {
+    if (follow_error.value() == oscillation_err.value()) {
+      selected_strategy = "OSCILLATION";
+    } else if (follow_error.value() == tolerance_err.value()) {
+      selected_strategy = "PATH_TOLERANCE_VIOLATED";
+    }
+  }
+
+  // Write the chosen strategy to the blackboard for the <Switch> node to use.
+  setOutput("selected_strategy", selected_strategy);
+  RCLCPP_DEBUG(node_->get_logger(), "[RecoverySelector] Selected strategy: '%s'", selected_strategy.c_str());
+
+  // This node's job is only to select a strategy, so it always returns SUCCESS upon completion.
+  return BT::NodeStatus::SUCCESS;
+}
+
+}  // namespace amr_bt_nodes
+```
+
+**[참고]** 이 노드를 BT 팩토리에 등록할 때는 다음과 같이 호출합니다:
+
+```cpp
+// In your BT node registration file
+factory.registerNodeType<amr_bt_nodes::SelectRecoveryStrategyAction>(
+  "SelectRecoveryStrategyAction", rclcpp::Node::SharedPtr(node));
+```
+
+-----
+
+### 2\. Behavior Tree XML (`IntelligentRecoverySubtree`)
+
+위에서 만든 `SelectRecoveryStrategyAction` 노드를 사용하도록 수정한 BT XML입니다.
+
+```xml
+<BehaviorTree ID="IntelligentRecoverySubtree">
+  <Sequence name="RecoverySequence">
+    <LogTextAction name="RecoveryBanner"
+      message="[!!! RECOVERY !!!] Main navigation failed. Initiating intelligent recovery logic."
+      interval_s="1.0" />
+    
+    <Switch name="IntelligentRecoverySwitch" variable="{selected_strategy}">
+
+      <SelectRecoveryStrategyAction name="SelectStrategy"
+                                    compute_path_error_code="{compute_path_error_code}"
+                                    follow_path_error_code="{follow_path_error_code}"
+                                    cfg_err_no_valid="{cfg_err_no_valid}"
+                                    cfg_err_start_occ="{cfg_err_start_occ}"
+                                    cfg_err_goal_occ="{cfg_err_goal_occ}"
+                                    cfg_err_oscillation="{cfg_err_oscillation}"
+                                    cfg_err_path_tolerance="{cfg_err_path_tolerance}"
+                                    selected_strategy="{selected_strategy}" />
+
+      <Case case="NO_VALID_PATH">
+        </Case>
+
+      <Case case="ROBOT_STUCK">
+        </Case>
+
+      <Case case="START_OCCUPIED">
+        </Case>
+      
+      <Case case="GOAL_OCCUPIED">
+        </Case>
+
+      <Case case="OSCILLATION">
+        </Case>
+
+      <Case case="PATH_TOLERANCE_VIOLATED">
+        <Sequence name="PathToleranceActions">
+          <LogTextAction name="PathToleranceLog" message="[RECOVERY] Case: Path tolerance violated. Re-planning." interval_s="1.0" />
+          <SubTree name="ClearPair" ID="ClearCostmapsPairSubtree" _autoremap="true" />
+        </Sequence>
+      </Case>
+
+      <Default>
+        </Default>
+
+    </Switch>
+  </Sequence>
+</BehaviorTree>
+```
+
+이제 이 코드들을 프로젝트에 통합하시면 원하시는 대로 견고하고 예측 가능한 복구 시스템이 완성됩니다.
+
