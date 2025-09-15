@@ -1829,3 +1829,119 @@ Subtree를 활용하여 모듈화하고 가독성을 높이는 방향으로 코�
 ```
 
 이렇게 바꾸면, `Maneuver_PlanB@Default`까지 모두 `FAILURE`를 반환해야만 `Fallback` 전체가 `FAILURE`를 반환하게 되어, 의도대로 복구 실패를 상위로 전파할 수 있습니다.
+
+
+
+###########
+
+
+네, 아주 중요한 핵심을 정확히 짚어주셨습니다. 문제를 완벽하게 이해했습니다.
+
+사용자님의 목표는 다음과 같습니다:
+
+1.  `RoundRobin`의 순차적 재시도 로직을 그대로 유지하고 싶다. (ClearCostmaps -\> 메인 루프 시도 -\> 실패 -\> Wait -\> 메인 루프 시도 -\> 실패 -\> Maneuver -\> ...)
+2.  하지만 이 `RoundRobin`의 모든 복구 액션을 다 시도했는데도 **결국 문제를 해결하지 못했을 때**, 최종적으로 `FAILURE`를 반환하여 전체 미션이 실패했음을 명확히 하고 싶다.
+
+현재 BT의 문제는 `RoundRobin`의 자식인 `ClearCostmapsPairSubtree`나 `Wait`가 **자신의 임무를 성공적으로 수행하면** `SUCCESS`를 반환하기 때문에, 이것이 "복구 성공"으로 간주되어 `RoundRobin`의 순환이 계속될 수는 있지만, "모든 복구를 시도했지만 소용없음"이라는 최종 실패 상태를 감지할 방법이 없다는 것입니다.
+
+이 딜레마를 해결하기 위해, BT의 상태를 추적하는 매우 효과적인 패턴을 제안해 드리겠습니다.
+
+### 해결 전략: "복구 시도 횟수" 카운터를 이용한 순환 감지
+
+핵심 아이디어는 **"복구 로직에 진입할 때마다 카운터를 1씩 증가시키고, 이 카운터가 `RoundRobin`의 자식 노드 개수를 초과하면, 모든 복구 옵션을 다 사용한 것으로 간주하여 강제로 실패시키는 것"** 입니다.
+
+이를 위해 다음과 같이 BT를 수정하겠습니다.
+
+1.  **초기화 단계 추가**: `MainTree`가 시작될 때 `recovery_attempts`라는 블랙보드 변수를 0으로 초기화합니다.
+2.  **`IncrementAndCheckCycle` 서브트리 생성**: 복구 시도 횟수를 증가시키고, 한계에 도달했는지 확인하는 로직을 별도의 모듈(Subtree)로 만듭니다. 이 서브트리는 한계를 초과하면 `FAILURE`를, 아니면 `SUCCESS`를 반환합니다.
+3.  **복구 로직 수정**: 기존의 `IntelligentRecoverySubtree`의 가장 앞단에 이 새로운 서브트리를 추가합니다. `Sequence` 노드로 묶어서, 사이클 한계를 초과하면(`FAILURE` 반환) 뒷부분의 복구 로직을 실행하지 않고 즉시 전체 복구를 실패시킵니다.
+
+### 수정된 BT XML 코드
+
+아래는 위 전략을 적용하여 수정한 전체 BT XML입니다. 변경된 부분과 추가된 부분에 주석으로 설명을 달아두었습니다.
+
+```xml
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+
+  <BehaviorTree ID="IncrementAndCheckCycleSubtree">
+    <Sequence name="GuardSequence">
+      <Script name="IncrementRecoveryCounter" code="recovery_attempts := recovery_attempts + 1" />
+      <LogTextAction name="LogAttemptCount" message="[Recovery Guard] Recovery attempt: {recovery_attempts}" />
+      
+      <Fallback name="CheckCycleLimit">
+        <Precondition name="IsUnderLimit" if="recovery_attempts <= max_attempts" else="FAILURE">
+          <AlwaysSuccess />
+        </Precondition>
+        
+        <Sequence name="HandleCycleLimitExceeded">
+          <LogTextAction name="CycleLimitLog" color="red" message="[CRITICAL] Recovery cycle limit ({max_attempts}) reached. All recovery actions failed to resolve the issue."/>
+          <AlwaysFailure />
+        </Sequence>
+      </Fallback>
+    </Sequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="IntelligentRecoverySubtree">
+    <Sequence name="RecoverySequence">
+      <LogTextAction name="RecoveryBanner" message="[!!! RECOVERY !!!] Initiating intelligent recovery logic." interval_s="1.0" />
+      <Fallback name="IntelligentRecoverySelector">
+        <Sequence name="DefaultFailureCase">
+          <LogTextAction name="DefaultFailureLog" message="[RECOVERY CASE] Default failure. Running general recovery sequence." interval_s="1.0" />
+          <RoundRobin name="DefaultFailureRecoveryActions">
+            <SubTree name="ClearPair@Default" ID="ClearCostmapsPairSubtree" _autoremap="true" />
+            <Wait name="DefaultWait" wait_duration="{cfg_wait_default}" />
+            <SubTree name="Maneuver_PlanA@Default" ID="ManeuverSubtree" _autoremap="true" planner_id="{cfg_recov_planner_A}" controller_id="{cfg_recov_controller}" />
+            <SubTree name="Maneuver_PlanB@Default" ID="ManeuverSubtree" _autoremap="true" planner_id="{cfg_recov_planner_B}" controller_id="{cfg_recov_controller}" />
+          </RoundRobin>
+        </Sequence>
+      </Fallback>
+    </Sequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="25" name="NavigateRecovery">
+      
+      <PipelineSequence name="NavigateWithReplanning">
+        <RunNTimesDecorator num_ticks="1" name="Initilizing...">
+          <Sequence>
+            <LogTextAction name="InitRecoveryCounterLog" message="Initializing recovery counter..." />
+            <SetBlackboard name="Init_recovery_attempts" output_key="recovery_attempts" value="0" />
+            <SetBlackboard name="Cfg_max_recovery_attempts" output_key="max_recovery_attempts" value="4" /> 
+            
+            </Sequence>
+        </RunNTimesDecorator>
+        
+        </PipelineSequence>
+
+      <Sequence name="GuardedRecoveryExecution">
+        <SubTree name="CycleGuard" ID="IncrementAndCheckCycleSubtree" _autoremap="true" />
+        
+        <SubTree name="IntelligentRecovery" ID="IntelligentRecoverySubtree" _autoremap="true" />
+      </Sequence>
+      
+    </RecoveryNode>
+  </BehaviorTree>
+
+  </root>
+```
+
+### 어떻게 이 문제가 해결되는가?
+
+1.  **평상시 (복구 사이클이 한계 이전):**
+
+      * 주행이 실패하면 `GuardedRecoveryExecution` 시퀀스가 실행됩니다.
+      * `CycleGuard` 서브트리가 실행되어 `recovery_attempts`가 1 증가하고, 아직 한계(4)를 넘지 않았으므로 `SUCCESS`를 반환합니다.
+      * `GuardedRecoveryExecution` 시퀀스는 다음 자식인 `IntelligentRecovery` 서브트리를 실행합니다.
+      * `IntelligentRecovery` 내부의 `RoundRobin`은 다음 복구 액션(예: `Wait`)을 실행하고 `SUCCESS`를 반환합니다.
+      * `GuardedRecoveryExecution` 전체가 `SUCCESS`를 반환하고, `MapsRecovery` 노드는 다시 주행 로직을 시도합니다. **(사용자님이 원하시던 순차 로직 유지)**
+
+2.  **모든 복구 옵션을 다 사용한 후:**
+
+      * 주행이 5번째 실패하면(`recovery_attempts`가 4인 상태에서 다시 실패), `GuardedRecoveryExecution`이 실행됩니다.
+      * `CycleGuard` 서브트리가 실행되어 `recovery_attempts`가 5로 증가합니다.
+      * `CycleGuard` 내부의 `Precondition`이 "5 \<= 4" 조건을 검사하고 `FAILURE`를 반환합니다.
+      * `CycleGuard`는 `AlwaysFailure` 노드를 실행하여 최종적으로 \*\*`FAILURE`\*\*를 반환합니다.
+      * `GuardedRecoveryExecution` 시퀀스는 첫 번째 자식이 `FAILURE`를 반환했으므로 즉시 멈추고 \*\*`FAILURE`\*\*를 반환합니다.
+      * 최상위 `MapsRecovery` 노드는 자신의 복구 자식(`GuardedRecoveryExecution`)이 `FAILURE`를 반환했으므로, 더 이상 주행을 재시도하지 않고 **`MapsRecovery` 노드 전체가 최종적으로 `FAILURE`를 반환합니다.** **(원하시던 최종 실패 처리 성공)**
+
+이 패턴은 `RoundRobin`의 유용한 순차 재시도 특성을 그대로 활용하면서, 제어할 수 없는 무한 루프에 빠지는 것을 방지하고 명확한 실패 조건을 만들어주는 매우 견고한(robust) 방법입니다.
