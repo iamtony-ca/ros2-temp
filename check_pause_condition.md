@@ -65,7 +65,7 @@ BT::NodeStatus CheckPauseCondition::tick()
 
 ---
 
-
+```
 ```
 
 Nav2의 배터리 컨디션 예제는 자체 QoS 래퍼를 쓰지만(`StandardTopicQoS`), 핵심은 **재진입 시 초기화하고 `tick()` 안에서 `spin_all/ some`으로 콜백을 처리**한다는 점이에요. ([api.nav2.org][1])
