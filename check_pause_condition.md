@@ -65,26 +65,7 @@ BT::NodeStatus CheckPauseCondition::tick()
 
 ---
 
-## QoS 설정 버그도 하나 있어요
 
-현재 코드:
-
-```cpp
-rclcpp::QoS qos(rclcpp::KeepLast(1));
-qos.transient_local().reliable();
-if (!transient_local_) {
-  qos.reliable(); // DDS latched QoS (주석과 실제 코드 불일치)
-}
-```
-
-여기선 `transient_local_`이 `false`여도 위에서 이미 `transient_local()`을 호출해버려요. 의도대로라면 아래처럼 쓰는 게 맞습니다.
-
-```cpp
-rclcpp::QoS qos(rclcpp::KeepLast(1));
-qos.reliable();
-if (transient_local_) {
-  qos.transient_local();  // latched QoS를 원할 때만 적용
-}
 ```
 
 Nav2의 배터리 컨디션 예제는 자체 QoS 래퍼를 쓰지만(`StandardTopicQoS`), 핵심은 **재진입 시 초기화하고 `tick()` 안에서 `spin_all/ some`으로 콜백을 처리**한다는 점이에요. ([api.nav2.org][1])
