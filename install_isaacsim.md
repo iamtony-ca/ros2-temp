@@ -1,4 +1,4 @@
-좋아, Seri! 🙂
+
 아래는 **Ubuntu 24.04 + RTX 5090** 환경을 기준으로 정리한 **Isaac Sim 5.0.0 설치 가이드**야. 두 가지 방식(로컬 워크스테이션 설치 vs. Docker 컨테이너 설치)을 모두 담았고, 5090(Blackwell) GPU에서 흔히 부딪히는 드라이버 이슈까지 체크리스트에 넣었어.
 
 ---
@@ -190,3 +190,11 @@ docker run --name isaac-sim --entrypoint bash -it --runtime=nvidia --gpus all \
 [7]: https://docs.isaacsim.omniverse.nvidia.com/5.0.0/installation/download.html "Download Isaac Sim — Isaac Sim Documentation"
 [8]: https://docs.omniverse.nvidia.com/guide-kit-cae/latest/common/technical-requirements.html?utm_source=chatgpt.com "Technical Requirements — Kit CAE User Guide"
 [9]: https://docs.isaacsim.omniverse.nvidia.com/5.0.0/installation/install_container.html?utm_source=chatgpt.com "Container Installation - Isaac Sim Documentation"
+
+######## 
+추가 참고:  
+https://docs.isaacsim.omniverse.nvidia.com/5.0.0/installation/index.html 
+https://github.com/isaac-sim/IsaacSim 
+https://catalog.ngc.nvidia.com/orgs/nvidia/containers/isaac-sim 
+https://ahnbk.dev/?p=612 
+https://sblim.tistory.com/entry/Isaac-Sim-50-on-Ubuntu-2404-Unitree-G1-RL-LAB-1 
