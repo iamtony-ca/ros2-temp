@@ -193,8 +193,8 @@ docker run --name isaac-sim --entrypoint bash -it --runtime=nvidia --gpus all \
 
 ######## 
 추가 참고:  
-https://docs.isaacsim.omniverse.nvidia.com/5.0.0/installation/index.html 
-https://github.com/isaac-sim/IsaacSim 
-https://catalog.ngc.nvidia.com/orgs/nvidia/containers/isaac-sim 
-https://ahnbk.dev/?p=612 
-https://sblim.tistory.com/entry/Isaac-Sim-50-on-Ubuntu-2404-Unitree-G1-RL-LAB-1 
+https://docs.isaacsim.omniverse.nvidia.com/5.0.0/installation/index.html  
+https://github.com/isaac-sim/IsaacSim  
+https://catalog.ngc.nvidia.com/orgs/nvidia/containers/isaac-sim  
+https://ahnbk.dev/?p=612  
+https://sblim.tistory.com/entry/Isaac-Sim-50-on-Ubuntu-2404-Unitree-G1-RL-LAB-1  
