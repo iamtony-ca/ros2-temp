@@ -93,3 +93,79 @@ Nav2의 배터리 컨디션 예제는 자체 QoS 래퍼를 쓰지만(`StandardTo
 [2]: https://www.behaviortree.dev/docs/tutorial-basics/tutorial_04_sequence/?utm_source=chatgpt.com "Reactive and Asynchronous behaviors"
 [3]: https://medium.com/%40huawei.zhu/behavior-tree-library-8cf31acb3772?utm_source=chatgpt.com "Overview — Behavior tree library"
 [4]: https://docs.nav2.org/migration/Iron.html?utm_source=chatgpt.com "Iron to Jazzy"
+
+
+###################  
+
+알겠습니다. SyncAction 노드가 아니라 Decorator 노드였군요.
+
+말씀하신 내용을 정리하면 이렇습니다:
+
+  * 실행하려는 노드는 **Decorator** 타입입니다.
+  * 이 Decorator의 자식 노드는 **항상 `SUCCESS`를 반환하는 SyncAction**입니다.
+  * 따라서 이 Decorator는 자식의 상태(`SUCCESS`)를 그대로 반환하거나, 자체 로직에 따라 `RUNNING`을 반환할 수 있습니다.
+
+**결론부터 말씀드리면, 근본적인 해결책은 이전 답변과 동일합니다.**
+
+Behavior Tree의 제어 노드들(`Fallback`, `Sequence` 등)은 자식 노드의 타입이 Action인지, Decorator인지, SubTree인지를 신경 쓰지 않습니다. 오직 자식이 반환하는 상태(`SUCCESS`, `FAILURE`, `RUNNING`)에만 관심을 가집니다.
+
+따라서 `CheckPauseCondition`의 성공/실패와 무관하게 Decorator를 실행하고 원래의 결과를 보존하기 위해서는, 이전과 동일한 **`<Fallback>` 분기 패턴**을 사용하면 됩니다.
+
+-----
+
+### Decorator 노드를 적용한 BT 구조
+
+이전 답변의 `YourSyncAction` 부분을 원하시는 Decorator 노드로 바꾸기만 하면 됩니다.
+
+Decorator의 자식 노드는 항상 `SUCCESS`를 반환한다고 하셨으니, 예시에서는 명확한 이해를 위해 `<AlwaysSuccess />` 노드를 자식으로 사용하겠습니다.
+
+```xml
+<Sequence name="PauseBranch">
+  <Fallback name="ExecuteMyDecoratorRegardless">
+    
+    <Sequence name="SuccessPath">
+      <CheckPauseCondition name="PauseFlag" flag_topic="/controller_pause_flag" latch="1" transient_local="true" reset="{cfg_reset_controller_pause}" node="{node}" />
+      
+      <MyDecorator name="MyDecoratorNode">
+        <AlwaysSuccess /> </MyDecorator>
+
+    </Sequence>
+    
+    <Sequence name="FailurePath">
+
+      <MyDecorator name="MyDecoratorNode">
+        <AlwaysSuccess /> </MyDecorator>
+
+      <AlwaysFailure name="PropagateFailure" />
+    </Sequence>
+  </Fallback>
+  
+  <SetBlackboardBoolAction name="controller_pause" output_key="controller_pause" value="0" />
+  <LogTextAction name="PausedLog" message="[PAUSED] ." interval_s="0.0" />
+  ...
+</Sequence>
+```
+
+### 동작 원리
+
+이 구조의 동작은 이전과 완벽하게 동일합니다.
+
+  * `CheckPauseCondition`이 `SUCCESS`를 반환하면:
+
+    1.  `SuccessPath` 시퀀스가 실행됩니다.
+    2.  `CheckPauseCondition`이 `SUCCESS`를 반환합니다.
+    3.  `MyDecorator`가 실행됩니다. (자식이 `SUCCESS`이므로 `MyDecorator`도 `SUCCESS` 또는 `RUNNING`을 반환하겠지만, 결국 `SUCCESS`로 끝날 것입니다.)
+    4.  `SuccessPath` 시퀀스 전체가 `SUCCESS`를 반환하고, `Fallback`도 `SUCCESS`를 반환합니다.
+
+  * `CheckPauseCondition`이 `FAILURE`를 반환하면:
+
+    1.  `SuccessPath` 시퀀스가 즉시 `FAILURE`를 반환합니다.
+    2.  `Fallback`이 `FailurePath` 시퀀스를 실행합니다.
+    3.  `MyDecorator`가 실행됩니다.
+    4.  `AlwaysFailure`가 실행되어 `FAILURE`를 반환합니다.
+    5.  `FailurePath` 시퀀스 전체가 `FAILURE`를 반환하고, `Fallback`도 `FAILURE`를 반환합니다.
+
+결론적으로, 노드의 타입이 바뀌었더라도 **동일한 BT 제어 패턴으로 원하시는 목표를 달성**할 수 있습니다. ✅
+
+decorator에 RunNtimesdecorator 를 넣고 최초 1회 tick에서만 <SetBlackboardBoolAction name="Cfg_reset_controller_pause" output_key="cfg_reset_controller_pause" value="0" /> 이 되게 만들고 CheckPauseCondition 내부 코드를 수정 (reset 변수가 true이면 reset 처리하고 해당 reset _flag 를 false 로 처리.)
+  
