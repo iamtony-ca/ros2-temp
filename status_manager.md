@@ -461,3 +461,237 @@ StatusManager::StatusManager(const rclcpp::NodeOptions & options)
 ```
 
 이제 이 코드는 ROS 2 실행기 레벨에서 모든 이벤트(토픽 메시지, 타이머)를 순차적으로 처리하도록 보장받습니다. 말씀하신 대로 토픽을 놓치는 일 없이, 들어온 순서대로 하나씩 안전하게 처리하게 됩니다.
+
+##########################  
+
+좋아요—전체적으로 구조는 잘 잡았고, Nav2 액션/BT 상태를 한데 모아 “한 줄짜리 상태”로 내보내는 목적에 부합합니다. 다만 실제 운용에서 틈새가 몇 군데 있어요. 아래는 “바로 체감되는” 것부터 순서대로 정리했어요. (짤막한 패치 코드 포함)
+
+---
+
+# 핵심 개선 포인트 (High-impact)
+
+1. ## 액션 goal 추적: `EXECUTING`만 보면 놓칩니다
+
+지금 `active_*_goal_id_`를 `STATUS_EXECUTING`에서만 설정합니다. 하지만 Nav2 goal은 `ACCEPTED → EXECUTING → (CANCELING) → {SUCCEEDED|CANCELED|ABORTED}`로 흐르며, `EXECUTING`으로 가지 못하고 바로 `ABORTED`나 `CANCELED`되는 케이스가 있습니다. 이러면 최종 상태를 영영 놓칠 수 있어요.
+액션 상태 상수는 `action_msgs/GoalStatus`에 정의되어 있고(예: `STATUS_ACCEPTED=1`, `STATUS_EXECUTING=2`, `STATUS_CANCELED=5`, `STATUS_ABORTED=6`), 상태 스트림은 모든 액션 서버에 `/<action_name>/_action/status`로 노출됩니다. ([docs.ros2.org][1])
+
+**개선 패치(요지):**
+
+* `ACCEPTED`에서도 `active_*_goal_id_`를 잡도록 확장
+* 여러 goal 동시 존재 시 최신(goal\_info.stamp 가 가장 최신) goal만 “활성”으로 간주
+* `CANCELING`은 활성 상태 유지로 보되, `CANCELED/ABORTED/SUCCEEDED`가 뜨면 즉시 종료 처리
+
+```cpp
+// 공통 유틸 (헤더/소스 적절히 배치)
+static bool is_active_status(int8_t s) {
+  using GS = action_msgs::msg::GoalStatus;
+  return s == GS::STATUS_ACCEPTED || s == GS::STATUS_EXECUTING || s == GS::STATUS_CANCELING;
+}
+static bool is_terminal_status(int8_t s) {
+  using GS = action_msgs::msg::GoalStatus;
+  return s == GS::STATUS_SUCCEEDED || s == GS::STATUS_CANCELED || s == GS::STATUS_ABORTED;
+}
+static bool newer(const builtin_interfaces::msg::Time& a, const builtin_interfaces::msg::Time& b){
+  return (a.sec > b.sec) || (a.sec == b.sec && a.nanosec > b.nanosec);
+}
+
+// 예: nav_to_pose_status_callback() 안의 골자만 교체
+void StatusManager::nav_to_pose_status_callback(const GoalStatusArray::SharedPtr msg) {
+  using GS = action_msgs::msg::GoalStatus;
+  bool is_active_now = false;
+  std::optional<GS> final_status;
+
+  // 1) 최신 goal 선택(ACCEPTED/EXECUTING/CANCELING 중에서 stamp 가장 최신)
+  std::optional<unique_identifier_msgs::msg::UUID> newest_goal;
+  builtin_interfaces::msg::Time newest_stamp{};
+  for (const auto& s : msg->status_list) {
+    if (is_active_status(s.status) && (!newest_goal || newer(s.goal_info.stamp, newest_stamp))) {
+      newest_goal = s.goal_info.goal_id;
+      newest_stamp = s.goal_info.stamp;
+    }
+  }
+  if (newest_goal) {
+    is_active_now = true;
+    if (!active_nav_goal_id_ || !is_same_goal_id(*newest_goal, *active_nav_goal_id_)) {
+      std::lock_guard<std::recursive_mutex> lk(status_mutex_);
+      active_nav_goal_id_ = newest_goal;
+      latest_terminal_status_.reset(); // 새 goal 시작 → 이전 종결 플래그 클리어
+    }
+  }
+
+  // 2) 추적 중 goal의 최종 상태 탐지(최우선 CANCELED)
+  if (active_nav_goal_id_) {
+    for (const auto& s : msg->status_list) {
+      if (!is_same_goal_id(s.goal_info.goal_id, *active_nav_goal_id_)) continue;
+      if (s.status == GS::STATUS_CANCELED) { final_status = s; break; }
+      if (s.status == GS::STATUS_SUCCEEDED || s.status == GS::STATUS_ABORTED) final_status = s;
+    }
+  }
+
+  if (final_status) {
+    is_active_now = false;
+    std::lock_guard<std::recursive_mutex> lk(status_mutex_);
+    latest_terminal_status_ = final_status;
+    active_nav_goal_id_.reset();
+  }
+
+  is_nav_executing_.store(is_active_now);
+  evaluate_and_publish_if_changed();
+}
+```
+
+> 참고: `GoalInfo`에 `stamp`가 있어 최신 goal 판별에 쓰기 좋습니다. ([docs.ros2.org][2])
+
+---
+
+2. ## BT 런타임 상태 추적: “증분 로그”를 **스냅샷**처럼 쓰면 오검출
+
+`/behavior_tree_log`의 `event_log`는 “그 틱에서 바뀐 노드들만” 실립니다. 지금처럼 콜백마다 `running_bt_nodes_.clear()` 후 `RUNNING`만 담으면, 한 번 `RUNNING`으로 진입한 노드가 다음 틱에 변화가 없을 때 목록에서 사라져 “안 돌고 있다”고 오판합니다. `BehaviorTreeStatusChange` 메시지의 필드는 문자열 `"IDLE|RUNNING|SUCCESS|FAILURE"`이고, 이건 “상태 변경 이벤트”임을 암시합니다. ([ROS Documentation][3])
+
+**개선 패치(요지):**
+
+* `unordered_map<std::string, std::string> bt_states_`로 **누적 상태맵** 유지
+* 이번 이벤트로 바뀐 노드만 갱신, `RUNNING` 여부는 맵을 조회
+* `is_bt_node_running()`는 맵 기반으로 변경
+
+```cpp
+// 멤버로 교체
+std::unordered_map<std::string, std::string> bt_states_;
+
+void StatusManager::bt_log_callback(const BehaviorTreeLog::SharedPtr msg) {
+  std::lock_guard<std::recursive_mutex> lk(status_mutex_);
+  bool recovery_changed = false;
+  RobotStatus new_status = current_status_;
+
+  static const std::unordered_set<std::string> recovery_seq = {
+    "ShortRecoverySequence1","ShortRecoverySequence2","ShortRecoverySequenceTotal1"
+  };
+
+  for (const auto& ev : msg->event_log) {
+    bt_states_[ev.node_name] = ev.current_status; // 누적 업데이트
+
+    if (recovery_seq.count(ev.node_name)) {
+      if (ev.current_status == "RUNNING")      { new_status = RobotStatus::RECOVERY_RUNNING; recovery_changed = true; }
+      else if (ev.current_status == "SUCCESS") { new_status = RobotStatus::RECOVERY_SUCCESS; recovery_changed = true; }
+      else if (ev.current_status == "FAILURE") { new_status = RobotStatus::RECOVERY_FAILURE; recovery_changed = true; }
+    }
+  }
+
+  if (recovery_changed && current_status_ != new_status) {
+    current_status_ = new_status;
+    std_msgs::msg::String out; out.data = status_to_string(current_status_);
+    RCLCPP_INFO(get_logger(), "Robot Status Changed (by Recovery BT) -> %s", out.data.c_str());
+    status_publisher_->publish(out);
+  }
+
+  // 필요 시: evaluate( ) 호출
+  evaluate_and_publish_if_changed();
+}
+
+bool StatusManager::is_bt_node_running(const std::string& node_name) const {
+  auto it = bt_states_.find(node_name);
+  return it != bt_states_.end() && it->second == "RUNNING";
+}
+```
+
+---
+
+3. ## `RECEIVED_GOAL` 판정은 BT 노드명 대신 **액션 상태**에 의존
+
+지금은 `NavigateWithReplanning` 노드가 RUNNING이면 `RECEIVED_GOAL`로 분류하는데, 트리 이름/구조가 바뀌면 깨집니다. 액션 상태 배열에서 `STATUS_ACCEPTED`가 등장하면 그 순간을 `RECEIVED_GOAL`로 두는 편이 이식성 높고 정확합니다. 상수 정의는 위 문서 참고. ([docs.ros2.org][1])
+
+---
+
+4. ## 락 구조 단순화(재귀 뮤텍스 제거)
+
+여러 콜백에서 `status_mutex_` 잡은 채 `evaluate_and_publish_if_changed()`를 다시 호출해서 **재귀 락**이 필요해졌습니다.
+권장 패턴은:
+
+* “상태 플래그 갱신”은 (원자/짧은 구간)에서만 잠깐 잠그거나 `std::atomic`으로 처리
+* `evaluate_and_publish_if_changed()` 내부만 **단일 지점**에서 락 획득
+* 콜백에서는 락 없이 `evaluate...` 호출
+
+이렇게 바꾸면 `std::mutex`로 충분하고 데드락/우발적 재귀 진입 위험이 줄어듭니다.
+
+---
+
+5. ## 퍼블리시 정책: 이벤트 + 하트비트 구분 & QoS 개선
+
+지금은 타이머가 1초마다 무조건 동일 상태를 퍼블리시합니다. 구독자 입장에선 중복 스팸일 수 있어요.
+
+* 상태 변경 시에는 즉시 퍼블리시 (지금처럼)
+* 하트비트는 **옵션**으로 별도 토픽(`/robot_status/heartbeat`) or 동일 토픽에 **주기 N초로만**
+* QoS는 “마지막 상태를 새 구독자가 즉시 받도록” `transient_local` 권장
+
+```cpp
+auto qos = rclcpp::QoS(1).transient_local().reliable();
+status_publisher_ = create_publisher<std_msgs::msg::String>("/robot_status", qos);
+```
+
+---
+
+6. ## 라이프사이클 감시: detatch thread 지양 + 동적 갱신
+
+`query_initial_node_states()`를 detach 스레드에서 한 번만 평가하면, 이후 노드가 죽거나 재활성화돼도 `are_core_nodes_active_`가 업데이트되지 않습니다. 또한 노드 종료 시 detach 스레드가 남아있을 수 있어요.
+
+* **대안 A:** `/<node>/transition_event`(lifecycle\_msgs/TransitionEvent) 구독으로 활성/비활성 상태를 지속 반영(초기 상태는 `GetState` 서비스로 1회 질의) ([docs.ros2.org][4])
+* **대안 B:** Nav2 LifecycleManager 클라이언트를 써서 매 N초 `is_active()` 폴링 (간단) ([api.nav2.org][5])
+
+둘 중 하나로 옮기고, detach 대신 타이머 기반 폴링을 추천합니다.
+
+---
+
+7. ## IDLE 판정 안정화(속도 저주파 필터 & 파라미터화)
+
+`|v|<0.01 && |w|<0.01` 한 방이면 노이즈/양자화로 튀어요. 간단한 지수평활(EMA)나 0.2–0.3s 히스테리시스 홀드, 임계값 파라미터화를 권장.
+
+```cpp
+// 파라미터로 노출
+double stop_lin_thresh_{0.02}, stop_ang_thresh_{0.02}, stop_hold_sec_{0.3};
+rclcpp::Time last_motion_time_;
+void StatusManager::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg){
+  const auto now = now();
+  const bool moving = std::fabs(msg->twist.twist.linear.x)  > stop_lin_thresh_ ||
+                      std::fabs(msg->twist.twist.angular.z) > stop_ang_thresh_;
+  if (moving) last_motion_time_ = now;
+  is_robot_stopped_.store((now - last_motion_time_).seconds() > stop_hold_sec_);
+}
+```
+
+---
+
+# 기타 권장사항 (Nice-to-have)
+
+* **상태 토픽 타입**: 문자열 대신 `uint8`(enum) 또는 커스텀 msg(문자열+코드)로 내보내면 소비측 파싱이 견고해집니다.
+* **리커버리 표시 유지시간**: `RECOVERY_*`는 너무 순간적일 수 있으니 0.3–0.5s 유지(타임스탬프로 만료)하면 UI/로그 가독성↑.
+* **토픽 이름 파라미터화**: `bt_log_topic`(기본 `behavior_tree_log`)를 파라미터로—일부 설정은 `bt_navigator` 네임스페이스가 붙습니다. (BT 로그 메시지 정의는 nav2\_msgs에 문서화) ([ROS Documentation][6])
+* **컴포넌트화**: 컨테이너 사용 시 `rclcpp_components` 등록 매크로 추가.
+* **헤더 누락**: `unique_identifier_msgs/msg/uuid.hpp` 명시 include 권장.
+
+---
+
+# `determine_current_status()` 로직에 대한 짧은 제안
+
+* 우선순위는 그대로 두되, `RECEIVED_GOAL` 판단을 “액션에 `ACCEPTED` 존재” 여부로 바꾸세요.
+* `FOLLOWING_WAYPOINTS` 상태는 `is_waypoints_executing_`이 true일 때 우선 적용 (하위 플래그는 동일하게 PLANNING/DRIVING로 override).
+* `latest_terminal_status_`는 **읽었을 때만 reset**하는 현재 방식이 적절합니다.
+
+---
+
+필요하면 위 패치를 반영한 정리 버전(hpp/cpp)로도 뽑아줄게요. 참고 문서 몇 개 남겨둡니다:
+
+* `BehaviorTreeLog` / `BehaviorTreeStatusChange` 메시지 정의(상태 문자열) ([ROS Documentation][6])
+* 액션 상태 상수(`GoalStatus`), `GoalInfo.stamp`, `_action/status` 모니터링 관례 ([docs.ros2.org][1])
+* Nav2 BT 개요/기본 트리 문서(트리 이름 의존 위험성 참고) ([docs.nav2.org][7])
+* Lifecycle 이벤트/서비스(TransitionEvent/GetState, LifecycleManager client) ([docs.ros2.org][8])
+
+원하시면 “파라미터 선언 + QoS + 타이머 기반 라이프사이클 폴링”까지 포함한 최소 예제도 바로 만들어 드릴게요.
+
+[1]: https://docs.ros2.org/foxy/api/action_msgs/msg/GoalStatus.html "msg/GoalStatus Documentation"
+[2]: https://docs.ros2.org/foxy/api/action_msgs/msg/GoalInfo.html?utm_source=chatgpt.com "action_msgs/msg/GoalInfo Message"
+[3]: https://docs.ros.org/en/iron/p/nav2_msgs/interfaces/msg/BehaviorTreeStatusChange.html "BehaviorTreeStatusChange — nav2_msgs 1.2.10 documentation"
+[4]: https://docs.ros2.org/foxy/api/lifecycle_msgs/msg/TransitionEvent.html?utm_source=chatgpt.com "lifecycle_msgs/msg/TransitionEvent Message"
+[5]: https://api.nav2.org/nav2-jazzy/html/classnav2__lifecycle__manager_1_1LifecycleManagerClient.html?utm_source=chatgpt.com "nav2_lifecycle_manager LifecycleManagerClient"
+[6]: https://docs.ros.org/en/iron/p/nav2_msgs/interfaces/msg/BehaviorTreeLog.html "BehaviorTreeLog — nav2_msgs 1.2.10 documentation"
+[7]: https://docs.nav2.org/configuration/packages/configuring-bt-navigator.html?utm_source=chatgpt.com "Behavior-Tree Navigator"
+[8]: https://docs.ros2.org/foxy/api/lifecycle_msgs/index-msg.html?utm_source=chatgpt.com "lifecycle_msgs Message / Service / Action Documentation"
