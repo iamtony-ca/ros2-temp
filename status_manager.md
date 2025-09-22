@@ -695,3 +695,681 @@ void StatusManager::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg){
 [6]: https://docs.ros.org/en/iron/p/nav2_msgs/interfaces/msg/BehaviorTreeLog.html "BehaviorTreeLog — nav2_msgs 1.2.10 documentation"
 [7]: https://docs.nav2.org/configuration/packages/configuring-bt-navigator.html?utm_source=chatgpt.com "Behavior-Tree Navigator"
 [8]: https://docs.ros2.org/foxy/api/lifecycle_msgs/index-msg.html?utm_source=chatgpt.com "lifecycle_msgs Message / Service / Action Documentation"
+
+
+##################  
+좋아. 요청대로 **A방식(콜백은 Reentrant 유지, 공유 상태 접근은 모두 mutex로 보호)** 을 반영해서, `RECEIVED_GOAL` 원샷 트리거 + 콜백 그룹 + 레이스 방지까지 모두 포함한 **완성본 hpp/cpp**를 아래에 정리했어. 그대로 빌드해서 쓰면 된다.
+
+---
+
+### `status_manager.hpp`
+
+```cpp
+#pragma once
+
+#include <atomic>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+#include <set>
+#include <unordered_map>
+#include <algorithm>
+#include <chrono>
+
+#include "rclcpp/rclcpp.hpp"
+#include "rclcpp_action/rclcpp_action.hpp"
+
+#include "action_msgs/msg/goal_status_array.hpp"
+#include "action_msgs/msg/goal_status.hpp"
+#include "unique_identifier_msgs/msg/uuid.hpp"
+
+#include "nav_msgs/msg/odometry.hpp"
+#include "nav2_msgs/msg/behavior_tree_log.hpp"
+
+#include "lifecycle_msgs/srv/get_state.hpp"
+
+#include "std_msgs/msg/string.hpp"
+#include "std_msgs/msg/bool.hpp"
+
+enum class RobotStatus : uint8_t {
+  IDLE,
+  RECEIVED_GOAL,
+  PLANNING,
+  DRIVING,
+  FOLLOWING_WAYPOINTS,
+  PAUSED,
+  COLLISION_IMMINENT,
+  RECOVERY_FAILURE,
+  RECOVERY_RUNNING,
+  RECOVERY_SUCCESS,
+  SUCCEEDED,
+  FAILED,
+  CANCELED
+};
+
+class StatusManager : public rclcpp::Node
+{
+public:
+  using GoalStatusArray = action_msgs::msg::GoalStatusArray;
+  using BehaviorTreeLog = nav2_msgs::msg::BehaviorTreeLog;
+
+  explicit StatusManager(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
+
+private:
+  // === 주기/평가 ===
+  void timer_callback();
+  void evaluate_and_publish_if_changed();
+  RobotStatus determine_current_status(RobotStatus last_known_status);
+
+  // === 콜백 ===
+  void nav_to_pose_status_callback(const GoalStatusArray::SharedPtr msg);
+  void waypoints_status_callback(const GoalStatusArray::SharedPtr msg);
+  void nav_through_poses_status_callback(const GoalStatusArray::SharedPtr msg);
+  void compute_path_poses_status_callback(const GoalStatusArray::SharedPtr msg);
+  void compute_path_status_callback(const GoalStatusArray::SharedPtr msg);
+  void follow_path_status_callback(const GoalStatusArray::SharedPtr msg);
+  void bt_log_callback(const BehaviorTreeLog::SharedPtr msg);
+  void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
+  void collision_callback(const std_msgs::msg::Bool::SharedPtr msg);
+  void pause_flag_callback(const std_msgs::msg::Bool::SharedPtr msg);
+
+  // === 유틸 ===
+  void query_initial_node_states();
+  std::string status_to_string(RobotStatus status);
+  bool is_bt_node_running(const std::string& node_name) const;
+  inline bool is_terminal_robot_status(RobotStatus s) const {
+    return s == RobotStatus::IDLE || s == RobotStatus::SUCCEEDED ||
+           s == RobotStatus::FAILED || s == RobotStatus::CANCELED;
+  }
+
+  // === 동기화/상태 (모든 공유 상태는 status_mutex_로 보호) ===
+  mutable std::mutex status_mutex_;
+  RobotStatus current_status_{RobotStatus::IDLE};
+
+  bool are_core_nodes_active_{false};
+  bool is_robot_stopped_{true};
+  bool is_collision_imminent_{false};
+  bool is_paused_{false};
+
+  bool is_nav_executing_{false};
+  bool is_waypoints_executing_{false};
+  bool is_nav_through_poses_executing_{false};
+  bool is_planning_sub_action_executing_{false};
+  bool is_driving_sub_action_executing_{false};
+
+  std::vector<std::string> running_bt_nodes_;
+  bool is_in_recovery_context_{false};
+
+  std::optional<action_msgs::msg::GoalStatus> latest_terminal_status_;
+  std::optional<unique_identifier_msgs::msg::UUID> active_nav_goal_id_;
+  std::optional<unique_identifier_msgs::msg::UUID> active_waypoints_goal_id_;
+  std::optional<unique_identifier_msgs::msg::UUID> active_nav_through_poses_goal_id_;
+
+  // === RECEIVED_GOAL 원샷 트리거 ===
+  bool received_goal_armed_{true};   // 터미널 상태에서 arm
+  bool bt_log_seen_in_cycle_{false}; // 디버깅용
+
+  // === ROS I/F ===
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_publisher_;
+
+  rclcpp::Subscription<GoalStatusArray>::SharedPtr nav_to_pose_status_sub_;
+  rclcpp::Subscription<GoalStatusArray>::SharedPtr waypoints_status_sub_;
+  rclcpp::Subscription<GoalStatusArray>::SharedPtr nav_through_poses_status_sub_;
+  rclcpp::Subscription<GoalStatusArray>::SharedPtr compute_path_poses_status_sub_;
+  rclcpp::Subscription<GoalStatusArray>::SharedPtr compute_path_status_sub_;
+  rclcpp::Subscription<GoalStatusArray>::SharedPtr follow_path_status_sub_;
+  rclcpp::Subscription<BehaviorTreeLog>::SharedPtr bt_log_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr collision_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr pause_sub_;
+
+  rclcpp::TimerBase::SharedPtr timer_;
+
+  std::vector<rclcpp::Client<lifecycle_msgs::srv::GetState>::SharedPtr> lifecycle_clients_;
+  std::vector<std::string> core_node_names_ = {
+    "bt_navigator", "planner_server", "controller_server", "amcl"
+  };
+
+  // === 콜백 그룹 ===
+  rclcpp::CallbackGroup::SharedPtr cbg_bt_;
+  rclcpp::CallbackGroup::SharedPtr cbg_actions_; // Reentrant (A방식) + mutex 보호
+  rclcpp::CallbackGroup::SharedPtr cbg_misc_;
+  rclcpp::CallbackGroup::SharedPtr cbg_clients_;
+};
+```
+
+---
+
+### `status_manager.cpp`
+
+```cpp
+#include "robot_monitoring/status_manager.hpp"
+
+using GoalStatus = action_msgs::msg::GoalStatus;
+
+static bool is_same_goal_id(const unique_identifier_msgs::msg::UUID& id1,
+                            const unique_identifier_msgs::msg::UUID& id2)
+{
+  return std::equal(id1.uuid.begin(), id1.uuid.end(), id2.uuid.begin());
+}
+
+StatusManager::StatusManager(const rclcpp::NodeOptions & options)
+: Node("status_manager", options)
+{
+  // === 콜백 그룹 ===
+  cbg_bt_      = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  cbg_actions_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);  // A방식
+  cbg_misc_    = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+  cbg_clients_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
+  // === 퍼블리셔 (상태 캐시) ===
+  auto status_qos = rclcpp::QoS(1).reliable().transient_local();
+  status_publisher_ = this->create_publisher<std_msgs::msg::String>("/robot_status", status_qos);
+
+  // === 타이머 ===
+  timer_ = this->create_wall_timer(
+    std::chrono::seconds(1),
+    std::bind(&StatusManager::timer_callback, this),
+    cbg_misc_
+  );
+
+  // === 서브스크립션 옵션 ===
+  rclcpp::SubscriptionOptions so_actions; so_actions.callback_group = cbg_actions_;
+  rclcpp::SubscriptionOptions so_bt;     so_bt.callback_group      = cbg_bt_;
+  rclcpp::SubscriptionOptions so_misc;   so_misc.callback_group    = cbg_misc_;
+
+  // === 액션 상태 토픽 ===
+  nav_to_pose_status_sub_ = this->create_subscription<GoalStatusArray>(
+    "/navigate_to_pose/_action/status", 10,
+    std::bind(&StatusManager::nav_to_pose_status_callback, this, std::placeholders::_1),
+    so_actions);
+
+  waypoints_status_sub_ = this->create_subscription<GoalStatusArray>(
+    "/follow_waypoints/_action/status", 10,
+    std::bind(&StatusManager::waypoints_status_callback, this, std::placeholders::_1),
+    so_actions);
+
+  nav_through_poses_status_sub_ = this->create_subscription<GoalStatusArray>(
+    "/navigate_through_poses/_action/status", 10,
+    std::bind(&StatusManager::nav_through_poses_status_callback, this, std::placeholders::_1),
+    so_actions);
+
+  compute_path_poses_status_sub_ = this->create_subscription<GoalStatusArray>(
+    "/compute_path_through_poses/_action/status", 10,
+    std::bind(&StatusManager::compute_path_poses_status_callback, this, std::placeholders::_1),
+    so_actions);
+
+  compute_path_status_sub_ = this->create_subscription<GoalStatusArray>(
+    "/compute_path_to_pose/_action/status", 10,
+    std::bind(&StatusManager::compute_path_status_callback, this, std::placeholders::_1),
+    so_actions);
+
+  follow_path_status_sub_ = this->create_subscription<GoalStatusArray>(
+    "/follow_path/_action/status", 10,
+    std::bind(&StatusManager::follow_path_status_callback, this, std::placeholders::_1),
+    so_actions);
+
+  // === BT 로그 ===
+  bt_log_sub_ = this->create_subscription<BehaviorTreeLog>(
+    "/behavior_tree_log", 10,
+    std::bind(&StatusManager::bt_log_callback, this, std::placeholders::_1),
+    so_bt);
+
+  // === 기타 ===
+  odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+    "/odom", 10,
+    std::bind(&StatusManager::odom_callback, this, std::placeholders::_1),
+    so_misc);
+
+  collision_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+    "/is_collision_imminent", rclcpp::SystemDefaultsQoS(),
+    std::bind(&StatusManager::collision_callback, this, std::placeholders::_1),
+    so_misc);
+
+  pause_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+    "/pause_robot", rclcpp::SystemDefaultsQoS(),
+    std::bind(&StatusManager::pause_flag_callback, this, std::placeholders::_1),
+    so_misc);
+
+  // === 라이프사이클 상태 질의 클라이언트 ===
+  for (const auto& name : core_node_names_) {
+    auto client = this->create_client<lifecycle_msgs::srv::GetState>(
+      name + "/get_state",
+      rmw_qos_profile_services_default,
+      cbg_clients_);
+    lifecycle_clients_.push_back(client);
+  }
+
+  // 초기 활성 여부 확인 (별도 스레드)
+  std::thread{ [this]() { this->query_initial_node_states(); } }.detach();
+
+  RCLCPP_INFO(this->get_logger(), "StatusManager Node has been started.");
+}
+
+// === 타이머: 현 상태 주기 퍼블리시 ===
+void StatusManager::timer_callback()
+{
+  std_msgs::msg::String msg;
+  {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    msg.data = status_to_string(current_status_);
+  }
+  status_publisher_->publish(msg);
+}
+
+// === 상태 평가 & 변경 시 퍼블리시 ===
+void StatusManager::evaluate_and_publish_if_changed()
+{
+  std::optional<std_msgs::msg::String> to_pub;
+
+  {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    RobotStatus new_status = determine_current_status(current_status_);
+
+    // 터미널 상태로 돌아오면 RECEIVED_GOAL 트리거 재-무장
+    if (is_terminal_robot_status(new_status)) {
+      received_goal_armed_ = true;
+      bt_log_seen_in_cycle_ = false;
+    }
+
+    if (new_status != current_status_) {
+      current_status_ = new_status;
+      std_msgs::msg::String s; s.data = status_to_string(current_status_);
+      RCLCPP_INFO(this->get_logger(), "Robot Status Changed -> %s", s.data.c_str());
+      to_pub = s;
+    }
+  }
+
+  if (to_pub) status_publisher_->publish(*to_pub);
+}
+
+// === 상태 결정 ===
+RobotStatus StatusManager::determine_current_status(RobotStatus last_known_status)
+{
+  // 공유 상태 읽기 전부 락 안에서 호출되므로 race 없음
+  if (is_collision_imminent_) return RobotStatus::COLLISION_IMMINENT;
+  if (is_paused_)             return RobotStatus::PAUSED;
+
+  if (is_nav_executing_) {
+    if (last_known_status == RobotStatus::RECOVERY_RUNNING) return last_known_status;
+    if (is_driving_sub_action_executing_)  return RobotStatus::DRIVING;
+    if (is_planning_sub_action_executing_) return RobotStatus::PLANNING;
+    if (last_known_status == RobotStatus::PLANNING || last_known_status == RobotStatus::DRIVING)
+      return last_known_status;
+  }
+
+  if (is_waypoints_executing_ || is_nav_through_poses_executing_) {
+    if (last_known_status == RobotStatus::RECOVERY_RUNNING) return last_known_status;
+    if (is_driving_sub_action_executing_)  return RobotStatus::DRIVING;
+    if (is_planning_sub_action_executing_) return RobotStatus::PLANNING;
+    if (last_known_status == RobotStatus::PLANNING || last_known_status == RobotStatus::DRIVING)
+      return last_known_status;
+    // 필요시 FOLLOWING_WAYPOINTS로 별도 분리 가능
+  }
+
+  if (latest_terminal_status_.has_value()) {
+    auto s = latest_terminal_status_->status;
+    latest_terminal_status_.reset();
+    switch (s) {
+      case GoalStatus::STATUS_SUCCEEDED: return RobotStatus::SUCCEEDED;
+      case GoalStatus::STATUS_CANCELED:  return RobotStatus::CANCELED;
+      case GoalStatus::STATUS_ABORTED:   return RobotStatus::FAILED;
+      default: break;
+    }
+  }
+
+  if (are_core_nodes_active_ && is_robot_stopped_)
+    return RobotStatus::IDLE;
+
+  if (!are_core_nodes_active_) return RobotStatus::FAILED;
+  return last_known_status;
+}
+
+// === 액션 상태 콜백들 (A방식: 공유 상태 전체 mutex 보호) ===
+
+void StatusManager::nav_through_poses_status_callback(const GoalStatusArray::SharedPtr msg)
+{
+  bool was_active;
+  {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    was_active = is_nav_through_poses_executing_;
+  }
+
+  bool is_active_now = false;
+  std::optional<action_msgs::msg::GoalStatus> final_status;
+
+  {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    if (!active_nav_through_poses_goal_id_) {
+      for (const auto& status : msg->status_list) {
+        if (status.status == GoalStatus::STATUS_EXECUTING) {
+          is_active_now = true;
+          active_nav_through_poses_goal_id_ = status.goal_info.goal_id;
+          latest_terminal_status_.reset();
+          break;
+        }
+      }
+    } else {
+      is_active_now = true;
+    }
+
+    if (active_nav_through_poses_goal_id_) {
+      for (const auto& status : msg->status_list) {
+        if (is_same_goal_id(status.goal_info.goal_id, *active_nav_through_poses_goal_id_)) {
+          if (status.status == GoalStatus::STATUS_CANCELED) { final_status = status; break; }
+          if (status.status == GoalStatus::STATUS_SUCCEEDED || status.status == GoalStatus::STATUS_ABORTED) {
+            final_status = status;
+          }
+        }
+      }
+    }
+
+    if (final_status) {
+      is_active_now = false;
+      latest_terminal_status_ = final_status;
+      active_nav_through_poses_goal_id_.reset();
+    }
+
+    if (was_active != is_active_now) is_nav_through_poses_executing_ = is_active_now;
+  }
+
+  evaluate_and_publish_if_changed();
+}
+
+void StatusManager::waypoints_status_callback(const GoalStatusArray::SharedPtr msg)
+{
+  bool was_active;
+  {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    was_active = is_waypoints_executing_;
+  }
+
+  bool is_active_now = false;
+  std::optional<action_msgs::msg::GoalStatus> final_status;
+
+  {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    if (!active_waypoints_goal_id_) {
+      for (const auto& status : msg->status_list) {
+        if (status.status == GoalStatus::STATUS_EXECUTING) {
+          is_active_now = true;
+          active_waypoints_goal_id_ = status.goal_info.goal_id;
+          latest_terminal_status_.reset();
+          break;
+        }
+      }
+    } else {
+      is_active_now = true;
+    }
+
+    if (active_waypoints_goal_id_) {
+      for (const auto& status : msg->status_list) {
+        if (is_same_goal_id(status.goal_info.goal_id, *active_waypoints_goal_id_)) {
+          if (status.status == GoalStatus::STATUS_CANCELED) { final_status = status; break; }
+          if (status.status == GoalStatus::STATUS_SUCCEEDED || status.status == GoalStatus::STATUS_ABORTED) {
+            final_status = status;
+          }
+        }
+      }
+    }
+
+    if (final_status) {
+      is_active_now = false;
+      latest_terminal_status_ = final_status;
+      active_waypoints_goal_id_.reset();
+    }
+
+    if (was_active != is_active_now) is_waypoints_executing_ = is_active_now;
+  }
+
+  evaluate_and_publish_if_changed();
+}
+
+void StatusManager::nav_to_pose_status_callback(const GoalStatusArray::SharedPtr msg)
+{
+  bool was_active;
+  {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    was_active = is_nav_executing_;
+  }
+
+  bool is_active_now = false;
+  std::optional<action_msgs::msg::GoalStatus> final_status;
+
+  {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    if (!active_nav_goal_id_) {
+      for (const auto& status : msg->status_list) {
+        if (status.status == GoalStatus::STATUS_EXECUTING) {
+          is_active_now = true;
+          active_nav_goal_id_ = status.goal_info.goal_id;
+          latest_terminal_status_.reset();
+          break;
+        }
+      }
+    } else {
+      is_active_now = true;
+    }
+
+    if (active_nav_goal_id_) {
+      for (const auto& status : msg->status_list) {
+        if (is_same_goal_id(status.goal_info.goal_id, *active_nav_goal_id_)) {
+          if (status.status == GoalStatus::STATUS_CANCELED) { final_status = status; break; }
+          if (status.status == GoalStatus::STATUS_SUCCEEDED || status.status == GoalStatus::STATUS_ABORTED) {
+            final_status = status;
+          }
+        }
+      }
+    }
+
+    if (final_status) {
+      is_active_now = false;
+      latest_terminal_status_ = final_status;
+      active_nav_goal_id_.reset();
+    }
+
+    if (was_active != is_active_now) is_nav_executing_ = is_active_now;
+  }
+
+  evaluate_and_publish_if_changed();
+}
+
+void StatusManager::compute_path_poses_status_callback(const GoalStatusArray::SharedPtr msg)
+{
+  bool is_active = false;
+  for (const auto& s : msg->status_list) {
+    if (s.status == GoalStatus::STATUS_EXECUTING) { is_active = true; break; }
+  }
+  {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    is_planning_sub_action_executing_ = is_active;
+  }
+  evaluate_and_publish_if_changed();
+}
+
+void StatusManager::compute_path_status_callback(const GoalStatusArray::SharedPtr msg)
+{
+  bool is_active = false;
+  for (const auto& s : msg->status_list) {
+    if (s.status == GoalStatus::STATUS_EXECUTING) { is_active = true; break; }
+  }
+  {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    is_planning_sub_action_executing_ = is_active;
+  }
+  evaluate_and_publish_if_changed();
+}
+
+void StatusManager::follow_path_status_callback(const GoalStatusArray::SharedPtr msg)
+{
+  bool is_active = false;
+  for (const auto& s : msg->status_list) {
+    if (s.status == GoalStatus::STATUS_EXECUTING) { is_active = true; break; }
+  }
+  {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    is_driving_sub_action_executing_ = is_active;
+  }
+  evaluate_and_publish_if_changed();
+}
+
+void StatusManager::bt_log_callback(const BehaviorTreeLog::SharedPtr msg)
+{
+  std::optional<std_msgs::msg::String> to_pub;
+
+  {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    bt_log_seen_in_cycle_ = true;
+
+    // (1) 원샷 RECEIVED_GOAL: 터미널 상태 && 아직 arm 상태일 때만 1회 발화
+    if (received_goal_armed_ && is_terminal_robot_status(current_status_)) {
+      current_status_ = RobotStatus::RECEIVED_GOAL;
+      received_goal_armed_ = false;
+      std_msgs::msg::String s; s.data = status_to_string(current_status_);
+      RCLCPP_INFO(this->get_logger(), "Robot Status Changed (BT first seen) -> %s", s.data.c_str());
+      to_pub = s;
+    }
+
+    // (2) 리커버리 이벤트 감지 + 현재 RUNNING 노드 리스트 업데이트(증분 로그 기반)
+    static const std::set<std::string> recovery_sequence_nodes = {
+      "ShortRecoverySequence1",
+      "ShortRecoverySequence2",
+      "ShortRecoverySequenceTotal1",
+    };
+
+    bool status_changed_by_recovery = false;
+    RobotStatus new_status = current_status_;
+
+    running_bt_nodes_.clear();
+    bool recovery_flag_check = false;
+
+    for (const auto& event : msg->event_log) {
+      if (event.current_status == "RUNNING") {
+        running_bt_nodes_.push_back(event.node_name);
+        if (recovery_sequence_nodes.count(event.node_name)) {
+          recovery_flag_check = true;
+        }
+      }
+      if (recovery_sequence_nodes.count(event.node_name)) {
+        if (event.current_status == "RUNNING")      { new_status = RobotStatus::RECOVERY_RUNNING; status_changed_by_recovery = true; }
+        else if (event.current_status == "SUCCESS")  { new_status = RobotStatus::RECOVERY_SUCCESS; status_changed_by_recovery = true; }
+        else if (event.current_status == "FAILURE")  { new_status = RobotStatus::RECOVERY_FAILURE; status_changed_by_recovery = true; }
+      }
+    }
+
+    is_in_recovery_context_ = recovery_flag_check;
+
+    if (status_changed_by_recovery && current_status_ != new_status) {
+      current_status_ = new_status;
+      std_msgs::msg::String s; s.data = status_to_string(current_status_);
+      RCLCPP_INFO(this->get_logger(), "Robot Status Changed (by Recovery BT) -> %s", s.data.c_str());
+      to_pub = s;  // 덮어씀
+    }
+  }
+
+  if (to_pub) status_publisher_->publish(*to_pub);
+
+  // 최종 일관성 유지
+  evaluate_and_publish_if_changed();
+}
+
+void StatusManager::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
+{
+  const double lin = std::abs(msg->twist.twist.linear.x);
+  const double ang = std::abs(msg->twist.twist.angular.z);
+  {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    is_robot_stopped_ = (lin < 0.01 && ang < 0.01);
+  }
+}
+
+void StatusManager::collision_callback(const std_msgs::msg::Bool::SharedPtr msg)
+{
+  {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    is_collision_imminent_ = msg->data;
+  }
+  evaluate_and_publish_if_changed();
+}
+
+void StatusManager::pause_flag_callback(const std_msgs::msg::Bool::SharedPtr msg)
+{
+  {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    is_paused_ = msg->data;
+  }
+  evaluate_and_publish_if_changed();
+}
+
+void StatusManager::query_initial_node_states()
+{
+  bool all_active = true;
+  for (size_t i = 0; i < core_node_names_.size(); ++i) {
+    while (!lifecycle_clients_[i]->wait_for_service(std::chrono::seconds(1))) {
+      if (!rclcpp::ok()) {
+        RCLCPP_ERROR(this->get_logger(), "Interrupted while waiting for %s service.", core_node_names_[i].c_str());
+        {
+          std::lock_guard<std::mutex> lk(status_mutex_);
+          are_core_nodes_active_ = false;
+        }
+        return;
+      }
+      RCLCPP_INFO(this->get_logger(), "Waiting for %s service...", core_node_names_[i].c_str());
+    }
+
+    auto req = std::make_shared<lifecycle_msgs::srv::GetState::Request>();
+    auto result_future = lifecycle_clients_[i]->async_send_request(req);
+    auto result = result_future.get();
+    if (!result || result->current_state.id != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+      all_active = false;
+      RCLCPP_WARN(this->get_logger(), "Node %s is not active.", core_node_names_[i].c_str());
+    } else {
+      RCLCPP_INFO(this->get_logger(), "Node %s is active.", core_node_names_[i].c_str());
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    are_core_nodes_active_ = all_active;
+  }
+  RCLCPP_INFO(this->get_logger(), "Core nodes active status: %s", all_active ? "true" : "false");
+  evaluate_and_publish_if_changed();
+}
+
+bool StatusManager::is_bt_node_running(const std::string& node_name) const
+{
+  std::lock_guard<std::mutex> lk(status_mutex_);
+  return std::find(running_bt_nodes_.begin(), running_bt_nodes_.end(), node_name) != running_bt_nodes_.end();
+}
+
+std::string StatusManager::status_to_string(RobotStatus status)
+{
+  switch (status) {
+    case RobotStatus::IDLE:                return "IDLE";
+    case RobotStatus::RECEIVED_GOAL:       return "RECEIVED_GOAL";
+    case RobotStatus::PLANNING:            return "PLANNING";
+    case RobotStatus::DRIVING:             return "DRIVING";
+    case RobotStatus::FOLLOWING_WAYPOINTS: return "FOLLOWING_WAYPOINTS";
+    case RobotStatus::PAUSED:              return "PAUSED";
+    case RobotStatus::COLLISION_IMMINENT:  return "COLLISION_IMMINENT";
+    case RobotStatus::RECOVERY_FAILURE:    return "RECOVERY_FAILURE";
+    case RobotStatus::RECOVERY_RUNNING:    return "RECOVERY_RUNNING";
+    case RobotStatus::RECOVERY_SUCCESS:    return "RECOVERY_SUCCESS";
+    case RobotStatus::SUCCEEDED:           return "SUCCEEDED";
+    case RobotStatus::FAILED:              return "FAILED";
+    case RobotStatus::CANCELED:            return "CANCELED";
+    default:                               return "UNKNOWN";
+  }
+}
+```
+
+---
+
+### 메모
+
+* **실행기**: 반드시 `MultiThreadedExecutor`(혹은 `component_container_mt`) 사용 권장.
+* **스레드 안전**: Reentrant 그룹이라도 모든 공유 상태는 `status_mutex_`로 감싸도록 통일했어. 각 콜백에서 읽기/판정/쓰기 모두 mutex 범위 안에서 수행.
+* **RECEIVED\_GOAL**: `/behavior_tree_log`가 처음 수신되는 시점에, 현재 로봇 상태가 터미널이면 1회만 `RECEIVED_GOAL`로 전이 → 액션 종료로 터미널 상태 복귀 시 arm 재장전.
+
+필요하면 `CMakeLists.txt` / `package.xml` / `component` 등록까지 같이 만들어줄게.
