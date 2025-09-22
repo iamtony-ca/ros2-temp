@@ -198,3 +198,98 @@ https://github.com/isaac-sim/IsaacSim
 https://catalog.ngc.nvidia.com/orgs/nvidia/containers/isaac-sim  
 https://ahnbk.dev/?p=612  
 https://sblim.tistory.com/entry/Isaac-Sim-50-on-Ubuntu-2404-Unitree-G1-RL-LAB-1  
+
+################  
+
+
+문제 2개가 섞여 있어요:
+
+1. `xdg-open` 없음 → 예제 뷰어가 리눅스 데스크탑 유틸리티를 찾다 실패
+2. **Isaac 자산(assets) 루트**를 못 찾아서 예제(Nova Carter) 리소스를 못 여는 상황
+
+아래대로 처리하면 됩니다.
+
+---
+
+# 1) `xdg-open` 오류는 치명적이지 않습니다
+
+예제 패널의 *Browse Scenes*가 컨테이너 안에서 파일 브라우저를 열려고 하다 실패한 겁니다. 시뮬레이션 자체엔 영향 없고, 필요하면 컨테이너에 `xdg-utils`만 넣으면 사라집니다:
+
+```bash
+apt-get update && apt-get install -y xdg-utils   # 선택 사항
+```
+
+(이 단계는 정보용—공식 문서 이슈는 아니고, 핵심은 2번 자산 경로 설정입니다.)
+
+---
+
+# 2) “Could not find assets root folder” 해결 (정식 방법)
+
+Isaac Sim 5.0은 기본적으로 **Isaac 자산 루트**가 설정되어 있어야 예제(로봇/환경)를 불러옵니다. Docker에서 가장 확실한 건 **Nucleus 서버의 Isaac 5.0 자산**을 기본 루트로 지정하는 겁니다.
+
+## A) Nucleus 서버를 쓰는 경우(권장)
+
+Docker 실행 시 **OMNI\_SERVER** 환경변수나 **명령행 플래그**로 Isaac 5.0 자산 루트를 지정하세요. (공식 5.0 설치 FAQ 예시)
+
+```bash
+docker run --gpus all --network=host \
+  -e ACCEPT_EULA=Y \
+  -e OMNI_SERVER=omniverse://<NUCLEUS_IP>/NVIDIA/Assets/Isaac/5.0 \
+  -e OMNI_USER=<username> -e OMNI_PASS=<password> \
+  nvcr.io/nvidia/isaac-sim:5.0.0
+```
+
+또는 앱 실행 플래그:
+
+```bash
+./isaac-sim.sh \
+  --/persistent/isaac/asset_root/default="omniverse://<NUCLEUS_IP>/NVIDIA/Assets/Isaac/5.0"
+```
+
+이 값은 Isaac Sim 내부 API가 자산 루트를 찾을 때 그대로 사용됩니다. ([Isaac Sim Documentation][1])
+
+> 참고: 컨테이너에서 로컬 Nucleus(예: `omniverse://localhost/NVIDIA/Assets/...`)를 쓰는 예시가 포럼에도 정리돼 있습니다. ([NVIDIA Developer Forums][2])
+
+## B) 로컬 디스크의 자산 팩을 쓰는 경우
+
+오프라인/사내망이라면 **Isaac 5.0 자산 팩을 로컬에 내려받아** 컨테이너에 마운트하고, 그 경로를 기본 루트로 지정할 수 있습니다. (FAQ에 로컬 경로 지정/브라우저 폴더 설정 예시 포함)
+
+```bash
+./isaac-sim.sh \
+  --/persistent/isaac/asset_root/default="/isaac-assets/Assets/Isaac/5.0"
+```
+
+필요하면 `~/.local/share/ov/data/Kit/Isaac-Sim/5.0/user.config.json` 에도 동일 값을 넣어 둘 수 있습니다. ([Isaac Sim Documentation][1])
+
+## C) 인터넷(S3) 기본 루트를 그대로 쓰려면
+
+기본값은 퍼블릭 S3의 Isaac 5.0 자산입니다. 방화벽/프록시로 S3가 막혀 있으면 위 A/B 방식으로 전환하세요. (FAQ에 기본값/설정 위치 명시) ([Isaac Sim Documentation][1])
+
+---
+
+# 3) Nova Carter 예제가 보이는지 확인
+
+자산 루트가 제대로 잡히면 **Content/Asset Browser**에서 다음 경로가 보여야 합니다:
+
+* `omniverse://<서버>/NVIDIA/Assets/Isaac/5.0/Isaac/Robots/NVIDIA/NovaCarter/nova_carter.usd`
+  (5.0 문서의 로봇 자산 목록에 Nova Carter 경로가 기재되어 있습니다.) ([Isaac Sim Documentation][3])
+
+그다음 `Window ▸ Examples ▸ Robotics Examples ▸ ROS2 ▸ Navigation ▸ Nova Carter` 를 다시 열면, 더 이상 “assets root” 오류가 나오면 안 됩니다. Isaac 내부의 “자산 루트 탐색” 유틸은 루트를 못 찾으면 RuntimeError를 던지도록 정의돼 있는데, 위 설정을 하면 통과합니다. ([Isaac Sim Documentation][4])
+
+---
+
+## 한 번에 점검 체크리스트
+
+1. 컨테이너 실행 옵션에 **OMNI\_SERVER**(또는 `--/persistent/isaac/asset_root/default=...`)가 들어갔는가? ([Isaac Sim Documentation][1])
+2. Isaac에서 Content/Asset Browser에 **`NVIDIA/Assets/Isaac/5.0/Isaac`** 폴더들이 보이는가? (FAQ의 폴더 예시와 일치 확인) ([Isaac Sim Documentation][1])
+3. Nova Carter 경로(`.../Robots/NVIDIA/NovaCarter/nova_carter.usd`)를 직접 더블클릭해 열 수 있는가? ([Isaac Sim Documentation][3])
+
+---
+
+필요하시면, 지금 쓰시는 Docker 실행 스크립트/compose 파일을 보내주세요. **Nucleus 주소/계정/캐시**까지 포함해 5.0 권장값으로 깔끔히 정리해 드릴게요.
+
+[1]: https://docs.isaacsim.omniverse.nvidia.com/5.0.0/installation/install_faq.html?utm_source=chatgpt.com "Setup Tips - Isaac Sim Documentation"
+[2]: https://forums.developer.nvidia.com/t/could-not-find-isaac-sim-assets-folder/278426?utm_source=chatgpt.com "Could not find Isaac Sim assets folder"
+[3]: https://docs.isaacsim.omniverse.nvidia.com/5.0.0/assets/usd_assets_robots.html?utm_source=chatgpt.com "Robot Assets - Isaac Sim Documentation"
+[4]: https://docs.isaacsim.omniverse.nvidia.com/5.0.0/py/source/extensions/isaacsim.storage.native/docs/index.html?utm_source=chatgpt.com "[isaacsim.storage.native] Isaac Sim Native Storage"
+
