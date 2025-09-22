@@ -1373,3 +1373,177 @@ std::string StatusManager::status_to_string(RobotStatus status)
 * **RECEIVED\_GOAL**: `/behavior_tree_log`가 처음 수신되는 시점에, 현재 로봇 상태가 터미널이면 1회만 `RECEIVED_GOAL`로 전이 → 액션 종료로 터미널 상태 복귀 시 arm 재장전.
 
 필요하면 `CMakeLists.txt` / `package.xml` / `component` 등록까지 같이 만들어줄게.
+
+
+#################  
+
+
+좋아—세 가지(⟨CANCELED, FAILED, SUCCEEDED⟩) 상태로 “전이되는 순간”에 BT 누적 캐시(`bt_states_`)를 싹 비우면 돼. 방법은 간단해:
+
+* `bt_states_`를 멤버로 유지(이미 있다면 재사용).
+* **상태 전이 로직 한 곳**(= `evaluate_and_publish_if_changed()`)에서 새 상태가 `CANCELED|FAILED|SUCCEEDED`일 때 `bt_states_`와 보조 캐시들(`running_bt_nodes_`, `is_in_recovery_context_`)을 초기화.
+* 스레드 안전을 위해 **status\_mutex\_가 잠긴 구간 안에서** 초기화.
+
+아래는 필요한 최소 패치야. (네가 마지막에 사용 중인 “A방식” 코드 기준)
+
+---
+
+### 1) 헤더에 `bt_states_`와 초기화 헬퍼 추가
+
+```cpp
+// status_manager.hpp (멤버들 중)
+#include <unordered_map>
+
+// ...
+
+private:
+  // ... 기존 멤버들 ...
+  std::vector<std::string> running_bt_nodes_;
+  bool is_in_recovery_context_{false};
+
+  // BT 상태 누적 맵: node_name -> "IDLE|RUNNING|SUCCESS|FAILURE"
+  std::unordered_map<std::string, std::string> bt_states_;
+
+  // 내부 유틸: mutex가 잡힌 상태에서 BT 캐시 초기화
+  void reset_bt_state_cache_locked_();
+```
+
+---
+
+### 2) 소스에 초기화 함수 구현
+
+```cpp
+// status_manager.cpp
+void StatusManager::reset_bt_state_cache_locked_()
+{
+  // status_mutex_ 가 이미 잠겨 있어야 함!
+  bt_states_.clear();
+  running_bt_nodes_.clear();
+  is_in_recovery_context_ = false;
+}
+```
+
+---
+
+### 3) 상태 전이 지점에서 초기화 트리거
+
+`evaluate_and_publish_if_changed()` 안에서 “상태가 바뀌었고, 새 상태가 ⟨SUCCEEDED|FAILED|CANCELED⟩이면” 초기화:
+
+```cpp
+void StatusManager::evaluate_and_publish_if_changed()
+{
+  std::optional<std_msgs::msg::String> to_pub;
+
+  {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    RobotStatus new_status = determine_current_status(current_status_);
+
+    // 터미널(넓은 의미)에서 RECEIVED_GOAL 재무장
+    if (is_terminal_robot_status(new_status)) {
+      received_goal_armed_ = true;
+      bt_log_seen_in_cycle_ = false;
+    }
+
+    if (new_status != current_status_) {
+      // === 여기서 "세 가지" 터미널에 한해 BT 캐시 초기화 ===
+      if (new_status == RobotStatus::SUCCEEDED ||
+          new_status == RobotStatus::FAILED   ||
+          new_status == RobotStatus::CANCELED) {
+        reset_bt_state_cache_locked_();
+      }
+
+      current_status_ = new_status;
+      std_msgs::msg::String s; s.data = status_to_string(current_status_);
+      RCLCPP_INFO(this->get_logger(), "Robot Status Changed -> %s", s.data.c_str());
+      to_pub = s;
+    }
+  }
+
+  if (to_pub) status_publisher_->publish(*to_pub);
+}
+```
+
+> 이렇게 하면 `latest_terminal_status_`를 통해 결과가 결정되든, 다른 경로로 터미널이 되든 **항상 한 곳**에서 BT 캐시가 정리돼요.
+
+---
+
+### 4) BT 로그 콜백에서 `bt_states_` 누적 업데이트 (선택 사항)
+
+지금은 `running_bt_nodes_`만 쓰지만, 너가 말한 누적 맵을 계속 쓰고 싶다면 `/behavior_tree_log`에서 **증분 이벤트**를 누적 반영하면 돼:
+
+```cpp
+void StatusManager::bt_log_callback(const BehaviorTreeLog::SharedPtr msg)
+{
+  std::optional<std_msgs::msg::String> to_pub;
+  {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    bt_log_seen_in_cycle_ = true;
+
+    // 원샷 RECEIVED_GOAL
+    if (received_goal_armed_ && is_terminal_robot_status(current_status_)) {
+      current_status_ = RobotStatus::RECEIVED_GOAL;
+      received_goal_armed_ = false;
+      std_msgs::msg::String s; s.data = status_to_string(current_status_);
+      RCLCPP_INFO(this->get_logger(), "Robot Status Changed (BT first seen) -> %s", s.data.c_str());
+      to_pub = s;
+    }
+
+    // 누적 맵 / 러닝 노드 업데이트
+    static const std::set<std::string> recovery_nodes = {
+      "ShortRecoverySequence1","ShortRecoverySequence2","ShortRecoverySequenceTotal1",
+    };
+    bool status_changed_by_recovery = false;
+    RobotStatus new_status = current_status_;
+
+    running_bt_nodes_.clear();
+    bool recovery_flag_check = false;
+
+    for (const auto& ev : msg->event_log) {
+      // 누적 맵 업데이트: 항상 마지막 current_status로 갱신
+      bt_states_[ev.node_name] = ev.current_status;
+
+      if (ev.current_status == "RUNNING") {
+        running_bt_nodes_.push_back(ev.node_name);
+        if (recovery_nodes.count(ev.node_name)) recovery_flag_check = true;
+      }
+      if (recovery_nodes.count(ev.node_name)) {
+        if (ev.current_status == "RUNNING")      { new_status = RobotStatus::RECOVERY_RUNNING; status_changed_by_recovery = true; }
+        else if (ev.current_status == "SUCCESS")  { new_status = RobotStatus::RECOVERY_SUCCESS; status_changed_by_recovery = true; }
+        else if (ev.current_status == "FAILURE")  { new_status = RobotStatus::RECOVERY_FAILURE; status_changed_by_recovery = true; }
+      }
+    }
+
+    is_in_recovery_context_ = recovery_flag_check;
+
+    if (status_changed_by_recovery && current_status_ != new_status) {
+      current_status_ = new_status;
+      std_msgs::msg::String s; s.data = status_to_string(current_status_);
+      RCLCPP_INFO(this->get_logger(), "Robot Status Changed (by Recovery BT) -> %s", s.data.c_str());
+      to_pub = s; // 덮어씀
+    }
+  }
+
+  if (to_pub) status_publisher_->publish(*to_pub);
+  evaluate_and_publish_if_changed();
+}
+```
+
+---
+
+### 5) (옵션) IDLE에서도 초기화하고 싶다면?
+
+요청은 “canceled/failed/succeeded에서 초기화”였지만, IDLE 진입 시에도 깨끗하게 시작하고 싶으면 조건을 한 줄 추가하면 돼:
+
+```cpp
+if (new_status == RobotStatus::SUCCEEDED ||
+    new_status == RobotStatus::FAILED   ||
+    new_status == RobotStatus::CANCELED ||
+    new_status == RobotStatus::IDLE) {   // ← 선택
+  reset_bt_state_cache_locked_();
+}
+```
+
+---
+
+이렇게 하면 **세 터미널 상태로 전이되는 순간**에 `bt_states_`는 물론 `running_bt_nodes_`/`is_in_recovery_context_`까지 싹 초기화돼서, 다음 사이클에서 BT 로그가 들어오면 항상 깔끔한 상태로 “원샷 RECEIVED\_GOAL → 후속 상태” 흐름이 이어집니다.
+
