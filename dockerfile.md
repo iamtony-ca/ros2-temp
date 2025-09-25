@@ -12,6 +12,7 @@
 # ===================================================================
 # ROS 2 Jazzy Desktop 버전을 기반으로 시작합니다. (Rviz 등 GUI 도구 포함)
 FROM osrf/ros:jazzy-desktop-noble AS development_base
+# FROM osrf/ros:jazzy-desktop-full AS development_base
 
 # ===================================================================
 # 프록시 및 사설 인증서 설정 (Proxy and Private Certificate Setup)
