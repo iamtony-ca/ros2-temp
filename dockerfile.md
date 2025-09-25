@@ -64,7 +64,7 @@ ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 # ROS Domain ID를 42로 설정합니다.
 ENV ROS_DOMAIN_ID=42
 # ROS 로그 파일이 저장될 디렉토리를 지정합니다.
-ENV ROS_LOG_DIR=/root/ros_logs
+ENV ROS_LOG_DIR=/root/ros2_ws/log
 
 # ===================================================================
 # 기본 시스템 및 모니터링/네트워크 도구 설치
@@ -123,16 +123,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ===================================================================
 # ROS 2 Humble과의 호환성 등을 위해 특정 버전의 setuptools가 필요할 수 있습니다.
 # RUN pip install --no-cache-dir setuptools==58.2.0
-RUN pip install --no-cache-dir jupyter
+# RUN pip install --no-cache-dir jupyter
 
 # ===================================================================
 # ROS 워크스페이스 설정 및 의존성 설치
 # ===================================================================
 # 작업 디렉토리를 생성하고 설정합니다.
-WORKDIR /ros2_ws
+WORKDIR /root/ros2_ws
 
 # Docker 캐시 최적화를 위해 src 폴더를 먼저 복사합니다.
-COPY ./src /ros2_ws/src
+COPY ./src /root/ros2_ws/src
 
 # ROS 의존성을 설치합니다. (src/package.xml 기반)
 RUN . /opt/ros/jazzy/setup.sh && \
@@ -145,18 +145,24 @@ RUN . /opt/ros/jazzy/setup.sh && \
 # 소스 코드 복사 및 빌드 (독립 실행 가능한 이미지 생성용)
 # ===================================================================
 # 모든 소스 코드를 다시 복사하여 최신 상태를 반영합니다.
-COPY . /ros2_ws/
+COPY . /root/ros2_ws/
 
 # colcon으로 워크스페이스를 빌드합니다.
+# 이전 빌드 결과물을 삭제하고, 빌드 옵션을 추가합니다.
 RUN . /opt/ros/jazzy/setup.sh && \
-    colcon build --symlink-install
+    rm -rf build install log && \
+    export MAKEFLAGS="-j4" && \
+    colcon build \
+        --symlink-install \
+        --parallel-workers 3 \
+        --packages-skip package_skipped
 
 # ===================================================================
 # .bashrc에 ROS 환경 자동 소싱 추가
 # ===================================================================
 # 새 터미널을 열 때마다 자동으로 ROS 환경이 설정되도록 .bashrc에 source 구문을 추가합니다.
 RUN echo "source /opt/ros/jazzy/setup.bash" >> /root/.bashrc
-RUN echo "source /ros2_ws/install/setup.bash" >> /root/.bashrc
+RUN echo "source /root/ros2_ws/install/setup.bash" >> /root/.bashrc
 
 # ===================================================================
 # 컨테이너 실행 환경 설정
@@ -182,7 +188,7 @@ set -e
 
 # ROS 2 환경을 소싱합니다.
 source /opt/ros/jazzy/setup.bash
-source /ros2_ws/install/setup.bash
+source /root/ros2_ws/install/setup.bash
 
 # Dockerfile의 CMD나 docker run 명령어로 전달된 명령을 최종적으로 실행합니다.
 exec "$@"
@@ -206,13 +212,16 @@ exec "$@"
   * **일반 환경:**
     ```bash
     docker build -t my-amr-app:latest .
+    docker build -t my-amr-app:latest /home/user/my_project/  
     ```
   * **프록시 환경:** (`--build-arg` 사용)
     ```bash
     docker build \
       --build-arg PROXY_URL="http://your-proxy-address:port" \
       --build-arg CERT_PATH="company-cert.crt" \
-      -t my-amr-app:latest .
+      --no-cache \
+      --pull \
+      -t my-amr-app:latest /home/user/my_project/  
     ```
 
 ### 3\. Docker 컨테이너 실행
