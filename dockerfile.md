@@ -248,7 +248,10 @@ docker run -it --rm \
 -e DISPLAY=$DISPLAY \
 -e LIBGL_ALWAYS_INDIRECT=0 \
 -e QT_X11_NO_MITSHM=1 \
--v [호스트 PC의 ros2_ws 절대 경로]:/ros2_ws \
+-v [호스트 PC의 ros2_ws/src 절대 경로]:/root/ros2_ws/src \
+-v amr_build_vol:/root/ros2_ws/build \
+-v amr_install_vol:/root/ros2_ws/install \
+-v amr_log_vol:/root/ros2_ws/log \
 --name my_amr_container \
 my-amr-app:latest
 ```
