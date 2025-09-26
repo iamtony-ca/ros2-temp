@@ -164,3 +164,335 @@ if __name__ == '__main__':
 [3]: https://github.com/petermg/Depth-Anything-V2_16bitPNG_Touchly1?utm_source=chatgpt.com "petermg/Depth-Anything-V2_16bitPNG_Touchly1"
 [4]: https://arxiv.org/abs/2412.14103?utm_source=chatgpt.com "A Simple yet Effective Test-Time Adaptation for Zero-Shot ..."
 [5]: https://huggingface.co/depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf?utm_source=chatgpt.com "depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf"
+
+######################  
+
+좋습니다. 아래는 **완전한 실행 스크립트**예요.
+요구하신 대로 입력 이미지를 **세로축 기준으로 절반(가로를 1/2) 잘라, 왼쪽 절반만**을 모델 입력으로 사용합니다.
+또한 퍼센타일 정규화, 반사(유리/디스플레이) 마스크, 평면 보간, 가이드 필터, TTA, 16-bit 저장 옵션을 포함했습니다. (PEP 8 스타일)
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Depth-Anything-V2 inference script with:
+- Left-half crop (use only the left side of the image)
+- Percentile normalization
+- Specular/reflective candidate mask (glass/displays)
+- Planar fill for low-confidence regions
+- Guided/joint-bilateral smoothing
+- Optional horizontal flip TTA
+- Optional 16-bit depth saving
+
+Tested with: Python 3.10+, OpenCV 4.x, torch 2.x
+"""
+
+import argparse
+import glob
+import os
+from typing import List, Tuple
+
+import cv2
+import matplotlib
+import numpy as np
+import torch
+
+from depth_anything_v2.dpt import DepthAnythingV2
+
+
+# ----------------------------- Utils ----------------------------- #
+
+def list_image_files(path: str) -> List[str]:
+    """Return a list of image file paths (or from .txt file)."""
+    if os.path.isfile(path):
+        if path.lower().endswith(".txt"):
+            with open(path, "r") as f:
+                names = [ln.strip() for ln in f.readlines()]
+            return [p for p in names if os.path.isfile(p)]
+        return [path]
+    # directory (recursive)
+    exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
+    files = glob.glob(os.path.join(path, "**/*"), recursive=True)
+    return [f for f in files if os.path.splitext(f)[1].lower() in exts]
+
+
+def percentile_normalize(depth: np.ndarray, lo: float = 2, hi: float = 98) -> np.ndarray:
+    """Percentile-based normalization to [0,1] with outlier suppression."""
+    d = depth.astype(np.float32)
+    lo_v, hi_v = np.percentile(d, [lo, hi])
+    d = np.clip(d, lo_v, hi_v)
+    scale = max(hi_v - lo_v, 1e-8)
+    return (d - lo_v) / scale
+
+
+def specular_mask_bgr(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Build a specular/reflective candidate mask (0/255) using
+    brightness, saturation and edge cues.
+    """
+    img_u8 = img_bgr if img_bgr.dtype == np.uint8 else np.clip(img_bgr, 0, 255).astype(np.uint8)
+    hsv = cv2.cvtColor(img_u8, cv2.COLOR_BGR2HSV)
+    s = hsv[..., 1].astype(np.float32) / 255.0
+    v = hsv[..., 2].astype(np.float32) / 255.0
+
+    # bright + low saturation → candidate highlights
+    bright = (v > 0.92) & (s < 0.25)
+
+    # strengthen with edge information
+    gray = cv2.cvtColor(img_u8, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Laplacian(gray, ddepth=cv2.CV_32F)
+    edges = np.abs(edges)
+    if edges.max() > 0:
+        edges /= edges.max()
+    edgey = edges > 0.25
+
+    mask = ((bright | edgey).astype(np.uint8)) * 255
+    # open → dilate to reduce spurious small holes and connect highlight blobs
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    return mask
+
+
+def guided_smooth(depth01: np.ndarray, guide_bgr: np.ndarray,
+                  radius: int = 4, eps: float = 1e-3) -> np.ndarray:
+    """
+    Edge-aware smoothing of depth using the RGB as a guide.
+    Tries ximgproc.guidedFilter, falls back to bilateral filter.
+    """
+    d = depth01.astype(np.float32)
+    try:
+        import cv2.ximgproc as xip  # type: ignore
+        gf = xip.guidedFilter(guide=guide_bgr, src=d, radius=radius, eps=eps)
+        return gf.astype(np.float32)
+    except Exception:
+        # joint bilateral (approx) fallback
+        d8 = np.clip(d * 255.0, 0, 255).astype(np.uint8)
+        bf = cv2.bilateralFilter(d8, d=7, sigmaColor=25, sigmaSpace=7)
+        return (bf.astype(np.float32) / 255.0)
+
+
+def fill_planar(depth01: np.ndarray, invalid_mask_u8: np.ndarray, iters: int = 2) -> np.ndarray:
+    """
+    Simple neighborhood diffusion + median-based fill for invalid regions.
+    Enough for reflective/transparent patches to avoid holes.
+    """
+    d = depth01.astype(np.float32).copy()
+    inv = invalid_mask_u8 > 0
+    if not np.any(inv):
+        return d
+
+    kernel = np.ones((3, 3), np.uint8)
+    for _ in range(iters):
+        # 1) dilate numeric values (simple outward diffusion)
+        dil = cv2.dilate(d, kernel)
+        # 2) median smoothing for robustness
+        med = cv2.medianBlur(np.clip(d * 255.0, 0, 255).astype(np.uint8), 5).astype(np.float32) / 255.0
+        neigh = 0.5 * dil + 0.5 * med
+        d[inv] = neigh[inv]
+    return d
+
+
+def infer_with_tta(model, img_bgr: np.ndarray, input_size: int) -> np.ndarray:
+    """Single-frame inference with optional horizontal flip TTA."""
+    d0 = model.infer_image(img_bgr, input_size)  # (H, W) float32
+    img_flip = cv2.flip(img_bgr, 1)
+    d1 = model.infer_image(img_flip, input_size)
+    d1 = cv2.flip(d1, 1)
+    return 0.5 * (d0 + d1)
+
+
+def crop_left_half(img: np.ndarray) -> np.ndarray:
+    """Cut image vertically in half and return the left half."""
+    h, w = img.shape[:2]
+    return img[:, :w // 2].copy()
+
+
+# ----------------------------- Main ----------------------------- #
+
+def build_model(encoder: str, device: str) -> DepthAnythingV2:
+    model_cfgs = {
+        "vits": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]},
+        "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96, 192, 384, 768]},
+        "vitl": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
+        "vitg": {"encoder": "vitg", "features": 384, "out_channels": [1536, 1536, 1536, 1536]},
+    }
+    model = DepthAnythingV2(**model_cfgs[encoder])
+    ckpt = f"checkpoints/depth_anything_v2_{encoder}.pth"
+    state = torch.load(ckpt, map_location="cpu")
+    model.load_state_dict(state)
+    model = model.to(device).eval()
+    return model
+
+
+def visualize_depth(depth01: np.ndarray, grayscale: bool) -> np.ndarray:
+    """Return BGR visualization image from [0,1] depth."""
+    vis8 = np.clip(depth01 * 255.0, 0, 255).astype(np.uint8)
+    if grayscale:
+        return cv2.cvtColor(vis8, cv2.COLOR_GRAY2BGR)
+    # consistent colormap (matplotlib Spectral_r), converted to BGR
+    cmap = matplotlib.colormaps.get_cmap("Spectral_r")
+    vis3 = (cmap(vis8)[:, :, :3] * 255.0).astype(np.uint8)[:, :, ::-1]
+    return vis3
+
+
+def process_one(
+    model: DepthAnythingV2,
+    filename: str,
+    outdir: str,
+    input_size: int,
+    use_tta: bool,
+    grayscale: bool,
+    pred_only: bool,
+    save_16bit: bool,
+    save_mask: bool,
+    crop_left: bool,
+) -> None:
+    base = os.path.splitext(os.path.basename(filename))[0]
+    raw = cv2.imread(filename, cv2.IMREAD_COLOR)
+    if raw is None:
+        print(f"[WARN] Failed to read: {filename}")
+        return
+
+    # --- crop left half as requested ---
+    if crop_left:
+        raw = crop_left_half(raw)
+
+    # --- inference ---
+    depth = infer_with_tta(model, raw, input_size) if use_tta else model.infer_image(raw, input_size)
+
+    # --- percentile normalization to [0,1] ---
+    depth01 = percentile_normalize(depth, lo=2, hi=98)
+
+    # --- specular candidate mask (glass / display) ---
+    spec_mask = specular_mask_bgr(raw)  # 0/255
+    spec_bool = spec_mask > 0
+
+    # --- planar fill for masked (low-confidence) regions ---
+    depth_filled = fill_planar(depth01, spec_mask, iters=2)
+
+    # --- guided smoothing (edge-aware) ---
+    depth_for_smooth = depth_filled.copy()
+    # prevent over-smoothing inside masked areas (keep them conservative)
+    depth_for_smooth[spec_bool] = depth01[spec_bool]
+    depth_smooth = guided_smooth(depth_for_smooth, raw, radius=4, eps=1e-3)
+
+    # --- final composition (conservative inside mask) ---
+    final01 = depth_smooth
+    final01[spec_bool] = np.minimum(final01[spec_bool], depth_filled[spec_bool])
+
+    # --- save outputs ---
+    os.makedirs(outdir, exist_ok=True)
+    vis = visualize_depth(final01, grayscale=grayscale)
+
+    if pred_only:
+        cv2.imwrite(os.path.join(outdir, f"{base}_depth.png"), vis)
+    else:
+        split = np.ones((raw.shape[0], 50, 3), dtype=np.uint8) * 255
+        concat = cv2.hconcat([raw, split, vis])
+        cv2.imwrite(os.path.join(outdir, f"{base}_depth.png"), concat)
+
+    if save_mask:
+        cv2.imwrite(os.path.join(outdir, f"{base}_mask.png"), spec_mask)
+
+    if save_16bit:
+        cv2.imwrite(
+            os.path.join(outdir, f"{base}_depth16.png"),
+            np.clip(final01 * 65535.0, 0, 65535).astype(np.uint16),
+        )
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Depth Anything V2 with robust post-processing")
+    p.add_argument("--img-path", type=str, required=True,
+                   help="Image path, directory, or a .txt file listing image paths")
+    p.add_argument("--input-size", type=int, default=672,
+                   help="Model input size (longer side). Try 672~896 for better details")
+    p.add_argument("--outdir", type=str, default="./vis_depth")
+
+    p.add_argument("--encoder", type=str, default="vitl",
+                   choices=["vits", "vitb", "vitl", "vitg"])
+
+    p.add_argument("--pred-only", dest="pred_only", action="store_true",
+                   help="Save only prediction (no side-by-side concat)")
+    p.add_argument("--grayscale", dest="grayscale", action="store_true",
+                   help="Use grayscale visualization instead of color map")
+
+    p.add_argument("--tta", action="store_true", help="Enable horizontal flip TTA")
+    p.add_argument("--save-16bit", action="store_true",
+                   help="Also save 16-bit depth PNG (normalized)")
+    p.add_argument("--save-mask", action="store_true",
+                   help="Save specular/reflective candidate mask as PNG")
+    p.add_argument("--no-crop-left", action="store_true",
+                   help="Disable left-half cropping (default: use left half)")
+
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    device = (
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "cpu"
+    )
+    print(f"[INFO] Using device: {device}")
+
+    model = build_model(args.encoder, device)
+    files = list_image_files(args.img_path)
+
+    if not files:
+        print("[ERROR] No input images found.")
+        return
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    for idx, f in enumerate(files, 1):
+        print(f"[{idx}/{len(files)}] {f}")
+        try:
+            process_one(
+                model=model,
+                filename=f,
+                outdir=args.outdir,
+                input_size=args.input_size,
+                use_tta=args.tta,
+                grayscale=args.grayscale,
+                pred_only=args.pred_only,
+                save_16bit=args.save_16bit,
+                save_mask=args.save_mask,
+                crop_left=not args.no_crop_left,  # default: crop left half
+            )
+        except Exception as e:
+            print(f"[WARN] Failed on {f}: {e}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 사용 예
+
+```bash
+python3 run_depth_v2_left_half.py \
+  --img-path /path/to/images \
+  --encoder vitl \
+  --input-size 672 \
+  --tta \
+  --save-16bit \
+  --save-mask
+```
+
+* 기본은 **왼쪽 절반 크롭 사용**입니다. 원본 전체로 돌리고 싶으면 `--no-crop-left`를 주세요.
+* 결과물:
+
+  * `*_depth.png` : 시각화 결과(기본은 raw|bar|depth 합쳐서 저장, `--pred-only` 시 depth만 저장)
+  * `*_depth16.png` : 16-bit 정규화 깊이(옵션)
+  * `*_mask.png` : 반사/투명 후보 마스크(옵션)
+
+원하시면, 이걸 **ROS 2 노드**로 감싸서 `sensor_msgs/Image`(mono16 + mask) 퍼블리시하는 버전도 만들어 드릴게요.
+
+##########################  
+
