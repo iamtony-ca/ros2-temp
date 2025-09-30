@@ -219,3 +219,104 @@ scan:
   * **여전히 같이 돈다**면: `/scan`과 TF의 시각이 아직 안 맞습니다(또는 RViz Fixed Frame이 실수로 base_link).
 
 필요하면 `/clock` 1줄, `/scan` 헤더 1줄, RViz의 LaserScan Status 메시지 한 줄만 더 보내줘—그걸로 정확히 어느 노드가 다른 시간축을 쓰는지 집어낼게요.
+
+
+####################
+맞아요—URDF만 바꿨다고 `use_sim_time` 플래그 값이 “자동으로 바뀌는” 일은 거의 없어요.
+하지만 **URDF 변경이 “시간 불일치”를 유발**할 수 있는 경로는 몇 가지가 있습니다. 핵심은 “모두 `true`인가?”가 아니라 **“같은 시간축으로 찍히고 있나?”**예요. 앞서 로그에서 `/scan` 시각이 **181초**, TF는 **210~214초**였죠. 이건 전형적인 **시각 불일치**입니다.
+
+## URDF만 바꿨는데 시간이 어긋날 수 있는 이유 (현실에서 자주 생김)
+
+1. **센서 플러그인/드라이버가 바뀜**
+
+   * TB4 기본 URDF의 `xacro:rplidar`는 Gazebo용 Ray Sensor 플러그인을 붙여 **sim time(/clock)** 으로 스탬프를 찍습니다.
+   * 커스텀 URDF에서 `parent_link`, `gazebo` 인자, 매크로 인자 누락 등으로 **플러그인 분기가 달라지면**, 같은 `/scan` 토픽명이라도 **다른 노드**(혹은 시스템 시계로 찍는 노드)가 퍼블리시할 수 있어요. 결과: `/scan`은 **시스템 시간**, TF는 **sim time** → 변환 실패.
+
+2. **노드/네임스페이스가 달라져 파라미터 주입이 빗나감**
+
+   * 예: 이전에 `use_sim_time`를 `/**` 또는 `/rplidar_node`로 주입했는데, URDF/런치 변경으로 노드명이 `rplidar`→`rplidar_node`(또는 네임스페이스 변경)로 바뀌면 **그 노드에는 `use_sim_time`가 안 먹습니다.**
+
+3. **재시작 타이밍으로 생기는 시각 격차**
+
+   * URDF 바꾸면서 `robot_state_publisher`(TF)는 재시작되었는데 Gazebo 센서 플러그인은 **이전부터 돌던 시계 기준**으로 계속 퍼블리시 → `/scan` 첫 메시지 시각이 과거(181s)로 남고, TF는 최신(210s) → RViz가 변환 못 해서 **센서 프레임 그대로 그림**(붙어서 도는 증상).
+
+4. **`gazebo` 인자 누락/기본값**
+
+   * TB4 URDF는 `xacro:arg name="gazebo"`로 플러그인 포함을 토글합니다. 커스텀 URDF에서 이 인자가 없거나 기본값이 달라지면 플러그인 경로가 바뀌어 **스탬프 방식이 달라질** 수 있어요.
+
+---
+
+## 빠른 확증 테스트 (3줄로 끝)
+
+아래 세 줄로 “누가 다른 시간축인지” 바로 잡힙니다.
+
+```bash
+# 1) /clock 현재 시각
+ros2 topic echo /clock --once
+
+# 2) /scan 헤더 시각
+ros2 topic echo /scan --once | head -n 5
+
+# 3) /tf 최신 시각(odom->base_link 같은 자주 나오는 변환)
+ros2 topic echo /tf --once | head -n 20
+```
+
+* 세 값이 **서로 수 초 이내**로 비슷해야 정상입니다.
+* 하나라도 **수십 초** 어긋나면 그 퍼블리셔(대개 `/scan`)가 범인.
+
+---
+
+## 바로 고치는 액션 플랜
+
+1. **모든 관련 노드가 sim time을 쓰는지 강제 확인**
+
+   ```bash
+   ros2 param get /gazebo use_sim_time            # Gazebo(또는 gz-ros-bridge가 있다면 그쪽)
+   ros2 param get /robot_state_publisher use_sim_time
+   ros2 param get /rviz use_sim_time
+   ros2 param get /rplidar_node use_sim_time      # 실제 센서 드라이버/플러그인 노드명에 맞추기
+   ros2 param get /diff_drive_controller use_sim_time  # odom 퍼블리셔 쪽
+   ```
+
+   하나라도 `false`면 `ros2 param set ... true`.
+
+2. **/scan 퍼블리셔 정체 확인**
+
+   ```bash
+   ros2 node info $(ros2 topic info /scan -v | grep 'Publisher count' -n; ros2 topic info /scan -v)
+   # 또는: ros2 topic info /scan -v  만으로 퍼블리셔 노드명 확인
+   ```
+
+   * TB4 때와 **퍼블리셔 노드명이 다른지** 확인.
+   * 퍼블리셔 노드에 `use_sim_time`가 들어갔는지 바로 `ros2 param get`으로 확인/설정.
+
+3. **URDF의 rplidar 매크로 인자/부모/각도 정리**
+
+   * 매크로 첫머리에 없으면 추가:
+
+     ```xml
+     <xacro:arg name="gazebo" default="true"/>
+     ```
+   * TB4와 동일하게(권장):
+
+     ```xml
+     <xacro:rplidar name="rplidar" parent_link="shell_link" gazebo="$(arg gazebo)">
+       <origin xyz="0.0 0.0 0.15" rpy="0 0 ${pi/2}"/>
+     </xacro:rplidar>
+     ```
+
+     (부모를 `chassis_link`로 유지하고 싶어도 **yaw=pi/2**는 맞추세요.)
+
+4. **스택 통째로 재시작**
+
+   * Gazebo(또는 시뮬), `robot_state_publisher`, 센서 퍼블리셔, RViz를 **모두 끄고 다시** 띄워 _동일한 시각 축_으로 시작하게 하세요.
+   * 재시작 후 위 3줄 테스트를 다시 실행.
+
+---
+
+## 요약
+
+* `use_sim_time=true` “값 자체”는 그대로일 수 있어도, **URDF 변경이 퍼블리셔/플러그인/네임스페이스/재시작 타이밍**을 바꾸면서 **시각 불일치**를 만들 수 있습니다.
+* 지금 캡처와 숫자는 **그 불일치(181s vs 210+s)**를 정확히 가리키고 있어요.
+* 위 액션 1–4만 수행하면, Fixed Frame이 `map`인 RViz에서 **빨간 점들이 지도에 고정**되어 보일 겁니다.
+* 그 다음 단계로 각도(yaw=pi/2)까지 TB4와 맞추면 방향 정렬까지 깔끔하게 끝납니다.
