@@ -680,3 +680,180 @@ def generate_launch_description():
     ```
 
 이제 Gazebo에 로봇 두 대가 각각의 초기 위치에 생성되고, 각 로봇을 제어하는 Nav2 스택이 독립적으로 실행될 것입니다. RViz에서도 두 로봇의 상태를 모두 확인할 수 있습니다.
+
+
+
+죄송합니다. 제가 이전에 제공해 드린 수정된 런치 코드에 **Gazebo 모델 경로를 설정하는 중요한 부분이 누락**되었습니다. 문제가 발생한 것이 당연합니다.
+
+`Unable to find uri[model://turtlebot3_world]` 오류는 이전 `my_map` 오류와 원인이 100% 동일합니다. Gazebo가 `turtlebot3_world`라는 모델을 찾아야 하는데, 어디서 찾아야 할지 경로를 모르기 때문에 발생하는 것입니다.
+
+-----
+
+### \#\# 문제 분석: 모델 경로 누락
+
+`tb3_simulation_launch.py`와 `unique_multi_tb3_simulation_launch.py`는 모두 `tb3_sandbox.sdf.xacro`라는 월드 파일을 사용합니다. 이 월드 파일 안에는 `turtlebot3_world`라는 3D 모델(벽, 장애물 등)을 불러오는 `<include uri="model://turtlebot3_world">` 코드가 포함되어 있습니다.
+
+이 `turtlebot3_world` 모델은 `nav2_minimal_tb3_sim/models/` 폴더 안에 있습니다.
+
+제가 드린 수정 코드에서는 이 `models` 폴더의 경로를 Gazebo에게 알려주는 `AppendEnvironmentVariable` 부분이 빠져있었습니다.
+
+-----
+
+### \#\# 해결 방법: 런치 파일에 경로 추가
+
+이전에 수정했던 `unique_multi_tb3_simulation_launch.py` 파일을 다시 열고, Gazebo 모델 경로를 추가하는 코드를 삽입해야 합니다.
+
+아래는 **경로 설정 코드가 추가된, 최종 수정된 전체 코드**입니다. 이 내용으로 `unique_multi_tb3_simulation_launch.py` 파일을 다시 한번 덮어쓰고 저장해주세요.
+
+```python
+# Copyright (c) 2018 Intel Corporation
+# Copyright (c) 2024 Open Navigation LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import tempfile
+from launch import LaunchDescription
+from launch.actions import (DeclareLaunchArgument, ExecuteProcess, GroupAction,
+                            IncludeLaunchDescription, RegisterEventHandler, OpaqueFunction,
+                            AppendEnvironmentVariable) # AppendEnvironmentVariable 추가
+from launch.conditions import IfCondition
+from launch.event_handlers import OnShutdown
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, TextSubstitution
+from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
+
+
+def generate_launch_description():
+    # 패키지 경로 설정
+    bringup_dir = get_package_share_directory('nav2_bringup')
+    sim_dir = get_package_share_directory('nav2_minimal_tb3_sim')
+    launch_dir = os.path.join(bringup_dir, 'launch')
+
+    # 시뮬레이션할 로봇들의 이름과 초기 위치 정의
+    robots = [
+        {'name': 'robot1', 'x_pose': 0.0, 'y_pose': 0.5, 'yaw': 0.0},
+        {'name': 'robot2', 'x_pose': 0.0, 'y_pose': -0.5, 'yaw': 0.0}
+    ]
+
+    # ==========================================================================================
+    # [수정된 부분 START] Gazebo가 모델을 찾을 수 있도록 GZ_SIM_RESOURCE_PATH 환경 변수 설정
+    set_env_vars_resources = AppendEnvironmentVariable(
+        'GZ_SIM_RESOURCE_PATH',
+        os.path.join(sim_dir, 'models')
+    )
+    # ==========================================================================================
+
+    # 런치 파라미터 선언
+    # ... (이전과 동일한 파라미터 선언 부분) ...
+    world_arg = DeclareLaunchArgument(...)
+    map_arg = DeclareLaunchArgument(...)
+    params_file_arg_1 = DeclareLaunchArgument(...)
+    params_file_arg_2 = DeclareLaunchArgument(...)
+    rviz_arg = DeclareLaunchArgument(...)
+    rviz_config_arg = DeclareLaunchArgument(...)
+
+    # 1. Gazebo 서버를 단 한 번만 실행
+    # ... (이전과 동일한 Gazebo 실행 부분) ...
+    world_sdf = tempfile.mktemp(...)
+    world_sdf_xacro = ExecuteProcess(...)
+    start_gazebo_cmd = ExecuteProcess(...)
+    remove_temp_sdf_file = RegisterEventHandler(...)
+    
+    # TurtleBot3 Waffle URDF 파일 내용 읽기
+    # ... (이전과 동일) ...
+    urdf = os.path.join(sim_dir, 'urdf', 'turtlebot3_waffle.urdf')
+    with open(urdf, 'r') as infp:
+        robot_description = infp.read()
+    
+    # 2. RViz를 단 한 번만 실행
+    # ... (이전과 동일) ...
+    start_rviz_cmd = IncludeLaunchDescription(...)
+
+    # 3. 각 로봇에 대한 노드 그룹 생성 (루프)
+    # ... (이전과 동일한 루프 부분) ...
+    robots_actions = []
+    for robot in robots:
+        # ... (이전과 동일) ...
+        robot_group = GroupAction([...])
+        robots_actions.append(robot_group)
+
+    # LaunchDescription 생성 및 액션 추가
+    ld = LaunchDescription()
+    
+    # [수정된 부분] 환경 변수 설정 액션을 가장 먼저 추가
+    ld.add_action(set_env_vars_resources)
+
+    # 런치 파라미터 선언 추가
+    # ... (이전과 동일) ...
+    ld.add_action(world_arg)
+    ld.add_action(map_arg)
+    ld.add_action(params_file_arg_1)
+    ld.add_action(params_file_arg_2)
+    ld.add_action(rviz_arg)
+    ld.add_action(rviz_config_arg)
+
+    # Gazebo 관련 액션 추가
+    # ... (이전과 동일) ...
+    ld.add_action(world_sdf_xacro)
+    ld.add_action(start_gazebo_cmd)
+    ld.add_action(remove_temp_sdf_file)
+    
+    # RViz 액션 추가
+    ld.add_action(start_rviz_cmd)
+
+    # 각 로봇 그룹 액션 추가
+    for group in robots_actions:
+        ld.add_action(group)
+
+    return ld
+```
+
+*(코드의 생략된 부분(...)은 이전 답변의 내용과 동일합니다. 전체 코드를 다시 붙여넣으셔도 되고, `AppendEnvironmentVariable` 관련 부분만 추가/수정하셔도 됩니다.)*
+
+-----
+
+### \#\# (재확인) `CMakeLists.txt` 점검
+
+이전 `my_map` 문제 때와 마찬가지로, `nav2_minimal_tb3_sim` 패키지 자체의 `CMakeLists.txt` 파일에 `models` 폴더가 `install` 목록에 포함되어 있는지도 다시 한번 확인해주세요.
+
+**`~/turtlebot_ws/src/nav2_minimal_turtlebot_simulation/nav2_minimal_tb3_sim/CMakeLists.txt`** 파일을 열어 아래와 같이 `models`가 있는지 확인하고, 없다면 추가해주세요.
+
+```cmake
+install(DIRECTORY
+  launch
+  worlds
+  models  # <-- 이 부분이 있는지 확인!
+  urdf
+  ...
+  DESTINATION share/${PROJECT_NAME}
+)
+```
+
+-----
+
+### \#\# 최종 실행 순서
+
+1.  위와 같이 `unique_multi_tb3_simulation_launch.py` 파일을 수정합니다.
+2.  (필요하다면) `nav2_minimal_tb3_sim`의 `CMakeLists.txt`도 수정합니다.
+3.  터미널에서 작업 공간을 **깨끗하게 다시 빌드**하고 실행합니다.
+    ```bash
+    cd ~/turtlebot_ws
+    rm -rf install build log
+    colcon build
+    source install/setup.bash
+    ros2 launch nav2_bringup unique_multi_tb3_simulation_launch.py
+    ```
+
+제 실수로 중요한 부분을 누락하여 혼란을 드린 점 사과드립니다. 위와 같이 수정하시면 Gazebo가 `turtlebot3_world` 모델을 정상적으로 찾을 수 있을 것입니다.
