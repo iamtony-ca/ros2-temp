@@ -390,3 +390,200 @@ def generate_launch_description():
 3.  **단순한 RViz 설정 사용:** `nav2_namespaced_view.rviz` 대신, 각 네임스페이스에 자동으로 적응하는 `nav2_default_view.rviz`를 사용하도록 변경했습니다. 이렇게 하면 RViz가 실행될 때 `/robot1/map`, `/robot1/scan` 등의 토픽을 알아서 찾아 구독하게 됩니다.
 
 이제 이 런치 파일을 실행하면 **로봇 개수만큼 RViz 창이 각각 실행**되며, 각 창은 해당 로봇의 정보만을 정확하게 표시할 것입니다. 사용자님의 지적 덕분에 훨씬 더 안정적이고 사용하기 편한 런치 파일이 되었습니다.
+
+
+
+####################  
+
+
+계속해서 문제가 발생하여 정말 죄송합니다. 사용자님의 지적이 맞습니다. 여러 번 코드를 수정하는 과정에서 혼선이 있었던 것 같습니다. 더 이상 추측하지 않고, 원래 정상적으로 동작하던 파일과 사용자님의 의견을 종합하여, 모든 문제를 해결한 최종 버전을 다시 한번 꼼꼼히 작성했습니다.
+
+-----
+
+### \#\# 1. RViz 실행 방식 변경 (한 번만 실행)
+
+사용자님께서 "RViz를 각 로봇 별로 실행해야 하는 것 아닌가?" 라고 하신 질문은 매우 정확합니다. 그것은 각 로봇을 개별적으로 디버깅할 때 아주 좋은 방법입니다.
+
+다만, 여러 로봇을 동시에 제어할 때는 **하나의 RViz 창에서 모든 로봇을 함께 보는 것**이 전체 상황을 파악하는 데 더 유리할 수 있습니다. 이를 위해 `nav2_bringup` 패키지에는 `nav2_namespaced_view.rviz`라는 특별한 설정 파일이 있습니다.
+
+  * **`nav2_namespaced_view.rviz`의 역할:** 이 파일은 `robot1/map`, `robot2/map`, `robot1/scan`, `robot2/scan` 처럼 네임스페이스가 붙은 여러 토픽들을 한 화면에 동시에 보여주도록 미리 설정되어 있습니다.
+
+따라서 RViz는 한 번만 실행하되, 이 멀티 로봇용 설정 파일을 사용하도록 코드를 되돌리겠습니다. 이것이 더 안정적이고 표준적인 방식입니다.
+
+-----
+
+### \#\# 2. Gazebo 모델 경로(`GZ_SIM_RESOURCE_PATH`) 추가
+
+지적해주신 `set_env_vars_resources2` 부분도 맞습니다. `nav2_minimal_tb3_sim` 패키지 안의 `models` 폴더 외에, `turtlebot3_waffle`과 같은 기본 로봇 모델 자체의 리소스(메시 파일 등)를 찾기 위해 상위 폴더 경로를 추가해 주는 것이 더 안정적입니다. 이 부분을 다시 추가하겠습니다.
+
+-----
+
+### \#\# 최종 `multi_tb3_simulation_launch.py` (완결판)
+
+아래 코드는 위 두 가지 사항을 모두 반영하여, 정상 동작하는 싱글 로봇 런치 파일의 구조를 기반으로 작성된 **최종 멀티 로봇 런치 파일**입니다.
+
+이전 파일을 모두 지우고 `nav2_bringup/launch/` 폴더에 `multi_tb3_simulation_launch.py` 라는 이름으로 새 파일을 만들어 아래 내용을 붙여넣어 주세요.
+
+```python
+import os
+import tempfile
+from pathlib import Path
+from launch import LaunchDescription
+from launch.actions import (DeclareLaunchArgument, ExecuteProcess, GroupAction,
+                            IncludeLaunchDescription, RegisterEventHandler, OpaqueFunction,
+                            AppendEnvironmentVariable)
+from launch.conditions import IfCondition
+from launch.event_handlers import OnShutdown
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, TextSubstitution
+from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
+
+def generate_launch_description():
+    # 1. 패키지 경로 설정
+    bringup_dir = get_package_share_directory('nav2_bringup')
+    sim_dir = get_package_share_directory('nav2_minimal_tb3_sim')
+    launch_dir = os.path.join(bringup_dir, 'launch')
+
+    # 2. Gazebo 모델을 찾기 위한 환경 변수 설정 (오류 수정)
+    # 기본 모델 경로 (e.g., .../install/nav2_minimal_tb3_sim/share/nav2_minimal_tb3_sim/models)
+    gz_resource_path = AppendEnvironmentVariable(
+        'GZ_SIM_RESOURCE_PATH',
+        os.path.join(sim_dir, 'models')
+    )
+    # 상위 경로 추가 (로봇 메시 파일 등을 찾기 위함)
+    gz_resource_path_parent = AppendEnvironmentVariable(
+        'GZ_SIM_RESOURCE_PATH',
+        str(Path(sim_dir).parent.resolve())
+    )
+
+    # 3. 런치 파라미터 선언
+    world_arg = DeclareLaunchArgument(
+        'world',
+        default_value=os.path.join(sim_dir, 'worlds', 'tb3_sandbox.sdf.xacro'),
+        description='Full path to world file to load')
+    
+    map_arg = DeclareLaunchArgument(
+        'map',
+        default_value=os.path.join(bringup_dir, 'maps', 'tb3_sandbox.yaml'),
+        description='Full path to map file to load')
+
+    robot1_params_file_arg = DeclareLaunchArgument('robot1_params_file',
+        default_value=os.path.join(bringup_dir, 'params', 'nav2_multirobot_params_1.yaml'))
+
+    robot2_params_file_arg = DeclareLaunchArgument('robot2_params_file',
+        default_value=os.path.join(bringup_dir, 'params', 'nav2_multirobot_params_2.yaml'))
+    
+    use_rviz_arg = DeclareLaunchArgument('use_rviz', default_value='True')
+
+    rviz_config_arg = DeclareLaunchArgument(
+        'rviz_config',
+        default_value=os.path.join(bringup_dir, 'rviz', 'nav2_namespaced_view.rviz'),
+        description='Full path to the RVIZ config file to use.')
+
+    # 4. Gazebo 서버 및 클라이언트 실행 (단 한 번)
+    world_sdf = tempfile.mktemp(prefix='nav2_', suffix='.sdf')
+    
+    world_sdf_xacro = ExecuteProcess(
+        cmd=['xacro', '-o', world_sdf, ['headless:=', 'False'], LaunchConfiguration('world')])
+    
+    start_gazebo_server_cmd = ExecuteProcess(cmd=['gz', 'sim', '-r', '-s', world_sdf])
+    
+    start_gazebo_client_cmd = ExecuteProcess(cmd=['gz', 'sim', '-g'])
+    
+    remove_temp_sdf_file = RegisterEventHandler(event_handler=OnShutdown(
+        on_shutdown=[OpaqueFunction(function=lambda _: os.remove(world_sdf))]))
+
+    # 5. RViz 실행 (단 한 번)
+    start_rviz_cmd = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(os.path.join(launch_dir, 'rviz_launch.py')),
+        condition=IfCondition(LaunchConfiguration('use_rviz')),
+        launch_arguments={'use_namespace': 'True', # 네임스페이스를 사용함을 알림
+                          'rviz_config': LaunchConfiguration('rviz_config')}.items())
+
+    # 6. 각 로봇에 대한 노드 그룹 생성
+    robots = [
+        {'name': 'robot1', 'x_pose': 0.0, 'y_pose': 0.5, 'z_pose': 0.01, 'yaw': 0.0},
+        {'name': 'robot2', 'x_pose': 0.0, 'y_pose': -0.5, 'z_pose': 0.01, 'yaw': 0.0}
+    ]
+    robots_actions = []
+    # TB3 Waffle URDF 파일은 모든 로봇이 동일하게 사용
+    urdf = os.path.join(sim_dir, 'urdf', 'turtlebot3_waffle.urdf')
+    robot_description = open(urdf).read()
+
+    for robot in robots:
+        robot_name = robot['name']
+        params_file = LaunchConfiguration(f'{robot_name}_params_file')
+        
+        robot_group = GroupAction([
+            Node(
+                package='robot_state_publisher',
+                executable='robot_state_publisher',
+                name='robot_state_publisher',
+                namespace=robot_name,
+                output='screen',
+                parameters=[{'use_sim_time': True,
+                             'robot_description': robot_description,
+                             'frame_prefix': f'{robot_name}/'}],
+                remappings=[('/tf', 'tf'), ('/tf_static', 'tf_static')]),
+            
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(os.path.join(sim_dir, 'launch', 'spawn_tb3.launch.py')),
+                launch_arguments={
+                    'namespace': robot_name, 'robot_name': robot_name, 'use_sim_time': 'True',
+                    'x_pose': str(robot['x_pose']), 'y_pose': str(robot['y_pose']),
+                    'z_pose': str(robot['z_pose']), 'yaw': str(robot['yaw']),
+                }.items()),
+
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(os.path.join(launch_dir, 'bringup_launch.py')),
+                launch_arguments={
+                    'namespace': robot_name, 'use_namespace': 'True', 'map': LaunchConfiguration('map'),
+                    'use_sim_time': 'True', 'params_file': params_file, 'autostart': 'true',
+                    'use_simulator': 'False', 'use_rviz': 'False', 'use_robot_state_pub': 'False'
+                }.items()),
+        ])
+        robots_actions.append(robot_group)
+
+    # 7. 최종 LaunchDescription 조립
+    ld = LaunchDescription()
+    
+    ld.add_action(world_arg)
+    ld.add_action(map_arg)
+    ld.add_action(robot1_params_file_arg)
+    ld.add_action(robot2_params_file_arg)
+    ld.add_action(use_rviz_arg)
+    ld.add_action(rviz_config_arg)
+    
+    ld.add_action(gz_resource_path)
+    ld.add_action(gz_resource_path_parent)
+    
+    ld.add_action(world_sdf_xacro)
+    ld.add_action(start_gazebo_server_cmd)
+    ld.add_action(start_gazebo_client_cmd)
+    ld.add_action(remove_temp_sdf_file)
+    
+    ld.add_action(start_rviz_cmd)
+
+    for group in robots_actions:
+        ld.add_action(group)
+
+    return ld
+```
+
+### \#\# 최종 실행 순서
+
+1.  **새 파일 생성:** `nav2_bringup/launch/` 폴더에 `multi_tb3_simulation_launch.py` 라는 이름으로 새 파일을 만들고 위 코드를 붙여넣습니다.
+
+2.  **빌드 및 실행:** 터미널에서 아래 명령어를 실행합니다.
+
+    ```bash
+    cd ~/turtlebot_ws
+    # 변경된 패키지들만 다시 빌드
+    colcon build --packages-select nav2_bringup nav2_minimal_tb3_sim
+    source install/setup.bash
+    # 새로 만든 런치 파일 실행
+    ros2 launch nav2_bringup multi_tb3_simulation_launch.py
+    ```
+
+이제 Gazebo가 정상적으로 실행되고, 두 대의 로봇이 생성되며, 하나의 RViz 창에서 모든 로봇의 상태를 확인할 수 있을 것입니다. 여러 번에 걸쳐 혼란을 드린 점 다시 한번 사과드립니다.
