@@ -320,3 +320,145 @@ ros2 topic echo /tf --once | head -n 20
 * 지금 캡처와 숫자는 **그 불일치(181s vs 210+s)**를 정확히 가리키고 있어요.
 * 위 액션 1–4만 수행하면, Fixed Frame이 `map`인 RViz에서 **빨간 점들이 지도에 고정**되어 보일 겁니다.
 * 그 다음 단계로 각도(yaw=pi/2)까지 TB4와 맞추면 방향 정렬까지 깔끔하게 끝납니다.
+############################
+
+
+
+네, `depot.sdf` 파일에서 3D 맵 모델을 교체하는 것은 간단합니다. 핵심은 Gazebo Fuel에서 온라인으로 Depot 맵을 불러오는 `<include>` 블록을, **사용자의 로컬 STL 파일을 사용하는 새로운 `<include>` 블록으로 교체**하는 것입니다.
+
+다만, STL 파일을 바로 월드에 넣기보다는 Gazebo의 표준 방식인 '모델(Model)'로 먼저 만들어주는 것이 좋습니다. 이렇게 하면 맵을 재사용하고 관리하기가 훨씬 편해집니다.
+
+아래 3단계로 나누어 자세히 설명해 드리겠습니다.
+
+-----
+
+### \#\# 1단계: STL 파일을 Gazebo 모델로 만들기
+
+먼저 사용자의 STL 파일을 Gazebo가 인식할 수 있는 '모델' 패키지 형태로 정리해야 합니다. 아래와 같은 폴더 구조를 만드는 것을 추천합니다.
+
+  * `my_robot_gazebo` (사용자의 시뮬레이션 패키지)
+      * `models/`
+          * `my_map/` (새로 만들 맵 모델 폴더)
+              * `meshes/`
+                  * `my_map.stl` **(사용자의 STL 파일을 이곳에 복사)**
+              * `model.config` **(아래 내용으로 새로 만들기)**
+              * `model.sdf` **(아래 내용으로 새로 만들기)**
+      * `worlds/`
+          * `my_world.sdf` (곧 만들 커스텀 월드 파일)
+      * `...`
+
+#### \#\#\# `model.config` 파일 내용
+
+맵 모델의 이름, 버전, 설명 등 메타데이터를 담는 파일입니다.
+
+```xml
+<?xml version="1.0"?>
+<model>
+  <name>My Custom Map</name>
+  <version>1.0</version>
+  <sdf version="1.6">model.sdf</sdf>
+  <author>
+    <name>Your Name</name>
+    <email>your@email.com</email>
+  </author>
+  <description>
+    A custom map model for my robot simulation.
+  </description>
+</model>
+```
+
+#### \#\#\# `model.sdf` 파일 내용
+
+이 파일이 STL 파일을 실제 시뮬레이션 객체로 정의하는 역할을 합니다.
+
+```xml
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <model name="my_map_model">
+    <static>true</static>
+    <link name="map_link">
+      <visual name="visual">
+        <geometry>
+          <mesh>
+            <uri>meshes/my_map.stl</uri>
+          </mesh>
+        </geometry>
+      </visual>
+      <collision name="collision">
+        <geometry>
+          <mesh>
+            <uri>meshes/my_map.stl</uri>
+          </mesh>
+        </geometry>
+      </collision>
+    </link>
+  </model>
+</sdf>
+```
+
+-----
+
+### \#\# 2단계: 월드(`depot.sdf`) 파일 수정
+
+이제 월드 파일을 수정하여 기존 Depot 맵 대신 방금 만든 `my_map` 모델을 불러오도록 하겠습니다.
+
+1.  `depot.sdf` 파일을 `my_robot_gazebo/worlds/` 폴더에 `my_world.sdf` 라는 이름으로 복사합니다.
+
+2.  `my_world.sdf` 파일을 열고, 아래 **`<include>` 블록 전체를 찾아서 삭제**합니다.
+
+    **삭제할 부분:**
+
+    ```xml
+    <include>
+      <uri>
+        https://fuel.gazebosim.org/1.0/OpenRobotics/models/Depot
+      </uri>
+      <experimental:params>
+        ...
+      </experimental:params>
+    </include>
+    ```
+
+3.  삭제한 위치에, 1단계에서 만든 **로컬 모델을 불러오는 새로운 `<include>` 블록을 추가**합니다.
+
+    **추가할 부분:**
+
+    ```xml
+    <include>
+      <uri>model://my_map</uri>
+    </include>
+    ```
+
+-----
+
+### \#\# 3단계: 런치 파일 수정
+
+마지막으로, 시뮬레이션을 시작하는 메인 런치 파일이 새로 만든 `my_world.sdf`를 사용하고, `my_map` 모델을 찾을 수 있도록 경로를 수정해야 합니다.
+
+`tb4_simulation_launch.py`(또는 복사본) 파일을 열어 두 부분을 수정합니다.
+
+1.  **월드 파일 경로 변경:** `declare_world_cmd`의 `default_value`를 `my_world.sdf`로 변경합니다.
+2.  **모델 경로 추가:** `set_env_vars_resources`에 `models` 폴더 경로를 추가하여 Gazebo가 `model://my_map`을 찾을 수 있게 합니다.
+
+**수정 예시 (`tb4_simulation_launch.py`):**
+
+```python
+    ...
+    sim_dir = get_package_share_directory('my_robot_gazebo') # 사용자 패키지 이름
+    ...
+    declare_world_cmd = DeclareLaunchArgument(
+        'world',
+        # 1. 월드 파일 경로를 my_world.sdf로 변경
+        default_value=os.path.join(sim_dir, 'worlds', 'my_world.sdf'),
+        description='Full path to world model file to load',
+    )
+    ...
+    set_env_vars_resources = AppendEnvironmentVariable(
+            'GZ_SIM_RESOURCE_PATH',
+            # 2. 기존 worlds 경로 뒤에 models 폴더 경로도 추가
+            os.path.join(sim_dir, 'worlds') + ':' + os.path.join(sim_dir, 'models')
+    )
+    ...
+```
+
+이제 이 3단계를 거치면 Gazebo 시뮬레이션에 사용자의 커스텀 3D 맵이 성공적으로 나타날 것입니다\!
