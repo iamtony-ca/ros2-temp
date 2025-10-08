@@ -3312,12 +3312,14 @@ pip install fastapi uvicorn
 ​  
 Test @ 4-bit 양자화 모드 & FastAPI Server  
 Source code: vla-scripts/deploy.py [참고]  
-수정: Import 구문  
-```
+수정: Import 구문 
+
+```python
 from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig  
 ​```
   
 수정: class OpenVLAServer::__Init__
+
 ```python
 # self.vla = AutoModelForVision2Seq.from_pretrained(
 #     self.openvla_path,
@@ -3339,7 +3341,8 @@ self.vla = AutoModelForVision2Seq.from_pretrained(
 ​```
   
 수정: class OpenVLAServer::predict_action
-```
+
+```python
 # inputs = self.processor(prompt, Image.fromarray(image).convert("RGB")).to(self.device, dtype=torch.bfloat16)
 
 # === 8-BIT/4-BIT QUANTIZATION MODE ===
@@ -3347,7 +3350,8 @@ inputs = self.processor(prompt, Image.fromarray(image).convert("RGB")).to(self.d
 ​```
   
 # 실행
-```
+
+```bash
 # at VS Code Terminal
 conda activate openvla
 cd ~/ws_openvla
@@ -3356,14 +3360,16 @@ python openvla/vla-scripts/deploy.py
 ```​
 
 # Install — gradio
-```
+
+```bash
 pip install gradio
 ​```
   
 # Test @ Gradio 시각화
 ## Source code: gradio_app.py
 ### 코드 — gradio_app.py
-```
+
+```python
 import gradio as gr
 import requests
 import json_numpy
@@ -3434,22 +3440,25 @@ with gr.Blocks() as gradio_app:
     )
 
 gradio_app.launch()
+
 ​```
   
 # 실행
-```
+
+```bash
 # at VS Code Terminal
 conda activate openvla
 cd ~/ws_openvla
 
 python OpenVLA_Tutorial/gradio_app.py
+
 ​```
   
 # Test Images
 
 Place the red vegetable in the silver pot.
 
-Pick up the remote.
+Pick up the remote.  
 ############################  
 
 # LIBERO+OpenVLA Jupyter 실습
