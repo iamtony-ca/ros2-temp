@@ -3303,19 +3303,22 @@ https://robosuite.ai/docs/installation.html#installing-on-windows
 
 ##################################  
 
-FastAPI 구축 실습
-최초 작성: @May 19, 2025​
-업데이트: 1차 @July 30, 2025​
-Serving OpenVLA models over a REST API (FastAPI) 
-Install — FastAPI
-pip install fastapi uvicorn
-​
-Test @ 4-bit 양자화 모드 & FastAPI Server
-Source code: vla-scripts/deploy.py [참고]
-수정: Import 구문
-from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
-​
+FastAPI 구축 실습  
+최초 작성: @May 19, 2025​  
+업데이트: 1차 @July 30, 2025​  
+Serving OpenVLA models over a REST API (FastAPI)   
+Install — FastAPI  
+pip install fastapi uvicorn  
+​  
+Test @ 4-bit 양자화 모드 & FastAPI Server  
+Source code: vla-scripts/deploy.py [참고]  
+수정: Import 구문  
+```
+from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig  
+​```
+  
 수정: class OpenVLAServer::__Init__
+```python
 # self.vla = AutoModelForVision2Seq.from_pretrained(
 #     self.openvla_path,
 #     attn_implementation=attn_implementation,
@@ -3333,26 +3336,34 @@ self.vla = AutoModelForVision2Seq.from_pretrained(
     low_cpu_mem_usage=True,
     trust_remote_code=True,
 )
-​
+​```
+  
 수정: class OpenVLAServer::predict_action
+```
 # inputs = self.processor(prompt, Image.fromarray(image).convert("RGB")).to(self.device, dtype=torch.bfloat16)
 
 # === 8-BIT/4-BIT QUANTIZATION MODE ===
 inputs = self.processor(prompt, Image.fromarray(image).convert("RGB")).to(self.device, dtype=torch.float16)
-​
-실행
+​```
+  
+# 실행
+```
 # at VS Code Terminal
 conda activate openvla
 cd ~/ws_openvla
 
 python openvla/vla-scripts/deploy.py
-​
-Install — gradio
+```​
+
+# Install — gradio
+```
 pip install gradio
-​
-Test @ Gradio 시각화
-Source code: gradio_app.py
-코드 — gradio_app.py
+​```
+  
+# Test @ Gradio 시각화
+## Source code: gradio_app.py
+### 코드 — gradio_app.py
+```
 import gradio as gr
 import requests
 import json_numpy
@@ -3423,15 +3434,18 @@ with gr.Blocks() as gradio_app:
     )
 
 gradio_app.launch()
-​
-실행
+​```
+  
+# 실행
+```
 # at VS Code Terminal
 conda activate openvla
 cd ~/ws_openvla
 
 python OpenVLA_Tutorial/gradio_app.py
-​
-Test Images
+​```
+  
+# Test Images
 
 Place the red vegetable in the silver pot.
 
