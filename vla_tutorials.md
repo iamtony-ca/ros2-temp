@@ -2184,3 +2184,1561 @@ cd /home/kime/ws_openvla ; /usr/bin/env /home/kime/miniconda3/envs/ws_mdl/bin/py
 폴더 `runs/tmodel`
 
 [events.out.tfevents.1748068267.kime-A6000.3472412.0](attachment:d89e2f0e-a605-4258-acbd-d3d26290db56:events.out.tfevents.1748068267.kime-A6000.3472412.0)
+
+###############################  
+
+# Diffusion 모델 기초 이론
+
+**작성:** `초기` July 30, 2025 
+
+# **Diffusion 모델 개요**
+
+## **Generative vs. Discriminative**
+
+- Generative models learn the data distribution
+
+![image.png](attachment:66b704c2-6653-4a3a-83d8-e9bff8df1d1d:image.png)
+
+## **Generative Models — Learning to generate data**
+
+![image.png](attachment:832e53cd-6bca-443e-8dd7-cec9462bbc01:image.png)
+
+## Different **Generative Models**
+
+![image.png](attachment:c678bb9c-cf32-47eb-84fe-bcaa28ee33d5:image.png)
+
+# **Diffusion 모델 기초 이론**
+
+## Diffusion Models as Stacking VAEs
+
+![image.png](attachment:1c53c049-398f-463a-8428-13da91daabd8:image.png)
+
+![image.png](attachment:f6278021-546f-489b-9f22-d0ba44c79dad:image.png)
+
+### Forward diffusion process — stacking fixed VAE encoders
+
+- **Adding Gaussian noise according to schedule $𝛽_t$:**
+    
+    ![image.png](attachment:381605c6-7545-4aea-bd69-f4433341cade:image.png)
+    
+    **Forward Process (Step):** $q(\mathbf{x}_t | \mathbf{x}_{t-1}) = \mathcal{N}(\mathbf{x}_t; \sqrt{1 - \beta_t}\mathbf{x}_{t-1}, \beta_t \mathbf{I})$
+    
+    - $\mathcal{N}(\mathbf{x}t; \sqrt{1 - \beta_t}\mathbf{x}{t-1}, \beta_t \mathbf{I})$
+        - 다변량 정규 분포(Multivariate Normal Distribution)
+        - xt는 분포를 따르는 변수
+        - μ는 분포의 평균(Mean) 벡터
+        - Σ는 분포의 공분산(Covariance) 행렬
+    
+    **Forward Process (Total):** $q(\mathbf{x}_{1:T} | \mathbf{x}0) = \prod_{t=1}^{T} q(\mathbf{x}_t | \mathbf{x}_{t-1})$
+    
+
+- **Sampling of $x_𝑡$ at arbitrary timestep 𝑡 in closed form:**
+    
+    ![image.png](attachment:eedbac94-248c-40c3-b662-6c7ec5f5542c:c989a06f-72c0-4050-892e-e8c02bf6d569.png)
+    
+    ![image.png](attachment:584c34fa-8a32-44d6-947e-0b485eeccb5d:image.png)
+    
+    ![image.png](attachment:0161afdd-96b3-4517-aa52-6cfad97a7dcc:image.png)
+    
+    ![image.png](attachment:f643e7a6-8724-4ca1-8721-ebd22019b2a2:image.png)
+    
+    ![image.png](attachment:d99fb4f3-ea4b-4b2d-aa84-15af6ef6e592:image.png)
+    
+
+### Reverse denoising process — stacking `learnable` VAE decoders
+
+![image.png](attachment:dac7f402-8b29-47ef-9794-8683e80374ef:image.png)
+
+- Sample
+    
+    ![image.png](attachment:6e17c0e2-3855-4fb1-bdc7-6eb8394f2a11:image.png)
+    
+- Iteratively sample
+    
+    ![image.png](attachment:c0c5d3af-bfcb-46a7-8417-cf336b52417d:image.png)
+    
+- $q(\textbf{x}_{t-1}|\textbf{x}_{t})$ not directly tractable — But can be estimated with a Gaussian distribution if $𝛽_𝑡$ is small at each step
+    
+    ![image.png](attachment:77d45f03-da32-4f27-b01d-1a77d57dc0b4:image.png)
+    
+    ![image.png](attachment:9dda50c1-8c89-4b8f-9ed7-cfe6e7c52c65:image.png)
+    
+    ![image.png](attachment:06bdeaea-0a72-433a-b2ed-b51125deb740:image.png)
+    
+    ![image.png](attachment:d0988e32-2d48-48c2-871b-fbc7a696bab5:image.png)
+    
+
+### **Recap: Variational Autoencoders**
+
+- **Solution:** having intermediate latent variables to reduce the gap of each step
+    - Hierarchical VAEs (Stacking VAEs)
+        - Each step, the decoder removes part of the noise
+        - Provides a seed model closer to final distribution
+            
+            ![image.png](attachment:0a9b58ec-73ff-44db-bfcb-ca77fca5f8d3:image.png)
+            
+            ![image.png](attachment:5716afac-7559-41d2-a678-1880ad55c6be:image.png)
+            
+        - Each step incrementally recovers the final distribution
+            
+            ![image.png](attachment:cec49299-d73d-4f71-8565-cd233f45fbde:image.png)
+            
+- **Limitations of VAEs**
+    - Decoder must transform a standard Gaussian all the way to the target distribution in one-step
+        
+        ![image.png](attachment:e3707ce3-4c97-4956-b42b-0ba1eb27ce43:image.png)
+        
+        - Often too large a gap
+        - Blurry results are generated
+            
+            ![image.png](attachment:e023fdf3-358c-4fe8-a7c7-0792cc95d7a3:image.png)
+            
+- Training: maximize the ELBO (Evidence Lower Bound)
+    
+    ![image.png](attachment:8efb52de-60fc-419d-be30-cf0662188500:image.png)
+    
+    ![image.png](attachment:05c242e4-df15-42b1-9a55-ebd50a91c08a:image.png)
+    
+    ![image.png](attachment:ef21f705-7709-4efa-a448-bc59789af889:image.png)
+    
+- Decoder: a generative model that transforms a Gaussian variable z to real data
+- Encoder: an inference model that approximates the posterior 𝑞(𝑧|𝑥)
+- VAEs: a likelihood-based generative model
+
+### Diffusion models are special cases of Stacking VAEs
+
+![image.png](attachment:799d8ab2-fbaa-41b9-9ce0-052a8090efd9:image.png)
+
+- Diffusion models use fixed inference encoders
+    
+    ![image.png](attachment:82d2dfee-ab70-421c-8d6f-dbf87e117c7d:image.png)
+    
+- In VAEs, encoders are learned with KL-divergence between the posterior and the prior
+- Suffers from the ‘posterior-collapse’ issue :
+    - Posterior collapse는 잠재 변수 $z$의 근사 후방 분포 $q(z|x)$가 사전 분포 $p(z)$에 지나치게 가까워져서 잠재 변수가 데이터의 정보를 거의 반영하지 않게 되는 현상입니다.
+    - 잠재 변수 $z$가 데이터 $x$에 대해 독립적이 되어 의미 있는 표현을 학습하지 못합니다.
+    - 모델이 생성 품질이 떨어지거나, 잠재 공간이 활용되지 않아 다양성이 감소합니다.
+
+---
+
+## Diffusion Models: Training, Sampling
+
+- Final Objective
+    
+    ![image.png](attachment:dc8d42ee-9a04-425b-9fb5-121d8e561614:image.png)
+    
+- In DDPM, simplified version
+    
+    ![image.png](attachment:85811f63-0c74-4a1f-a542-fc36b1e5b008:image.png)
+    
+    ![image.png](attachment:833dd5ab-d7a2-4017-bb3b-cd9b6ba8dcb3:image.png)
+    
+
+---
+
+## Many Steps in Diffusion (Sampling)
+
+- Slow in generation
+- In Training, we randomly sample one time step
+- But in inference, we must transit from T to 0
+    - 1000 steps
+    - extremely slow for raw images/signals
+        
+        ![image.png](attachment:fe5bac93-8d07-4df4-868b-5886803f95d7:image.png)
+        
+        ![image.png](attachment:d93ba831-a496-47f3-a59d-4be123696d90:image.png)
+        
+        ![image.png](attachment:166f718c-2f7e-4d23-8808-caea88ce102b:image.png)
+        
+- DDIM with Fewer Steps Sampling
+    
+    ![image.png](attachment:9ab7b49f-d2aa-48f4-a7ae-184fec0732f3:image.png)
+    
+
+### DDPM vs DDIM 차이점
+
+Diffusion 모델에서 샘플 생성을 위한 **reverse diffusion process**를 방법
+
+- **DDPM**(Denoising Diffusion Probabilistic Models)
+- **DDIM**(Denoising Diffusion Implicit Models)
+
+하지만 두 모델은 **샘플링 과정의 방식**과 **속도**, 그리고 **샘플 다양성** 측면에서 중요한 차이를 가지고 있음.
+
+---
+
+### ✅ 1. DDPM (Denoising Diffusion Probabilistic Models)
+
+**제안자**: Ho et al. (2020)
+
+**핵심 아이디어**:
+
+DDPM은 forward 과정에서 점점 더 노이즈를 추가해가며 데이터를 정규 분포로 만든 뒤, 이를 역으로 제거하는 **확률적 reverse process**를 통해 샘플을 생성함.
+
+### 🔁 Forward Process:
+
+- 데이터 $x_0$에 점진적으로 노이즈를 추가해서 $x_1, x_2, ..., x_T$까지 생성
+- 노이즈는 다음 식으로 추가됨:
+    
+    $q(x_t | x_{t-1}) = \mathcal{N}(x_t; \sqrt{1 - \beta_t} x_{t-1}, \beta_t I)$
+    
+
+### 🔄 Reverse Process:
+
+- 학습된 신경망 $\epsilon_\theta(x_t, t)$이 $x_t$에서 원래의 noise $\epsilon$을 예측
+- 역방향 샘플링은 다음과 같은 **확률적** 형태:
+    
+    $p_\theta(x_{t-1} | x_t) = \mathcal{N}(x_{t-1}; \mu_\theta(x_t, t), \Sigma_\theta(x_t, t))$
+    
+- 한 스텝마다 Gaussian 샘플링이 있음 → **느림**
+
+### ❗️⭐특징:
+
+- **높은 샘플 품질**
+- **샘플링이 느림** (보통 1000 스텝 이상 필요)
+- **다양성 높음** (확률적 과정이므로 다양한 샘플 가능)
+
+---
+
+### ✅ 2. DDIM (Denoising Diffusion Implicit Models)
+
+**제안자**: Song et al. (2021)
+
+**핵심 아이디어**:
+
+DDIM은 DDPM과 동일한 학습 방식을 유지하면서도, 샘플링을 **결정론적(Deterministic)**으로 바꿔서 더 빠르게 만드는 방식
+
+### 🔁 Forward Process:
+
+- DDPM과 동일하게 진행
+
+### 🔄 Reverse Process:
+
+- 확률적 Gaussian 샘플링이 아닌, **ODE 기반의 결정론적 역방향 과정**
+- 다음과 같이 noise-free trajectory를 통해 샘플링:
+    
+    $x_{t-1} = \sqrt{\bar{\alpha}_{t-1}} \left( \frac{x_t - \sqrt{1 - \bar{\alpha}_t} \cdot \epsilon_\theta(x_t, t)}{\sqrt{\bar{\alpha}_t}} \right) + \sqrt{1 - \bar{\alpha}_{t-1}} \cdot \epsilon_\theta(x_t, t)$
+    
+- **Gaussian noise를 제거**해 결정론적 결과 생성
+- **샘플링 스텝 수를 줄일 수 있음** (e.g., 1000 → 50 스텝 등)
+
+### ❗️⭐특징:
+
+- **샘플링 속도 빠름** (수십 스텝으로도 고품질 샘플 생성 가능)
+- **결정론적 생성** (같은 조건이면 항상 같은 샘플)
+- **다양성 부족** → 하지만 optional noise 추가로 다양성 회복 가능
+
+---
+
+### 🔍 핵심 비교 요약
+
+| 항목 | **DDPM** | **DDIM** |
+| --- | --- | --- |
+| 샘플링 방식 | 확률적 (Stochastic) | 결정론적 (Deterministic) |
+| 샘플링 속도 | 느림 (보통 1000 스텝) | 빠름 (10~50 스텝 가능) |
+| 다양성 | 높음 (매번 다른 결과) | 낮음 (같은 조건이면 같은 결과) |
+| 학습 과정 | 동일 (noise prediction 방식) | 동일 |
+| 활용성 | 고품질이지만 느림 | 트레이드오프 조절 가능 (품질 vs 속도) |
+
+# **Diffusion 모델 — 실습 키 포인트**
+
+- Sampling
+- Network (UNet)
+- Training
+- Controling (Context)
+- Speeding Up (DDPM vs DDIM)
+
+## **Diffusion 모델 — Why?**
+
+![image.png](attachment:fdf8c017-2fca-4f7a-a937-697b95414794:image.png)
+
+![image.png](attachment:2d29c96a-9caa-4173-9c77-c0621676ae8b:image.png)
+
+![image.png](attachment:ae147e44-ba18-44e7-9d52-078d7d1d4e30:image.png)
+
+![image.png](attachment:324fd25f-73a9-4422-bb64-e438d4f529d7:image.png)
+
+## **Diffusion 모델 —** Sampling
+
+![image.png](attachment:1257f4db-7363-45e2-95e6-59144b668d75:image.png)
+
+![image.png](attachment:75ee2741-a7f8-4efd-98ad-668d44a2126d:image.png)
+
+![image.png](attachment:39381f54-7fe0-44eb-a86a-53013cb5b427:image.png)
+
+## **Diffusion 모델 —** Neural Network
+
+![image.png](attachment:05a3b71a-0043-4c20-be4b-e7054a51a404:image.png)
+
+![image.png](attachment:fae5b6f9-244e-4084-af0d-500345053d2f:image.png)
+
+## **Diffusion 모델 —** Training
+
+![image.png](attachment:2238cf84-fc8c-4621-96de-170ae92e3ab7:image.png)
+
+![image.png](attachment:edbced9f-d42a-4564-8395-1258a9083be3:image.png)
+
+![image.png](attachment:c7a4961e-e048-4391-b458-5d8e2b55ae8a:image.png)
+
+![image.png](attachment:fdc0143d-c60c-433a-a778-58c4bbc77828:image.png)
+
+## **Diffusion 모델 —** Controlling
+
+![image.png](attachment:3c7d545f-cd19-4e5e-8d78-8449ddc87286:image.png)
+
+![image.png](attachment:5168403e-0f88-42a1-a659-7fe957365810:image.png)
+
+![image.png](attachment:0576b914-c760-4618-95eb-31f2680b1dbc:image.png)
+
+## **Diffusion 모델 —** Speeding Up
+
+![image.png](attachment:c288281a-67fc-44f6-8891-cb88ba3d3ff0:image.png)
+
+![image.png](attachment:8914f088-1821-40db-9bbf-6bb256a382fa:image.png)
+
+---
+
+# 참고자료
+
+cs.cmu(F24) — lec24.diffusion.pdf — https://deeplearning.cs.cmu.edu/F24/document/slides/lec24.diffusion.pdf
+
+####################################  
+
+# Diffusion — Python 코드 기반 실습 (Sprite & MNIST)
+
+# **Lab 1 - Sampling (L1_Sampling.ipynb)**
+
+![image.png](attachment:10a2c874-b8fa-441d-be1c-1e8bd050d84f:9cfd4a18-be19-4b70-a4d0-c0cb28c74acf.png)
+
+```python
+class ContextUnet(nn.Module):
+    def __init__(self, in_channels, n_feat=256, n_cfeat=10, height=28):  # cfeat - context features
+        super(ContextUnet, self).__init__()
+
+        # number of input channels, number of intermediate feature maps and number of classes
+        self.in_channels = in_channels
+        self.n_feat = n_feat
+        self.n_cfeat = n_cfeat
+        self.h = height  #assume h == w. must be divisible by 4, so 28,24,20,16...
+
+        # Initialize the initial convolutional layer
+        self.init_conv = ResidualConvBlock(in_channels, n_feat, is_res=True)
+
+        # Initialize the down-sampling path of the U-Net with two levels
+        self.down1 = UnetDown(n_feat, n_feat)        # down1 #[10, 256, 8, 8]
+        self.down2 = UnetDown(n_feat, 2 * n_feat)    # down2 #[10, 256, 4, 4]
+        
+         # original: self.to_vec = nn.Sequential(nn.AvgPool2d(7), nn.GELU())
+        self.to_vec = nn.Sequential(nn.AvgPool2d((4)), nn.GELU())
+
+        # Embed the timestep and context labels with a one-layer fully connected neural network
+        self.timeembed1 = EmbedFC(1, 2*n_feat)
+        self.timeembed2 = EmbedFC(1, 1*n_feat)
+        self.contextembed1 = EmbedFC(n_cfeat, 2*n_feat)
+        self.contextembed2 = EmbedFC(n_cfeat, 1*n_feat)
+
+        # Initialize the up-sampling path of the U-Net with three levels
+        self.up0 = nn.Sequential(
+            nn.ConvTranspose2d(2 * n_feat, 2 * n_feat, self.h//4, self.h//4), # up-sample  
+            nn.GroupNorm(8, 2 * n_feat), # normalize                       
+            nn.ReLU(),
+        )
+        self.up1 = UnetUp(4 * n_feat, n_feat)
+        self.up2 = UnetUp(2 * n_feat, n_feat)
+
+        # Initialize the final convolutional layers to map to the same number of channels as the input image
+        self.out = nn.Sequential(
+            nn.Conv2d(2 * n_feat, n_feat, 3, 1, 1), # reduce number of feature maps   #in_channels, out_channels, kernel_size, stride=1, padding=0
+            nn.GroupNorm(8, n_feat), # normalize
+            nn.ReLU(),
+            nn.Conv2d(n_feat, self.in_channels, 3, 1, 1), # map to same number of channels as input
+        )
+
+    def forward(self, x, t, c=None):
+        """
+        x : (batch, n_feat, h, w) : input image
+        t : (batch, n_cfeat)      : time step
+        c : (batch, n_classes)    : context label
+        """
+        # x is the input image, c is the context label, t is the timestep, context_mask says which samples to block the context on
+
+        # pass the input image through the initial convolutional layer
+        x = self.init_conv(x)
+        # pass the result through the down-sampling path
+        down1 = self.down1(x)       #[10, 256, 8, 8]
+        down2 = self.down2(down1)   #[10, 256, 4, 4]
+        
+        # convert the feature maps to a vector and apply an activation
+        hiddenvec = self.to_vec(down2)
+        
+        # mask out context if context_mask == 1
+        if c is None:
+            c = torch.zeros(x.shape[0], self.n_cfeat).to(x)
+            
+        # embed context and timestep
+        cemb1 = self.contextembed1(c).view(-1, self.n_feat * 2, 1, 1)     # (batch, 2*n_feat, 1,1)
+        temb1 = self.timeembed1(t).view(-1, self.n_feat * 2, 1, 1)
+        cemb2 = self.contextembed2(c).view(-1, self.n_feat, 1, 1)
+        temb2 = self.timeembed2(t).view(-1, self.n_feat, 1, 1)
+        #print(f"uunet forward: cemb1 {cemb1.shape}. temb1 {temb1.shape}, cemb2 {cemb2.shape}. temb2 {temb2.shape}")
+
+        up1 = self.up0(hiddenvec)
+        up2 = self.up1(cemb1*up1 + temb1, down2)  # add and multiply embeddings
+        up3 = self.up2(cemb2*up2 + temb2, down1)
+        out = self.out(torch.cat((up3, x), 1))
+        return out
+
+```
+
+## 🧠 ContextUnet 클래스 정의
+
+이 부분은 **컨텍스트 조건부 U-Net** 구조를 구현한 것입니다. 확산 모델에서 사용될 핵심 신경망입니다.
+
+### 구조 요약:
+
+- `ResidualConvBlock`: 잔차 구조로 특징 추출
+- `UnetDown`, `UnetUp`: 다운샘플링, 업샘플링 경로
+- `EmbedFC`: 타임스텝(timestep) 및 조건(context)을 임베딩
+- 컨텍스트와 타임스텝 정보를 임베딩하여 중간 특성과 결합
+- 마지막에 원본 이미지와 같은 차원의 출력을 생성
+
+## Hyper Parameter 설정
+
+```python
+# hyperparameters
+
+## diffusion hyperparameters
+timesteps = 500
+beta1 = 1e-4
+beta2 = 0.02
+
+## network hyperparameters
+device = torch.device("cuda:0" if torch.cuda.is_available() else torch.device('cpu'))
+n_feat = 64 # 64 hidden dimension feature
+n_cfeat = 5 # context vector is of size 5
+height = 16 # 16x16 image
+save_dir = './weights/'
+
+# training hyperparameters
+batch_size = 100
+n_epoch = 32
+lrate=1e-3
+```
+
+## 확산 스케줄 계산
+
+```python
+## construct DDPM noise schedule
+b_t = (beta2 - beta1) * torch.linspace(0, 1, timesteps + 1, device=device) + beta1
+a_t = 1 - b_t
+ab_t = torch.cumsum(a_t.log(), dim=0).exp()    
+ab_t[0] = 1
+```
+
+노이즈 추가/제거에 사용되는 변수들을 계산합니다:
+
+- `b_t`, `a_t`, `ab_t`: 각각 시간에 따른 노이즈 비율, 잔여 신호 비율, 누적 신호 보존 비율
+
+## 노이즈 추가
+
+```python
+# removes the predicted noise (but adds some noise back in to avoid collapse)
+def denoise_add_noise(x, t, pred_noise, z=None):
+    if z is None:
+        z = torch.randn_like(x)
+    noise = b_t.sqrt()[t] * z
+    mean = (x - pred_noise * ((1 - a_t[t]) / (1 - ab_t[t]).sqrt())) / a_t[t].sqrt()
+    return mean + noise
+```
+
+## 샘플링 (DDPM)
+
+```python
+# sample using standard algorithm
+@torch.no_grad()
+def sample_ddpm(n_sample, save_rate=20):
+    # x_T ~ N(0, 1), sample initial noise
+    samples = torch.randn(n_sample, 3, height, height).to(device)  
+
+    # array to keep track of generated steps for plotting
+    intermediate = [] 
+    for i in range(timesteps, 0, -1):
+        print(f'sampling timestep {i:3d}', end='\r')
+
+        # reshape time tensor
+        t = torch.tensor([i / timesteps])[:, None, None, None].to(device)
+
+        # sample some random noise to inject back in. For i = 1, don't add back in noise
+        **z = torch.randn_like(samples) if i > 1 else 0**
+
+        eps = nn_model(samples, t)    # predict noise e_(x_t,t)
+        samples = denoise_add_noise(samples, i, eps, z)
+        if i % save_rate ==0 or i==timesteps or i<8:
+            intermediate.append(samples.detach().cpu().numpy())
+
+    intermediate = np.stack(intermediate)
+    return samples, intermediate
+```
+
+## 올바르지 않은 샘플링 (DDPM)
+
+```python
+**# incorrectly sample without adding in noise**
+@torch.no_grad()
+def sample_ddpm_incorrect(n_sample):
+    # x_T ~ N(0, 1), sample initial noise
+    samples = torch.randn(n_sample, 3, height, height).to(device)  
+
+    # array to keep track of generated steps for plotting
+    intermediate = [] 
+    for i in range(timesteps, 0, -1):
+        print(f'sampling timestep {i:3d}', end='\r')
+
+        # reshape time tensor
+        t = torch.tensor([i / timesteps])[:, None, None, None].to(device)
+
+        # don't add back in noise
+        **z = 0**
+
+        eps = nn_model(samples, t)    # predict noise e_(x_t,t)
+        samples = denoise_add_noise(samples, i, eps, z)
+        if i%20==0 or i==timesteps or i<8:
+            intermediate.append(samples.detach().cpu().numpy())
+
+    intermediate = np.stack(intermediate)
+    return samples, intermediate
+```
+
+# **Lab 2 - Training  (L2_Training.ipynb)**
+
+## 데이터 로드
+
+```python
+# load dataset and construct optimizer
+dataset = CustomDataset("./dataset/L2_sprites_1788_16x16.npy", "./dataset/L2_sprite_labels_nc_1788_16x16.npy", transform, null_context=False)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=1)
+optim = torch.optim.Adam(nn_model.parameters(), lr=lrate)
+```
+
+## 이미지에 노이즈 추가
+
+```python
+# perturbs an image to a specified noise level
+def perturb_input(x, t, noise):
+    return ab_t.sqrt()[t, None, None, None] * x + (1 - ab_t[t, None, None, None]).sqrt() * noise
+```
+
+## Training 프로세스
+
+```python
+# training without context code (Need GPU)
+
+# set into train mode
+nn_model.train()
+
+for ep in range(n_epoch):
+    print(f'epoch {ep}')
+    
+    # linearly decay learning rate
+    optim.param_groups[0]['lr'] = lrate*(1-ep/n_epoch)
+    
+    pbar = tqdm(dataloader, mininterval=2 )
+    for x, _ in pbar:   # x: images
+        optim.zero_grad()
+        x = x.to(device)
+        
+        # perturb data
+        noise = torch.randn_like(x)
+        t = torch.randint(1, timesteps + 1, (x.shape[0],)).to(device) 
+        x_pert = perturb_input(x, t, noise)
+        
+        # use network to recover noise
+        pred_noise = nn_model(x_pert, t / timesteps)
+        
+        # loss is mean squared error between the predicted and true noise
+        loss = F.mse_loss(pred_noise, noise)
+        loss.backward()
+        
+        optim.step()
+
+    # save model periodically
+    if ep%4==0 or ep == int(n_epoch-1):
+        if not os.path.exists(save_dir):
+            os.mkdir(save_dir)
+        torch.save(nn_model.state_dict(), save_dir + f"model_{ep}.pth")
+        print('saved model at ' + save_dir + f"model_{ep}.pth")
+```
+
+# **Lab 3 - Context**
+
+**조건부(Conditional) 이미지 생성**이며, Context를 반영한 생성 결과를 얻는 것이 목적임.
+
+## Context를 추가한 Training 프로세스
+
+```python
+# training with context code (Need GPU)
+# set into train mode
+nn_model.train()
+
+for ep in range(n_epoch):
+    print(f'epoch {ep}')
+    
+    # linearly decay learning rate
+    optim.param_groups[0]['lr'] = lrate*(1-ep/n_epoch)
+    
+    pbar = tqdm(dataloader, mininterval=2 )
+    **for x, c in pbar:   # x: images  c: context**
+        optim.zero_grad()
+        x = x.to(device)
+        **c = c.to(x)**
+        
+        # randomly mask out c
+        context_mask = torch.bernoulli(torch.zeros(c.shape[0]) + 0.9).to(device)
+        **c = c * context_mask.unsqueeze(-1)**
+        
+        # perturb data
+        noise = torch.randn_like(x)
+        t = torch.randint(1, timesteps + 1, (x.shape[0],)).to(device) 
+        x_pert = perturb_input(x, t, noise)
+        
+        # use network to recover noise
+        **pred_noise = nn_model(x_pert, t / timesteps, c=c)**
+        
+        # loss is mean squared error between the predicted and true noise
+        loss = F.mse_loss(pred_noise, noise)
+        loss.backward()
+        
+        optim.step()
+
+    # save model periodically
+    if ep%4==0 or ep == int(n_epoch-1):
+        if not os.path.exists(save_dir):
+            os.mkdir(save_dir)
+        torch.save(nn_model.state_dict(), save_dir + f"context_model_{ep}.pth")
+        print('saved model at ' + save_dir + f"context_model_{ep}.pth")
+```
+
+## Context를 추가한 Sampling 프로세스
+
+```python
+# sample with context using standard algorithm
+@torch.no_grad()
+def sample_ddpm_context(n_sample, context, save_rate=20):
+    # x_T ~ N(0, 1), sample initial noise
+    samples = torch.randn(n_sample, 3, height, height).to(device)  
+
+    # array to keep track of generated steps for plotting
+    intermediate = [] 
+    for i in range(timesteps, 0, -1):
+        print(f'sampling timestep {i:3d}', end='\r')
+
+        # reshape time tensor
+        t = torch.tensor([i / timesteps])[:, None, None, None].to(device)
+
+        # sample some random noise to inject back in. For i = 1, don't add back in noise
+        z = torch.randn_like(samples) if i > 1 else 0
+
+        **eps = nn_model(samples, t, c=context)**    # predict noise e_(x_t,t, ctx)
+        samples = denoise_add_noise(samples, i, eps, z)
+        if i % save_rate==0 or i==timesteps or i<8:
+            intermediate.append(samples.detach().cpu().numpy())
+
+    intermediate = np.stack(intermediate)
+    return samples, intermediate
+```
+
+## 특정 Context 기반 Sampling
+
+```python
+# user defined context
+ctx = torch.tensor([
+    # hero, non-hero, food, spell, side-facing
+    [1,0,0,0,0],  
+    [1,0,0,0,0],    
+    [0,0,0,0,1],
+    [0,0,0,0,1],    
+    [0,1,0,0,0],
+    [0,1,0,0,0],
+    [0,0,1,0,0],
+    [0,0,1,0,0],
+]).float().to(device)
+samples, _ = sample_ddpm_context(ctx.shape[0], ctx)
+show_images(samples)
+```
+
+## 특정 Mixed Context 기반 Sampling
+
+```python
+# mix of defined context
+ctx = torch.tensor([
+    # hero, non-hero, food, spell, side-facing
+    [1,0,0,0,0],      #human
+    [1,0,0.6,0,0],    
+    [0,0,0.6,0.4,0],  
+    [1,0,0,0,1],  
+    [1,1,0,0,0],
+    [1,0,0,1,0]
+]).float().to(device)
+samples, _ = sample_ddpm_context(ctx.shape[0], ctx)
+show_images(samples)
+```
+
+## 🔍모델 아키텍처 – `ContextUnet` 핵심 아이디어
+
+- **U-Net 기반 구조**에 **timestep**과 **context label**을 embedding하여 이미지 생성에 반영.
+- `context`는 클래스 정보를 담은 벡터 (예: one-hot)이며, 이를 통해 원하는 속성을 가진 이미지를 생성할 수 있음.
+
+```python
+x → init_conv → down1 → down2 → to_vec
+                  ↓           ↓
+              + time/context embeddings
+                  ↓           ↓
+               up0 → up1 → up2 → output
+
+```
+
+- `EmbedFC`: Fully Connected layer로 context와 timestep을 embedding
+- `up1`, `up2`: context와 timestep의 embedding을 곱/합하여 추가 정보 반영
+- context 없이 생성할 수도 있도록, `if c is None:` 처리
+
+# **Lab 4 - Fast Sampling (DDIM)**
+
+## DDIM Denois 프로세스
+
+```python
+# define sampling function for DDIM   
+# removes the noise using ddim
+def denoise_ddim(x, t, t_prev, pred_noise):
+    ab = ab_t[t]
+    ab_prev = ab_t[t_prev]
+    
+    x0_pred = ab_prev.sqrt() / ab.sqrt() * (x - (1 - ab).sqrt() * pred_noise)
+    dir_xt = (1 - ab_prev).sqrt() * pred_noise
+
+    return x0_pred + dir_xt
+```
+
+## DDIM Sampling 프로세스
+
+```python
+# sample quickly using DDIM
+@torch.no_grad()
+def sample_ddim(n_sample, n=20):
+    # x_T ~ N(0, 1), sample initial noise
+    samples = torch.randn(n_sample, 3, height, height).to(device)  
+
+    # array to keep track of generated steps for plotting
+    intermediate = [] 
+    step_size = timesteps // n
+    for i in range(timesteps, 0, -step_size):
+        print(f'sampling timestep {i:3d}', end='\r')
+
+        # reshape time tensor
+        t = torch.tensor([i / timesteps])[:, None, None, None].to(device)
+
+        eps = nn_model(samples, t)    # predict noise e_(x_t,t)
+        samples = denoise_ddim(samples, i, i - step_size, eps)
+        intermediate.append(samples.detach().cpu().numpy())
+
+    intermediate = np.stack(intermediate)
+    return samples, intermediate
+```
+
+## Context를 추가한 DDIM Sampling 프로세스
+
+```python
+# fast sampling algorithm with context
+@torch.no_grad()
+def sample_ddim_context(n_sample, context, n=20):
+    # x_T ~ N(0, 1), sample initial noise
+    samples = torch.randn(n_sample, 3, height, height).to(device)  
+
+    # array to keep track of generated steps for plotting
+    intermediate = [] 
+    step_size = timesteps // n
+    for i in range(timesteps, 0, -step_size):
+        print(f'sampling timestep {i:3d}', end='\r')
+
+        # reshape time tensor
+        t = torch.tensor([i / timesteps])[:, None, None, None].to(device)
+
+        eps = nn_model(samples, t, c=context)    # predict noise e_(x_t,t)
+        samples = denoise_ddim(samples, i, i - step_size, eps)
+        intermediate.append(samples.detach().cpu().numpy())
+
+    intermediate = np.stack(intermediate)
+    return samples, intermediate
+```
+
+
+############################  
+# OpenVLA 및 LIBERO 환경 구축
+
+**최초 작성:** May 19, 2025
+
+**업데이트:** 1차 July 30, 2025
+
+# **Installation — OpenVLA (Linux & Windows)**
+
+- **환경 구성:** PyTorch 2.2.0, torchvision 0.17.0, transformers 4.40.1, tokenizers 0.19.1, timm 0.9.10, and flash-attn 2.5.5
+
+### Set-up: Conda Env
+
+```bash
+# Create and activate conda environment
+conda create -n openvla python=3.10 -y
+conda activate openvla
+
+# Install PyTorch.
+# https://pytorch.org/get-started/locally/
+
+# CUDA 12.1 (Conda)
+conda install pytorch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 pytorch-cuda=12.1 -c pytorch -c nvidia -y 
+# OR
+# CUDA 12.1 (Pip) -Optional
+pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu121 -q
+```
+
+### Set-up: Openvla Repo
+
+```bash
+# Clone and install the openvla repo
+git clone https://github.com/openvla/openvla.git
+cd openvla
+pip install -e .
+# openvla pip 설치이후 Pytorch CPU 버전으로 downgrade 현상 체크
+# openvla pip 설치이후 CUDA 12.1 (Conda) 설치 추천
+conda install nvidia/label/cuda-12.1.0::cuda-nvcc
+```
+
+### Set-up(for Ubuntu): Ninja & Flash Attention 2
+
+```bash
+# Install Flash Attention 2 for training (https://github.com/Dao-AILab/flash-attention)
+#   =>> If you run into difficulty, try `pip cache remove flash_attn` first
+pip install packaging ninja
+# ninja --version; echo $?  # Verify Ninja --> should return exit code "0"
+# Linux GCC 필수 (윈도우에서는 MSVC 필요) 
+pip install "flash-attn==2.5.5" --no-build-isolation
+```
+
+### Set-up(for Windows): Ninja & Flash Attention 2
+
+```bash
+# 윈도우 flash-attn 설치 (이전 설치 진행 전)
+
+# 1. nvcc 설치
+# https://docs.nvidia.com/cuda/cuda-installation-guide-microsoft-windows/index.html
+# nvcc 실행 확인
+
+# 2. (Option) MS Visual Studio 설치 필요 가능
+
+```
+
+![image.png](attachment:bd205b7c-0c87-4e40-91b6-6844d7d14631:image.png)
+
+# Inference Test **— OpenVLA (Linux & Windows)**
+
+**Source code: vla-scripts/extern/verify_openvla.py**
+
+### VRAM 16GB 정도 — (BFLOAT16 + FLASH-ATTN MODE)
+
+```python
+# === BFLOAT16 + FLASH-ATTN MODE ===
+print("[*] Loading in BF16 with Flash-Attention Enabled")
+vla = AutoModelForVision2Seq.from_pretrained(
+    MODEL_PATH,
+    attn_implementation="flash_attention_2",
+    torch_dtype=torch.bfloat16,
+    low_cpu_mem_usage=True,
+    trust_remote_code=True,
+).to(device)
+```
+
+```python
+# === BFLOAT16 MODE ===
+inputs = processor(prompt, image).to(device, dtype=torch.bfloat16)
+```
+
+### VRAM 6GB 정도 — (4-BIT QUANTIZATION MODE)
+
+```bash
+# If needed
+sudo apt install python3-pip
+# Install bitsandbytes
+pip install bitsandbytes
+```
+
+```python
+from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
+```
+
+```python
+# === 4-BIT QUANTIZATION MODE (`pip install bitsandbytes`) :: [~6GB of VRAM Passive || 7GB of VRAM Active] ===
+print("[*] Loading in 4-Bit Quantization Mode")
+vla = AutoModelForVision2Seq.from_pretrained(
+    MODEL_PATH,
+    attn_implementation="flash_attention_2",
+    torch_dtype=torch.float16,
+    quantization_config=BitsAndBytesConfig(load_in_4bit=True),
+    low_cpu_mem_usage=True,
+    trust_remote_code=True,
+)
+```
+
+```python
+# === 8-BIT/4-BIT QUANTIZATION MODE ===
+inputs = processor(prompt, image).to(device, dtype=torch.float16)
+```
+
+<aside>
+💡
+
+**ERROR #1** - Related to “pip install bitsandbytes”
+
+> A module that was compiled using NumPy 1.x cannot be run in
+NumPy 2.2.6 as it may crash. To support both 1.x and 2.x
+versions of NumPy, modules must be compiled with NumPy 2.0.
+Some module may need to rebuild instead e.g. with 'pybind11>=2.12'.
+> 
+
+**SOL**
+
+```bash
+# pip install again (to downgrade as numpy 1.26.4)
+cd openvla
+pip install -e .
+```
+
+</aside>
+
+<aside>
+💡
+
+**ERROR #2**
+
+> ValueError: `.to` is not supported for `4-bit` or `8-bit` bitsandbytes models. Please use the model as it is, since the model has already been set to the correct devices and casted to the correct `dtype`.
+> 
+
+**SOL**
+
+```bash
+pip install accelerate==1.1.1
+```
+
+</aside>
+
+---
+
+# Install — **LIBERO**
+
+### Clone and install the LIBERO repo
+
+```bash
+git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
+cd LIBERO
+pip install -e .
+cd ..
+```
+
+### Install other required packages for OpenVLA
+
+```bash
+cd openvla
+pip install -r experiments/robot/libero/libero_requirements.txt
+```
+
+<aside>
+💡
+
+**ERROR #1** - Related to “pip install bitsandbytes”
+
+> A module that was compiled using NumPy 1.x cannot be run in
+NumPy 2.2.6 as it may crash. To support both 1.x and 2.x
+versions of NumPy, modules must be compiled with NumPy 2.0.
+Some module may need to rebuild instead e.g. with 'pybind11>=2.12'.
+> 
+
+**SOL**
+
+```bash
+# pip install again (to downgrade as numpy 1.26.4)
+cd openvla
+pip install -e .
+```
+
+</aside>
+
+# **Launching LIBERO Evaluations (Only Linux)**
+
+### Set-up — 4-bit 양자화 모드
+
+`openvla/experiments/robot/libero` 폴더 > `run_libero_eval.py` 
+
+GenerateConfig 클래스 > `load_in_4bit: bool = False` → `load_in_4bit: bool = True`
+
+```bash
+# Launch LIBERO-Spatial evals
+python experiments/robot/libero/run_libero_eval.py \
+  --model_family openvla \
+  --pretrained_checkpoint openvla/openvla-7b-finetuned-libero-spatial \
+  --task_suite_name libero_spatial \
+  --center_crop True
+  
+python experiments/robot/libero/run_libero_eval.py --model_family openvla --pretrained_checkpoint openvla/openvla-7b-finetuned-libero-spatial --task_suite_name libero_spatial --center_crop True
+
+# Launch LIBERO-Object evals
+python experiments/robot/libero/run_libero_eval.py \
+  --model_family openvla \
+  --pretrained_checkpoint openvla/openvla-7b-finetuned-libero-object \
+  --task_suite_name libero_object \
+  --center_crop True
+
+# Launch LIBERO-Goal evals
+python experiments/robot/libero/run_libero_eval.py \
+  --model_family openvla \
+  --pretrained_checkpoint openvla/openvla-7b-finetuned-libero-goal \
+  --task_suite_name libero_goal \
+  --center_crop True
+
+# Launch LIBERO-10 (LIBERO-Long) evals
+python experiments/robot/libero/run_libero_eval.py \
+  --model_family openvla \
+  --pretrained_checkpoint openvla/openvla-7b-finetuned-libero-10 \
+  --task_suite_name libero_10 \
+  --center_crop True
+```
+
+<aside>
+💡
+
+Custom dataset folder
+
+> Do you want to specify a custom path for the dataset folder? (Y/N): N
+> 
+</aside>
+
+<aside>
+💡
+
+Error #1
+
+```bash
+pip install robosuite==1.4
+```
+
+</aside>
+
+<aside>
+💡
+
+`robosuite` Installation for Windows ([참고](https://robosuite.ai/docs/installation.html#installing-on-windows))
+
+https://robosuite.ai/docs/installation.html#installing-on-windows
+
+</aside>
+
+---
+
+# 참고자료
+
+[GitHub - openvla/openvla: OpenVLA: An open-source vision-language-action model for robotic manipulation.](https://github.com/openvla/openvla?tab=readme-ov-file#getting-started)
+
+[CUDA Installation Guide for Microsoft Windows — Installation Guide Windows 12.9 documentation](https://docs.nvidia.com/cuda/cuda-installation-guide-microsoft-windows/index.html)
+
+
+################################  
+
+# OpenVLA 소개
+
+최초작성 : May 19, 2025 
+
+[OpenVLA: An Open-Source Vision-Language-Action Model](https://openvla.github.io/)
+
+[openvla_teaser_video.mp4](attachment:b5fbb0a8-8ea4-492e-9f2a-f8038a3f5076:openvla_teaser_video.mp4)
+
+![image.png](attachment:e475d3cf-9573-4e59-9853-a85dea39d267:image.png)
+
+![image.png](attachment:3a116deb-5858-4b79-b05d-d4400e95834d:image.png)
+
+## **OpenVLA 소개 및 특징**
+
+- **모델 개요**: 7B 파라미터 오픈소스 비전-언어-액션 모델(VLA)
+- **데이터**: Open X-Embodiment 데이터셋의 970k 로봇 에피소드로 사전 훈련
+- **성능**: 일반 로봇 조작 정책에서 새로운 최고 성능 달성
+- **다기능성**: 여러 로봇 제어 기본 지원
+- **적응성**: 파라미터 효율적 미세 조정으로 새로운 로봇 설정에 빠르게 적응
+- **오픈소스**: OpenVLA 체크포인트 및 PyTorch 훈련 파이프라인 완전 공개
+- **접근성**: HuggingFace에서 모델 다운로드 및 미세 조정 가능
+
+###########################################  
+
+# LIBERO 소개
+
+최초 작성: May 19, 2025 
+
+[LIBERO – LIBERO](https://libero-project.github.io/main.html)
+
+![image.png](attachment:b0635f31-4c2a-4296-8ffa-a0cad642ae29:image.png)
+
+## LIBERO 요약
+
+- **(기본)** 사전 훈련된 후 배치 **(추가)** 인간 사용자와 함께 **평생 학습**하여 개인화된 구현 에이전트 필수
+- **연구 과제**: 의사결정에서의 평생 학습(LLDM, lifelong learning in decision making) 중요
+- **문제점**: LLDM 연구를 위한 적절한 테스트베드 부족
+- **제안**: LIBERO, 평생 로봇 학습에 특화된 벤치마크 제공
+    - **특징**: 지속적으로 확장 가능한 벤치마크
+    - **목표**: 지식 전이를 연구하는 공통 플랫폼 제공
+- **기대 효과**: 기계학습 및 로보틱스 커뮤니티가 새로운 평생 학습 알고리즘 개발 및 평가 가능
+
+## LIBERO이 LLDM에 특화된 점
+
+- **지속적 학습 환경 제공**: LIBERO는 로봇이 **인간과의 상호작용**을 통해 새로운 기술과 지식을 **지속적으로 학습**할 수 있는 **동적 테스트베드**를 제공. LLDM의 핵심인 시간에 걸친 적응과 개선을 지원.
+- **지식 전이 초점**: LIBERO는 로봇이 **기존 지식**을 **새로운 작업**이나 환경에 **전이시키는 능력**을 **평가**하도록 설계됨. LLDM에서 필수적인 요소로, 로봇이 다양한 상황에서 효율적으로 학습할 수 있도록 도움.
+- **확장 가능한 벤치마크**: LIBERO는 새로운 작업, 시나리오, 데이터셋을 추가하며 지속적으로 **확장 가능**함.
+- **현실적 문제 반영**: LIBERO는 로봇이 실제 **인간과의 협업**에서 직면할 수 있는 **복잡한 의사결정 문제**를 포함함. 실세계에서의 평생 학습 요구사항을 충족하도록 설계됨.
+- **커뮤니티 협업 촉진**: 알고리즘 비교·평가를 위한 **표준화된 플랫폼** 제공.
+
+##################################  
+
+FastAPI 구축 실습
+최초 작성: @May 19, 2025​
+업데이트: 1차 @July 30, 2025​
+Serving OpenVLA models over a REST API (FastAPI) 
+Install — FastAPI
+pip install fastapi uvicorn
+​
+Test @ 4-bit 양자화 모드 & FastAPI Server
+Source code: vla-scripts/deploy.py [참고]
+수정: Import 구문
+from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
+​
+수정: class OpenVLAServer::__Init__
+# self.vla = AutoModelForVision2Seq.from_pretrained(
+#     self.openvla_path,
+#     attn_implementation=attn_implementation,
+#     torch_dtype=torch.bfloat16,
+#     low_cpu_mem_usage=True,
+#     trust_remote_code=True,
+# ).to(self.device)
+
+print("[*] Loading in 4-Bit Quantization Mode")
+self.vla = AutoModelForVision2Seq.from_pretrained(
+    self.openvla_path,
+    attn_implementation=attn_implementation,
+    torch_dtype=torch.float16,
+    quantization_config=BitsAndBytesConfig(load_in_4bit=True),
+    low_cpu_mem_usage=True,
+    trust_remote_code=True,
+)
+​
+수정: class OpenVLAServer::predict_action
+# inputs = self.processor(prompt, Image.fromarray(image).convert("RGB")).to(self.device, dtype=torch.bfloat16)
+
+# === 8-BIT/4-BIT QUANTIZATION MODE ===
+inputs = self.processor(prompt, Image.fromarray(image).convert("RGB")).to(self.device, dtype=torch.float16)
+​
+실행
+# at VS Code Terminal
+conda activate openvla
+cd ~/ws_openvla
+
+python openvla/vla-scripts/deploy.py
+​
+Install — gradio
+pip install gradio
+​
+Test @ Gradio 시각화
+Source code: gradio_app.py
+코드 — gradio_app.py
+import gradio as gr
+import requests
+import json_numpy
+import numpy as np
+from PIL import Image
+
+# Gradio 클라이언트와 서버 간 데이터 포맷 처리
+json_numpy.patch()
+
+# REST API 서버 엔드포인트
+API_URL = "http://localhost:8000/act"
+
+def predict_action(image, instruction, unnorm_key=None):
+    # 업로드된 이미지를 numpy 배열로 변환
+    image_array = np.array(image)
+
+    # 요청 데이터(payload) 생성
+    payload = {
+        "image": image_array,
+        "instruction": instruction,
+    }
+
+    if unnorm_key:
+        payload["unnorm_key"] = unnorm_key
+
+    # 서버에 POST 요청
+    response = requests.post(API_URL, json=payload)
+    
+    # 서버 응답 확인
+    if response.status_code == 200:
+        return response.json()
+    else:
+        return f"Error {response.status_code}: {response.text}"
+
+# Gradio 인터페이스 구성
+with gr.Blocks() as gradio_app:
+    gr.Markdown("# OpenVLA Robot Action Prediction")
+    gr.Markdown(
+        "Provide an image of the robot workspace and an instruction to predict the robot's action. "
+        "You can either upload an image or provide a base64-encoded image via API."
+    )
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            instruction_input = gr.Textbox(label="Instruction", placeholder="e.g., Pick up the remote")
+            unnorm_key_input = gr.Textbox(label="Unnorm Key (Optional)", placeholder="e.g., bridge_orig")
+            image_input = gr.Image(type="pil", label="Upload Image")
+            submit_btn = gr.Button("Submit")
+
+        with gr.Column(scale=1):
+            output_action = gr.Textbox(label="Robot Action (X, Y, Z, Roll, Pitch, Yaw, Gripper)", interactive=False, lines=8)
+    
+
+    # 예측 함수 연결
+    submit_btn.click(
+        fn=predict_action,
+        inputs=[image_input, instruction_input, unnorm_key_input],
+        outputs=[output_action]
+    )
+
+    # 예제 제공
+    gr.Examples(
+        examples=[
+            ["Place the red vegetable in the silver pot.", "bridge_orig", "./KIMe_OpenVLA/images/example1.jpeg"],
+            ["Pick up the remote", "bridge_orig", "./OpenVLA_Tutorial/images/example2.jpeg"]
+        ],
+        inputs=[instruction_input, unnorm_key_input, image_input]
+    )
+
+gradio_app.launch()
+​
+실행
+# at VS Code Terminal
+conda activate openvla
+cd ~/ws_openvla
+
+python OpenVLA_Tutorial/gradio_app.py
+​
+Test Images
+
+Place the red vegetable in the silver pot.
+
+Pick up the remote.
+############################  
+
+# LIBERO+OpenVLA Jupyter 실습
+
+# VSCode 설정 (lanuch.json & settings.json)
+
+**lanuch.json**
+
+```json
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "env": {"PYTHONPATH": "${workspaceFolder}${pathSeparator}${workspaceFolder}/openvla${pathSeparator}${env:PYTHONPATH}"}
+        }
+    ]
+}
+```
+
+**settings.json**
+
+```json
+{
+    "python.analysis.extraPaths": [
+        "./openvla"
+    ],
+    "python.autoComplete.extraPaths": [
+        "./openvla"
+    ]
+}
+```
+
+# Jupyter 실습
+
+**OpenVLA_Tutorial 폴더 내**
+
+- 01_LIBERO.ipynb
+- 02_OpenVLA_on_LIBERO.ipynb
+    
+    ```bash
+    # ipywidgets 모듈 오류시
+    conda install -c conda-forge ipywidgets
+    ```
+
+##################################  
+
+# GR00T N1.5 Tutorial
+
+**작성 일자:** 최초 작성 July 30, 2025
+
+---
+
+# **Installation Guide**
+
+1. Git Repo 복사
+
+```bash
+git clone https://github.com/NVIDIA/Isaac-GR00T
+cd Isaac-GR00T
+```
+
+1. Conda 환경 구성 (Python 3.10)
+    
+    > ⚠️CUDA 12.4 버전 필수 (flash-attn 때문에)
+    > 
+
+```bash
+conda create -n gr00t python=3.10
+conda activate gr00t
+pip install --upgrade setuptools
+pip install -e .[base]
+conda install nvidia/label/cuda-12.4.0::cuda-nvcc
+pip install --no-build-isolation flash-attn==2.7.1.post4
+```
+
+# **Getting started with this repo**
+
+- **Jupyter 노트북**과 상세 **문서**는 [`./getting_started`](https://github.com/NVIDIA/Isaac-GR00T/blob/main/getting_started) 폴더에서 확인 가능
+- **유틸리티 스크립트**는 [`./scripts`](https://github.com/NVIDIA/Isaac-GR00T/blob/main/scripts) 폴더 있음.
+- SO-101 로봇에서 모델을 미세 조정하는 방법 ([HuggingFace](https://huggingface.co/blog/nvidia/gr00t-n1-5-so101-tuning) 참고)
+    
+    [Post-Training Isaac GR00T N1.5 for LeRobot SO-101 Arm](https://huggingface.co/blog/nvidia/gr00t-n1-5-so101-tuning)
+    
+
+## **1. Data Format & Loading**
+
+- 데이터를 로드하고 처리하기 위해 [Hugging Face의 LeRobot 데이터](https://github.com/huggingface/lerobot)를 사용하지만, 더 상세한 양식(modality) 및 주석 스키마("LeRobot 호환 데이터 스키마", "LeRobot compatible data schema")를 활용함.
+- LeRobot 데이터셋의 예시는 `./demo_data/robot_sim.PickNPlace`에 저장되어 있음. 추가적인 [`modality.json`](https://www.google.com/search?q=%5Bhttps://github.com/NVIDIA/Isaac-GR00T/blob/main/demo_data/robot_sim.PickNPlace/meta/modality.json%5D(https://github.com/NVIDIA/Isaac-GR00T/blob/main/demo_data/robot_sim.PickNPlace/meta/modality.json)) 파일도 포함됨.
+- 데이터셋 형식에 대한 자세한 설명은 [`getting_started/LeRobot_compatible_data_schema.md`](https://github.com/NVIDIA/Isaac-GR00T/blob/main/getting_started/LeRobot_compatible_data_schema.md) 참고
+- [`EmbodimentTag`](https://github.com/NVIDIA/Isaac-GR00T/blob/main/getting_started/4_deeper_understanding.md#embodiment-action-head-fine-tuning)을 통해 multiple embodiments  지원
+- `LeRobotSingleDataset` 클래스를 사용하여 데이터를 로드 가능
+    
+    ```python
+    from gr00t.data.dataset import LeRobotSingleDataset
+    from gr00t.data.embodiment_tags import EmbodimentTag
+    from gr00t.data.dataset import ModalityConfig
+    from gr00t.experiment.data_config import DATA_CONFIG_MAP
+    
+    # get the data config
+    data_config = DATA_CONFIG_MAP["fourier_gr1_arms_only"]
+    
+    # get the modality configs and transforms
+    modality_config = data_config.modality_config()
+    transforms = data_config.transform()
+    
+    # This is a LeRobotSingleDataset object that loads the data from the given dataset path.
+    dataset = LeRobotSingleDataset(
+        dataset_path="demo_data/robot_sim.PickNPlace",
+        modality_configs=modality_config,
+        transforms=None,  # we can choose to not apply any transforms
+        embodiment_tag=EmbodimentTag.GR1, # the embodiment to use
+    )
+    
+    # This is an example of how to access the data.
+    dataset[5]
+    ```
+    
+- GR00T N1.5 모델과 연동하기 위해 데이터를 로드하고 처리하는 방법 **튜토리얼**
+- [`getting_started/0_load_dataset.ipynb`](https://github.com/NVIDIA/Isaac-GR00T/blob/main/getting_started/0_load_dataset.ipynb)
+- 위와 동일한 내용의 **실행 가능한 스크립트**
+    - [`scripts/load_dataset.py`](https://github.com/NVIDIA/Isaac-GR00T/blob/main/scripts/load_dataset.py)
+- Dataset 로드 실행
+    
+    ```bash
+    python scripts/load_dataset.py --dataset-path ./demo_data/robot_sim.PickNPlace
+    ```
+    
+
+## **2. Inference**
+
+- GR00T N1.5 모델: [Huggingface](https://huggingface.co/nvidia/GR00T-N1.5-3B)
+- 교차 구현(cross embodiment) dataset 예시: [demo_data/robot_sim.PickNPlace](https://github.com/NVIDIA/Isaac-GR00T/blob/main/demo_data/robot_sim.PickNPlace)
+
+### **2.1 Inference with PyTorch**
+
+```python
+from gr00t.model.policy import Gr00tPolicy
+from gr00t.data.embodiment_tags import EmbodimentTag
+
+# 1. Load the modality config and transforms, or use above
+modality_config = ComposedModalityConfig(...)
+transforms = ComposedModalityTransform(...)
+
+# 2. Load the dataset
+dataset = LeRobotSingleDataset(.....<Same as above>....)
+
+# 3. Load pre-trained model
+policy = Gr00tPolicy(
+    model_path="nvidia/GR00T-N1.5-3B",
+    modality_config=modality_config,
+    modality_transform=transforms,
+    embodiment_tag=EmbodimentTag.GR1,
+    device="cuda"
+)
+
+# 4. Run inference
+action_chunk = policy.get_action(dataset[0])
+```
+
+- 추론 파이프라인을 구축 Jupyter 노트북 튜토리얼:
+    - [`getting_started/1_gr00t_inference.ipynb`](https://github.com/NVIDIA/Isaac-GR00T/blob/main/getting_started/1_gr00t_inference.ipynb)
+- **추론 서비스** 실행 가능
+    - **서버 모드**
+        
+        ```
+        python scripts/inference_service.py --model-path nvidia/GR00T-N1.5-3B --server
+        ```
+        
+    - **클라이언트 모드** (to send requests to the server)
+        
+        ```
+        python scripts/inference_service.py  --client
+        ```
+        
+
+### **2.2 Inference with Python TensorRT (Optional)**
+
+- ONNX 및 TensorRT를 사용하여 추론하려면, [`deployment_scripts/README.md`](https://github.com/NVIDIA/Isaac-GR00T/blob/main/deployment_scripts/README.md) 참조
+
+## **3. Fine-Tuning**
+
+- **미세 조정(finetuning) Jupyter 노트북 :** [`getting_started/2_finetuning.ipynb`](https://github.com/NVIDIA/Isaac-GR00T/blob/main/getting_started/2_finetuning.ipynb)
+- 미세 조정(finetuning) 스크립트 실행:
+    
+    ```bash
+    # first run --help to see the available arguments
+    python scripts/gr00t_finetune.py --help
+    
+    # then run the script
+    python scripts/gr00t_finetune.py --dataset-path ./demo_data/robot_sim.PickNPlace --num-gpus 1
+    ```
+    
+    **Note**: **RTX 4090** 그래픽 카드를 사용하여 모델을 미세 조정(finetuning)하는 경우, `gr00t_finetune.py`를 실행할 때 **`--no-tune_diffusion_model`** 플래그를 반드시 추가해야 함. 이 플래그를 사용하지 않으면 **CUDA 메모리 부족(CUDA out of memory)** 오류가 발생할 수 있음.
+    
+- Hugging Face Sim 데이터 릴리즈에서 **샘플 데이터셋**을 [다운로드](https://huggingface.co/datasets/nvidia/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim)
+    
+    ```bash
+    huggingface-cli download  nvidia/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim \
+      --repo-type dataset \
+      --include "gr1_arms_only.CanSort/**" \
+      --local-dir $HOME/gr00t_dataset
+    ```
+    
+
+- 모델 미세 조정 시, **배치 크기를 최대로 늘리고 20k 스텝 동안 학습**을 권장
+- 하드웨어 성능 고려 사항
+    - **미세 조정 성능**: 최적의 미세 조정을 위해 **H100 노드 1개 또는 L40 노드 1개**를 사용함. A6000, RTX 4090과 같은 다른 하드웨어 구성도 작동하지만, 수렴하는 데 더 오래 걸릴 수 있음.
+    - **LoRA 미세 조정**: LoRA 미세 조정을 위해 **A6000 GPU 2개 또는 RTX 4090 GPU 2개**를 사용함.
+    - **추론 성능**: 실시간 추론의 경우, 대부분의 최신 GPU는 단일 샘플 처리시 비슷한 성능을 보임. 벤치마크 결과, L40과 RTX 4090 간의 추론 속도 차이는 미미함.
+- 새로운 형태(new embodiment)의 미세 조정에 대한 내용은 [`getting_started/3_0_new_embodiment_finetuning.md`](https://github.com/NVIDIA/Isaac-GR00T/blob/main/getting_started/3_0_new_embodiment_finetuning.md) 참고
+
+### **Choosing the Right Embodiment Head**
+
+![robots-banner](https://github.com/NVIDIA/Isaac-GR00T/raw/main/media/robots-banner.png)
+
+**GR00T N1.5는 다양한 로봇 구성에 최적화된 세 가지 사전 학습된 embodiment head를 제공함.**
+
+- **`EmbodimentTag.GR1`**: 절대 조인트 공간 제어(absolute joint space control)를 사용하는 **손**을 가진 휴머노이드 로봇
+- **`EmbodimentTag.OXE_DROID`**: EEF(delta end-effector) 제어를 사용하는 단일 암 로봇
+- **`EmbodimentTag.AGIBOT_GENIE1`**: 절대 조인트 공간 제어를 사용하는 **그리퍼**를 가진 휴머노이드 로봇
+- **`EmbodimentTag.NEW_EMBODIMENT`**: (사전 학습되지 않음) 새로운 로봇 embodiment에 대한 미세 조정
+- 관측 및 동작 공간에 대한 자세한 정보는 [`EmbodimentTag`](https://github.com/NVIDIA/Isaac-GR00T/blob/main/getting_started/4_deeper_understanding.md#embodiment-action-head-fine-tuning) 참고
+
+### **Sim Env: [robocasa-gr1-tabletop-tasks](https://github.com/robocasa/robocasa-gr1-tabletop-tasks)**
+
+- Sample dataset for finetuning: [다운로드](https://huggingface.co/datasets/nvidia/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim)
+- For Simulation Evaluation, [robocasa-gr1-tabletop-tasks](https://github.com/robocasa/robocasa-gr1-tabletop-tasks) 참고
+
+## **4. Evaluation**
+
+- 모델의 오프라인 평가를 수행하기 위해, 데이터셋에 대해 모델을 평가하고 그 결과를 시각적으로 보여주는 스크립트
+    
+    ```bash
+    python scripts/eval_policy.py --plot --model_path nvidia/GR00T-N1.5-3B
+    ```
+    
+- 또는, 새로 학습된 모델을 **클라이언트-서버 모드**로 실행 가능
+    
+    **새로 훈련된 모델 실행:**
+    
+    ```
+    python scripts/inference_service.py --server \
+        --model-path <MODEL_PATH> \
+        --embodiment-tag new_embodiment
+        --data-config <DATA_CONFIG>
+    ```
+    
+    **Offline Evaluation 스크립트 실행:**
+    
+    ```
+    python scripts/eval_policy.py --plot \
+        --dataset-path <DATASET_PATH> \
+        --embodiment-tag new_embodiment \
+        --data-config <DATA_CONFIG>
+    ```
+    
+    - Offline Evaluation 스크립트를 실행하면 **실제 값 (Ground Truth)과 예측된 행동 (Predicted actions) 간의 그래프**을 볼 수 있음. **행동의 정규화되지 않은 MSE (평균 제곱 오차)** 값도 제공됨.
+    - 이 결과는 **정책(policy)이 해당 데이터셋에서 얼마나 잘 작동하는지**에 대한 좋은 지표가 됨.
+
+# **Jetson Deployment**
+
+A detailed guide for deploying GR00T N1.5 on Jetson is available in [`deployment_scripts/README.md`](https://github.com/NVIDIA/Isaac-GR00T/blob/main/deployment_scripts/README.md).
+
+Here's comparison of E2E performance between PyTorch and TensorRT on Orin
+
+- Jetson에 GR00T N1.5를 배포하는 자세한 가이드는 [`deployment_scripts/README.md`](https://github.com/NVIDIA/Isaac-GR00T/blob/main/deployment_scripts/README.md) 참고
+- Orin에서 **PyTorch와 TensorRT 간의 E2E(End-to-End) 성능 비교**
+    
+    ![orin-perf](https://github.com/NVIDIA/Isaac-GR00T/raw/main/media/orin-perf.png)
+    
+- 모델 지연 시간은 `trtexec`를 사용하여 배치 크기 1로 측정되었음.
+    
+    
+    | **Model Name** | **Orin benchmark perf (ms)** | **Precision** |
+    | --- | --- | --- |
+    | Action_Head - process_backbone_output | 5.17 | FP16 |
+    | Action_Head - state_encoder | 0.05 | FP16 |
+    | Action_Head - action_encoder | 0.20 | FP16 |
+    | Action_Head - DiT | 7.77 | FP16 |
+    | Action_Head - action_decoder | 0.04 | FP16 |
+    | VLM - ViT | 11.96 | FP16 |
+    | VLM - LLM | 17.25 | FP16 |
+    
+    **참고:** 파이프라인 내 **모듈 지연 시간**(예: DiT 블록)은 위의 벤치마크 표에 있는 **모델 지연 시간보다 약간 더 길음.** 이는 해당 모듈(예: Action_Head - DiT)의 지연 시간이 표의 모델 지연 시간뿐만 아니라 **PyTorch에서 TensorRT로 데이터를 전송하고 다시 TensorRT에서 PyTorch로 결과를 반환하는 오버헤드**까지 포함하기 때문임.
+    
+
+---
+
+# 참고자료
+
+[NVIDIA Isaac GR00T](https://developer.nvidia.com/isaac/gr00t)
+
+https://github.com/NVIDIA/Isaac-GR00T/
+
+https://github.com/NVIDIA/Isaac-GR00T/
+
+[Post-Training Isaac GR00T N1.5 for LeRobot SO-101 Arm](https://huggingface.co/blog/nvidia/gr00t-n1-5-so101-tuning)
+
+  
+
+
