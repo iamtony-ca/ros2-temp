@@ -84,6 +84,12 @@ Host dev-case2
     # PC1_1에서 실행
     sudo git config --system url."https://localhost:8443/".insteadOf "https://github.company.net/"
     ```
+    ```bash
+    # PC1_1에서 실행(unset)
+    # 이전에 추가했던 url.insteadOf 규칙들을 모두 제거합니다.
+    sudo git config --system --unset-all url.https://localhost:8443/.insteadof
+    sudo git config --system --unset-all url.https://localhost:8443/github.com/.insteadof
+    ```    
 
 2.  **SSH 서버 설정 (`AcceptEnv`)**
 
