@@ -261,3 +261,193 @@ my-amr-app:latest
   * **코드 수정**: 호스트 PC의 `ros2_ws` 폴더에서 원하는 에디터로 수정합니다.
   * **컴파일/실행**: 컨테이너 터미널에서 `colcon build`, `ros2 launch` 등을 실행합니다.
   * **추가 접속**: `docker exec -it my_amr_container bash` 명령으로 새 터미널을 열 수 있습니다.
+  
+  
+######################################  
+물론입니다. 기존에 사용하시던 `Dockerfile`은 프록시 설정, 의존성 관리 등 이미 잘 구성되어 있네요. 여기서 저희가 논의했던 **비-루트(non-root) 사용자 설정**과 **`/workspaces` 디렉터리 표준**을 적용하여 훨씬 더 안정적이고 이식성 높은 개발 환경으로 개선해 보겠습니다.
+
+제가 수정한 `Dockerfile`과, 함께 사용하면 좋은 `entrypoint.sh` 스크립트 예시를 함께 생성해 드릴게요.
+
+### 주요 개선 사항:
+
+1.  **비-루트 사용자(`rosdev`) 생성:** `root` 대신 호스트 PC의 사용자 ID와 동일한 ID를 갖는 `rosdev` 사용자를 생성합니다. 이를 통해 파일 권한 문제를 원천적으로 해결합니다.
+2.  **작업 디렉터리 변경:** 모든 경로를 `/root/ros2_ws`에서 `/workspaces/ros2_ws`로 변경하여 VS Code Devcontainer 등 최신 개발 환경 표준을 따릅니다.
+3.  **소유권 설정:** 생성된 `rosdev` 사용자에게 `/workspaces` 디렉터리의 소유권을 부여합니다. `pip` 설정 파일 등도 `rosdev` 사용자의 홈 디렉터리에 생성되도록 수정합니다.
+4.  **개발 vs. 배포 분리:** 개발 환경에서는 소스 코드를 이미지에 빌드하기보다, 호스트에서 마운트하여 사용하는 것이 일반적입니다. 따라서 `colcon build` 부분을 주석 처리하고, 대신 `rosdep install`까지만 수행하여 어떤 프로젝트든 유연하게 개발할 수 있는 "베이스 환경"을 만드는 데 집중했습니다.
+
+아래 파일들을 확인해 보세요\!
+
+```dockerfile
+# ===================================================================
+# Stage 1: 최종 이미지의 기반이 될 개발용 이미지 생성
+# ===================================================================
+# ROS 2 Jazzy Desktop 버전을 기반으로 시작합니다. (Rviz 등 GUI 도구 포함)
+FROM osrf/ros:jazzy-desktop-noble AS development_base
+
+# ===================================================================
+# 빌드 인자(ARG) 정의
+# ===================================================================
+# 프록시 및 사설 인증서 정보를 전달받습니다.
+ARG PROXY_URL=""
+ARG CERT_PATH=""
+# [개선] 호스트의 사용자 정보를 전달받기 위한 인자를 추가합니다.
+ARG USERNAME=rosdev
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+
+# ===================================================================
+# 환경 변수 설정 (ENV)
+# ===================================================================
+# 시스템 관련 설정
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TERM=xterm-256color
+ENV LANG=C.UTF-8
+# ROS 관련 설정
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ENV ROS_DOMAIN_ID=42
+# [개선] 로그 디렉터리 경로를 /workspaces 기준으로 변경합니다.
+ENV ROS_LOG_DIR=/workspaces/ros2_ws/log
+
+# ===================================================================
+# ROOT 권한으로 필요한 작업 수행
+# ===================================================================
+# 프록시 및 사설 인증서 설정
+COPY ${CERT_PATH:-.} /tmp/
+RUN if [ -f /tmp/$(basename ${CERT_PATH:-cert.crt}) ]; then \
+        cp /tmp/$(basename ${CERT_PATH:-cert.crt}) /usr/local/share/ca-certificates/company-cert.crt && \
+        update-ca-certificates; \
+    fi
+
+# 시스템 업데이트 및 핵심 도구 설치
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    sudo \
+    build-essential \
+    git \
+    curl \
+    btop \
+    net-tools \
+    # ROS, Python 및 개발 라이브러리 설치
+    ros-dev-tools \
+    python3-pip \
+    gedit \
+    gimp \
+    libserial-dev \
+    libeigen3-dev \
+    python3-pybind11 \
+    graphviz \
+    graphviz-dev \
+    # 설치 후 apt 캐시를 정리하여 이미지 용량을 줄입니다.
+    && rm -rf /var/lib/apt/lists/*
+
+# --- [핵심 개선 1] 비-루트(non-root) 사용자 생성 ---
+# 호스트와 동일한 GID로 그룹 생성
+RUN if [ "$GROUP_ID" != "0" ]; then groupadd --gid $GROUP_ID $USERNAME; fi
+# 호스트와 동일한 UID/GID로 사용자 생성 및 홈 디렉터리(-m) 설정
+RUN if [ "$USER_ID" != "0" ]; then useradd --uid $USER_ID --gid $GROUP_ID -m -s /bin/bash $USERNAME; fi
+# 생성한 사용자가 비밀번호 없이 sudo를 사용할 수 있도록 권한 부여
+RUN echo "$USERNAME ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+# --- [핵심 개선 2] 작업 디렉터리 생성 및 소유권 부여 ---
+RUN mkdir -p /workspaces/ros2_ws \
+    && chown -R $USERNAME:$USERNAME /workspaces
+
+# ===================================================================
+# 비-루트 사용자(rosdev)로 전환
+# ===================================================================
+USER $USERNAME
+
+# [개선] pip 설정을 root가 아닌 생성된 사용자의 홈 디렉터리에 생성합니다.
+RUN if [ -n "${PROXY_URL}" ]; then \
+        mkdir -p ~/.config/pip && \
+        echo "[global]" > ~/.config/pip/pip.conf && \
+        echo "proxy = ${PROXY_URL}" >> ~/.config/pip/pip.conf && \
+        echo "trusted-host = pypi.python.org pypi.org files.pythonhosted.org" >> ~/.config/pip/pip.conf; \
+    else \
+        mkdir -p ~/.config/pip && \
+        echo "[global]" > ~/.config/pip/pip.conf && \
+        echo "trusted-host = pypi.python.org pypi.org files.pythonhosted.org" >> ~/.config/pip/pip.conf; \
+    fi
+
+# ===================================================================
+# ROS 워크스페이스 의존성 설치
+# ===================================================================
+# 작업 디렉토리를 설정합니다.
+WORKDIR /workspaces/ros2_ws
+
+# Docker 캐시 최적화를 위해 src 폴더를 먼저 복사합니다.
+# [개선] 복사 시 chown 옵션을 주어 rosdev 사용자 소유로 만듭니다.
+COPY --chown=$USERNAME:$USERNAME ./src /workspaces/ros2_ws/src
+
+# ROS 의존성을 설치합니다. (src/package.xml 기반)
+# sudo를 사용하여 root 권한으로 설치를 진행합니다.
+RUN . /opt/ros/jazzy/setup.sh && \
+    sudo apt-get update && \
+    rosdep update && \
+    rosdep install --from-paths src --ignore-src -r -y && \
+    sudo rm -rf /var/lib/apt/lists/*
+
+# ===================================================================
+# [선택] 소스 코드 빌드 (개발용 이미지에서는 주석 처리 권장)
+# ===================================================================
+# 개발 환경에서는 호스트의 소스를 마운트하여 사용하므로,
+# 이미지 빌드 시점에 코드를 빌드하는 것은 선택 사항입니다.
+# COPY --chown=$USERNAME:$USERNAME . /workspaces/ros2_ws/
+# RUN . /opt/ros/jazzy/setup.sh && \
+#     rm -rf build install log && \
+#     export MAKEFLAGS="-j4" && \
+#     colcon build \
+#         --symlink-install \
+#         --parallel-workers 3
+
+# ===================================================================
+# .bashrc에 ROS 환경 자동 소싱 추가
+# ===================================================================
+# [개선] root가 아닌 rosdev 사용자의 .bashrc에 source 구문을 추가합니다.
+RUN echo "source /opt/ros/jazzy/setup.bash" >> ~/.bashrc
+RUN echo "if [ -f /workspaces/ros2_ws/install/setup.bash ]; then source /workspaces/ros2_ws/install/setup.bash; fi" >> ~/.bashrc
+
+# ===================================================================
+# 컨테이너 실행 환경 설정
+# ===================================================================
+# Entrypoint 스크립트를 복사합니다. (root 소유여도 실행에 문제 없습니다)
+COPY ./entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN sudo chmod +x /usr/local/bin/entrypoint.sh
+ENTRYPOINT ["entrypoint.sh"]
+
+# 컨테ainer의 기본 실행 명령을 bash로 설정합니다.
+CMD ["bash"]
+
+```
+
+
+
+### 사용 방법
+
+이제 이 `Dockerfile`과 `entrypoint.sh`를 사용해 이미지를 빌드하고 컨테이너를 실행하면 됩니다.
+
+1.  **`entrypoint.sh` 파일 저장:**
+    위의 `entrypoint.sh` 내용을 `Dockerfile`과 같은 위치에 저장하고 실행 권한을 주세요.
+    ```bash
+    chmod +x entrypoint.sh
+
+    ```
+2.  **이미지 빌드:**
+    `--build-arg`를 사용하여 호스트 PC의 사용자 정보를 컨테이너에 전달합니다.
+    ```bash
+    docker build \
+        --build-arg USER_ID=$(id -u) \
+        --build-arg GROUP_ID=$(id -g) \
+        --build-arg USERNAME=rosdev \
+        -t my-ros-jazzy-dev .
+
+    ```
+3.  **컨테이너 실행:**
+    `-v` 옵션으로 호스트의 소스 코드를 컨테이너의 `/workspaces/ros2_ws/src`에 마운트합니다.
+    ```bash
+    docker run -it --rm \
+        -v ./src:/workspaces/ros2_ws/src \
+        my-ros-jazzy-dev
+
+    ```
+
+이제 컨테이너 내부는 `rosdev` 사용자로 실행되며, 호스트와 파일을 주고받을 때 더 이상 `sudo`를 사용할 필요가 없습니다. 훨씬 깔끔하고 안전한 개발 환경이 준비되었습니다\!
