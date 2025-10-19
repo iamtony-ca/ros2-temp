@@ -340,3 +340,227 @@ docker run --rm -it --net=host --ipc=host \
 ---
 
 필요하면 네가 실제로 쓰는 **토픽 목록(이름/Hz/바이트 크기)** 알려줘. 그에 맞춰 `qos_overrides.yaml`을 더 촘촘히(ESDF slice/PointCloud2/이미지별 최적 depth 값 등) 손봐서 드릴게.
+##########################  
+
+
+좋아—**서버 없이 P2P만**으로도 안정적으로 붙는 **pc1(client) + pc2(client)** 완벽 가이드를 깔끔하게 정리해줄게. (전제: `serialize_message()`는 전부 제거, Fast DDS 사용, Humble↔Jazzy 혼합 가능, 동일한 msg 정의 유지)
+
+---
+
+# 0) 전제/원칙
+
+* **메시지 정의 동일**: 표준 메시지만 쓰거나, 커스텀/Isaac ROS 메시지는 **동일 태그/커밋**을 pc1·pc2 모두 설치/빌드
+
+  ```bash
+  ros2 interface show nvblox_msgs/msg/DistanceMapSlice   # 양쪽 동일 출력
+  ```
+* **도커 권장 옵션**: `--net=host --ipc=host`
+* **MTU=1500** 권장(점보 프레임이면 우선 1500으로 맞춰 안정성부터 확보)
+* **RMW**: 본 가이드는 Fast DDS 기준
+
+  ```bash
+  export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+  export ROS_DOMAIN_ID=42
+  ```
+
+---
+
+# 1) P2P 방식 선택 (둘 중 택1, 상황에 따라 병행 가능)
+
+## 옵션 A) 멀티캐스트 기본(P2P 기본값) — 가장 간단
+
+* 같은 서브넷에서 멀티캐스트가 막혀있지 않다면, **XML 없이도** 바로 통신 가능
+* 실행만으로 확인:
+
+  ```bash
+  # pc1 / pc2 공통
+  export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+  export ROS_DOMAIN_ID=42
+  ros2 node list
+  ```
+* 장점: 설정 최소화
+* 단점: 도커 브리지/방화벽/서브넷 경계에서 **발견 불안정**할 수 있음
+
+## 옵션 B) 초기 피어(InitialPeers) 지정 — 추천(서버 없는 안정 P2P)
+
+* 멀티캐스트 의존을 줄이고, **서로의 IP를 직접 알려줘** 디스커버리 성공률을 끌어올림
+* inter-host에서는 **UDPv4만 사용(SHM off)** 권장
+
+**공용 XML(두 PC에 동일 배포, 단 주소는 “상대 IP”로 기입):**
+`/opt/fastdds_p2p.xml`
+
+```xml
+<?xml version="1.0" encoding="UTF-8" ?>
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <participant profile_name="default_participant" is_default_profile="true">
+    <rtps>
+      <!-- inter-host에서는 SHM 끄고 UDPv4만 -->
+      <useBuiltinTransports>false</useBuiltinTransports>
+      <userTransports>
+        <transport_id>udp_transport</transport_id>
+      </userTransports>
+
+      <builtin>
+        <discovery_config>
+          <discoveryProtocol>SIMPLE</discoveryProtocol> <!-- P2P -->
+        </discovery_config>
+
+        <!-- 서로의 유니캐스트 주소를 '초기 피어'로 등록 -->
+        <initialPeersList>
+          <locator>
+            <udpv4>
+              <address>192.168.10.21</address> <!-- 상대 PC IP를 넣기 -->
+              <port>7400</port>
+            </udpv4>
+          </locator>
+        </initialPeersList>
+      </builtin>
+
+      <!-- 실제 유선 대역만 화이트리스트 -->
+      <interfaceWhiteList>
+        <address>192.168.10.0/24</address>
+      </interfaceWhiteList>
+    </rtps>
+  </participant>
+
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>udp_transport</transport_id>
+      <type>UDPv4</type>
+      <sendBufferSize>4194304</sendBufferSize>
+      <receiveBufferSize>4194304</receiveBufferSize>
+    </transport_descriptor>
+  </transport_descriptors>
+
+  <!-- 퍼블리셔 비동기 + 스루풋 컨트롤(폭주/블로킹 방지) -->
+  <publisher profile_name="default_publisher" is_default_profile="true">
+    <qos>
+      <publishMode><kind>ASYNCHRONOUS_PUBLISH_MODE</kind></publishMode>
+      <throughputController>
+        <bytesPerPeriod>1048576</bytesPerPeriod>
+        <periodMillisec>10</periodMillisec>
+      </throughputController>
+    </qos>
+  </publisher>
+
+  <subscriber profile_name="default_subscriber" is_default_profile="true">
+    <qos>
+      <resourceLimitsQos>
+        <max_samples>512</max_samples>
+        <allocated_samples>32</allocated_samples>
+      </resourceLimitsQos>
+    </qos>
+  </subscriber>
+</profiles>
+```
+
+* **pc1**에서는 `<address>`에 **pc2의 IP**(예: 192.168.10.22)
+* **pc2**에서는 `<address>`에 **pc1의 IP**(예: 192.168.10.21)
+* 환경변수:
+
+  ```bash
+  export FASTDDS_DEFAULT_PROFILES_FILE=/opt/fastdds_p2p.xml
+  export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+  export ROS_DOMAIN_ID=42
+  ```
+* 도커 실행 예:
+
+  ```bash
+  docker run --rm -it --net=host --ipc=host \
+    -e ROS_DOMAIN_ID -e RMW_IMPLEMENTATION \
+    -e FASTDDS_DEFAULT_PROFILES_FILE=/opt/fastdds_p2p.xml \
+    -v /opt/fastdds_p2p.xml:/opt/fastdds_p2p.xml:ro \
+    <your_image>
+  ```
+
+> 팁
+>
+> * 멀티캐스트가 막힌 환경이면 **`<discoveryProtocol>SIMPLE</discoveryProtocol>` + `initialPeersList`** 만으로도 잘 붙음
+> * 초기 피어는 **양방향**(서로가 서로의 IP를) 지정해야 가장 안정
+
+---
+
+# 2) QoS/토픽 튜닝(대용량용 공통 권장)
+
+* **PointCloud2/이미지/Depth/ESDF slice**:
+
+  * `reliability: best_effort`
+  * `history: keep_last`
+  * `depth: 1~5`
+  * (퍼블리셔) 비동기 모드(위 XML로 기본화)
+* **맵/경로/TF 등 중요 저대역폭**: `RELIABLE` 유지
+* 예시(`qos_overrides.yaml`):
+
+  ```yaml
+  /nvblox/distance_slice:
+    reliability: best_effort
+    history: keep_last
+    depth: 3
+  /nvblox/esdf_pointcloud:
+    reliability: best_effort
+    history: keep_last
+    depth: 1
+  /camera/left/image_rect_color:
+    reliability: best_effort
+    history: keep_last
+    depth: 1
+  ```
+
+---
+
+# 3) Isaac ROS / NITROS 경계 (P2P라도 동일)
+
+* inter-host로 나가는 토픽은 **표준 ROS 타입**으로 퍼블리시
+  (예: `NitrosDistanceMapSlice` → `nvblox_msgs/DistanceMapSlice`, `NitrosPointCloud` → `sensor_msgs/PointCloud2`)
+* 토픽 타입 확인:
+
+  ```bash
+  ros2 topic info -t /nvblox/distance_slice
+  # Type: nvblox_msgs/msg/DistanceMapSlice 여야 함
+  ```
+
+---
+
+# 4) 기동 순서(권장)
+
+1. pc1: 소비자(Nav2 등) 스택 실행
+2. pc2: 생산자(ZED + nvblox) 스택 실행
+3. 연결/대역폭 확인
+
+   ```bash
+   ros2 node list
+   ros2 topic list
+   ros2 topic info -t /nvblox/distance_slice
+   ros2 topic hz /nvblox/distance_slice
+   ros2 topic bw /nvblox/esdf_pointcloud
+   ```
+
+---
+
+# 5) 운영/장애 대응 팁
+
+* **pc2 OFF 시**: pc1은 단독으로 문제없이 동작(구독자 없는 토픽만 생김). 반대로도 동일
+* **간헐 끊김/발견 실패**:
+
+  * 옵션 A(멀티캐스트) 사용 중이면 **옵션 B(InitialPeers)**로 전환
+  * `<send/receiveBufferSize>` 상향, MTU=1500, 방화벽/스위치 멀티캐스트 설정 확인
+* **RELIABLE로 막히는 느낌**: 대용량 토픽은 **BEST_EFFORT**로
+* **OOM/스파이크**: Throughput Controller, 다운샘플링(voxel), 불필요 필드 제거
+* **설정 확인**:
+
+  ```bash
+  echo $RMW_IMPLEMENTATION
+  echo $FASTDDS_DEFAULT_PROFILES_FILE
+  ros2 doctor --report
+  ```
+
+---
+
+# 6) 언제라도 서버 방식으로 스위치 가능
+
+* P2P로 충분히 안정하면 그대로 유지
+* **도커 브리지/여러 서브넷/방화벽**으로 P2P가 종종 흔들리면 **Discovery Server 모드**로만 전환하면 됨(나머지 QoS/UDPv4/표준 메시지 원칙은 동일)
+
+---
+
+필요하면 네 IP 대역을 알려줘. **초기 피어 XML을 pc1/pc2 각각에 맞춘 완성본**으로 바로 만들어줄게.
