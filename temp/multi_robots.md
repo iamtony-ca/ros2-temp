@@ -560,3 +560,320 @@ ament_package()
 
 필요하면 이 스펙으로 바로 빌드되는 **샘플 패키지 스켈레톤**(폴더 구조/빈 메시지 파일 포함)과,
 `PathValidator`, `ConflictDecider`, `RobotLayer`에서의 **퍼블/서브 코드 스니펫(C++17, Jazzy)**도 만들어줄게.
+###################################  
+####################################3  
+#######################################  
+좋아—요구사항 반영해서 **“robot → agent”로 전면 교체**하고, `RobotStatus.msg`도 **제공한 STATUS 테이블 기반으로 확장**했어. 패키지명도 `multi_agent_msgs`로 바꿨고, 모든 메시지/필드 참조를 일관되게 수정했다. (ROS 2 Jazzy 기준)
+
+---
+
+# 1) 상태/공유 계층 (Aggregator → Layer/Decider)
+
+### `msg/MultiAgentInfo.msg`
+
+```text
+# frame_id: 보통 "map"
+std_msgs/Header header
+
+# --- 식별자 ---
+uint16 machine_id                   # 에이전트 고유 숫자 ID (ex: 1001)
+string type_id                      # 에이전트/플랫폼 타입 (ex: "MIR250", "CUSTOM_AMR_A")
+
+# --- 현재 상태 ---
+geometry_msgs/PoseStamped current_pose
+geometry_msgs/Twist       current_twist   # 없으면 (0,0,0) 권장
+
+# 발자국(다각형)
+geometry_msgs/PolygonStamped footprint
+
+# 상위 상태(확장 STATUS 테이블 기반)
+multi_agent_msgs/AgentStatus status
+
+# 리루트 전환 구간 플래그
+bool   reroute                    # 기존 goal cancel→새 waypoints 배정~첫 waypoint 도달 전까지 true
+
+# 웨이포인트 인덱스(0~255)
+uint8  current_waypoint
+uint8  next_waypoint
+
+# 0~5 m 전방 경로 프리뷰(시간 정보 없는 포즈 배열)
+geometry_msgs/PoseStamped[] truncated_path   # frame_id: header.frame_id
+
+# --- 상호 관계/교차 인지 ---
+uint16[] cross_agent_ids          # 교차 가능성이 높은 다른 agent들의 machine_id 목록
+
+# --- 운용 컨텍스트 ---
+string mode                       # "auto" | "manual" | 기타 플릿 표준 문자열
+
+# --- 에어리어(협소/교차 섹션 등) ---
+uint16 area_id                    # 해당 없으면 0(NONE)
+bool   occupancy                  # 해당 area 점유 중인지
+
+# --- 작업/리플랜 상태 플래그 ---
+bool   transferring               # 부하 이송/스테이션 상호작용 중
+bool   re_path_search             # 상위/플래너가 경로 재탐색 중
+
+# --- 품질/불확실도 ---
+float32 pose_covariance           # [m] 등가 표준편차(간이). 필요 시 Covariance로 확장
+```
+
+### `msg/MultiAgentInfoArray.msg`
+
+```text
+std_msgs/Header header                 # stamp: 생성 기준 시각, frame_id: map
+multi_agent_msgs/MultiAgentInfo[] agents
+```
+
+### `msg/AgentStatus.msg`  ← (STATUS 테이블 반영, 불리언 제거)
+
+```text
+# 상위 상태 열거형 (값은 요구 테이블과 동일하게 매핑)
+uint8 STATUS_INIT                         = 0
+uint8 STATUS_PATH_SEARCHING               = 1
+uint8 STATUS_WAITING_FOR_OBS              = 2
+uint8 STATUS_MOVING                       = 3
+uint8 STATUS_ARRIVED                      = 4
+uint8 STATUS_MARKING                      = 5
+uint8 STATUS_UNLOADING                    = 6
+uint8 STATUS_UNLOADED                     = 7
+uint8 STATUS_LOADING                      = 8
+uint8 STATUS_LOADED                       = 9
+uint8 STATUS_AUTORECOVERY                 = 10   # 0x0A
+uint8 STATUS_RECOVERING                   = 11
+
+uint8 STATUS_MANUAL_RUNNING               = 12
+uint8 STATUS_MANUAL_COMPLETE              = 13
+
+uint8 STATUS_ERROR                        = 14   # 0x0E
+uint8 STATUS_PAUSE                        = 15
+uint8 STATUS_WAITING_FOR_SAFETY           = 16
+uint8 STATUS_WAITING_FOR_FLOWCONTROL      = 17
+uint8 STATUS_WAITING_FOR_ROS_STATUS       = 18
+
+uint8 STATUS_CHARGING                     = 19
+uint8 STATUS_CHARGE_DONE                  = 20
+uint8 STATUS_UNKNOWN                      = 21
+
+# 현재 상태 값
+uint8 phase
+```
+
+> 요구대로 `is_manual / is_transferring / is_reroute / is_replanning` **모두 제거**했고, 위 불리언들은 `MultiAgentInfo.msg`의 별도 필드로 유지돼 정책/레이어에서 활용하면 된다.
+
+---
+
+# 2) 코스트맵 메타 계층 (AgentLayer → Validator/Decider)
+
+### `msg/AgentLayerCellMeta.msg`
+
+```text
+std_msgs/Header header              # frame_id: map
+
+uint16 machine_id                   # 유래 agent
+uint8  phase                        # AgentStatus.phase 값
+string mode                         # "auto"/"manual"/...
+bool   reroute
+bool   re_path_search
+bool   transferring
+
+uint16 area_id                      # 없으면 0
+
+# 위치: world 또는 grid index (둘 다 있을 경우 world 우선)
+geometry_msgs/Point position        # 셀 센터 world 좌표 [m]
+uint32 mx
+uint32 my
+
+# 시간/불확실도
+float32 t_first_hit                 # [s] 최초 점유/교차 예상 시각(모르면 음수)
+float32 sigma                       # [m] 위치 불확실도 등가 반경
+```
+
+### `msg/AgentLayerMetaArray.msg`
+
+```text
+std_msgs/Header header              # frame_id: map
+multi_agent_msgs/AgentLayerCellMeta[] cells
+```
+
+> AgentLayer는 Costmap2D 내부에 비용을 쓰고, **의미 있는 셀만 희소 메타**로 발행한다. PathValidator는 ±커널 내에 메타가 하나라도 매칭되면 “agent 기인”으로 판정.
+
+---
+
+# 3) 의사결정 이벤트/명령 계층
+
+### `msg/PathAgentConflictEvent.msg`  ← (용어 교체)
+
+```text
+std_msgs/Header header                     # stamp: 판정 시각, frame_id: map
+string path_id                             # 검사한 경로 식별자(해시 등)
+
+# 관련 agent들
+uint16[] machine_ids
+uint8[]  phases                            # AgentStatus.phase 배열 (machine_ids와 길이 동일)
+bool     is_manual_any
+bool     is_reroute_any
+bool     is_re_path_search_any
+bool     transferring_any
+
+# 협소/교차 area
+uint16   shared_area_id                    # 동일 area면 값, 아니면 0
+bool     area_occupancy_any                # 관련 agent 중 area 점유자가 있는가
+
+# 수치 요약
+float32  ttc_first                         # [s], 모르면 음수
+float32  conflict_length_m                 # [m]
+float32  min_distance_m                    # [m]
+float32  confidence                        # 0~1 (메타 최신성/품질 반영)
+
+geometry_msgs/PoseStamped first_conflict_pose
+string   source_layer                      # 예: "global_costmap/agent_layer"
+float32  meta_staleness_ms
+string   note
+```
+
+### `msg/PathAgentConflictState.msg`
+
+```text
+std_msgs/Header header
+bool active
+multi_agent_msgs/PathAgentConflictEvent last_event
+```
+
+### `msg/DecisionCmd.msg`
+
+```text
+uint8 CMD_GO=0
+uint8 CMD_WAIT=1
+uint8 CMD_SLOWDOWN=2
+uint8 CMD_REPLAN_SOFT=3
+uint8 CMD_REPLAN_WITH_KEEP_OUT=4
+
+std_msgs/Header header
+uint8  cmd
+string reason
+```
+
+### `msg/AreaPolygon.msg`
+
+```text
+std_msgs/Header header          # frame_id: map
+uint16 area_id
+geometry_msgs/Polygon polygon
+```
+
+### `msg/KeepoutMask.msg`
+
+```text
+std_msgs/Header header          # frame_id: map
+geometry_msgs/Polygon[] polygons
+float32 dilation_m              # [m]
+float32 ttl_sec                 # [s]
+string  source
+```
+
+### `msg/SpeedLimitMask.msg`
+
+```text
+std_msgs/Header header          # frame_id: map (또는 local)
+geometry_msgs/Polygon[] regions
+float32 v_max                   # [m/s] ROI 내 속도 상한
+float32 ttl_sec                 # [s]
+string  source
+```
+
+### `srv/ApplyKeepoutMask.srv`  (선택)
+
+```text
+multi_agent_msgs/KeepoutMask request
+---
+bool accepted
+string message
+```
+
+---
+
+# 4) 권장 토픽 & QoS
+
+* `multi_agent_infos` (`MultiAgentInfoArray`): **reliable + volatile**, 5–10 Hz
+* `agent_layer_meta` (`AgentLayerMetaArray`): **reliable + transient_local + KeepLast(1)**
+* `path_agent_conflict_event`: **reliable + volatile + KeepLast(10)**
+* `path_agent_conflict_state`: **reliable + transient_local + KeepLast(1)**
+* `decision_cmd`: **reliable + volatile + KeepLast(10)**
+* `planner/keepout_mask`, `controller/speed_limit_mask`: **reliable + transient_local + KeepLast(1)**
+
+---
+
+# 5) 패키지 빌드 스켈레톤
+
+### `package.xml`
+
+```xml
+<?xml version="1.0"?>
+<package format="3">
+  <name>multi_agent_msgs</name>
+  <version>1.0.0</version>
+  <description>Custom messages for multi-agent navigation (Nav2)</description>
+  <maintainer email="you@example.com">You</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>builtin_interfaces</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
+```
+
+### `CMakeLists.txt`
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(multi_agent_msgs)
+
+find_package(ament_cmake REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(builtin_interfaces REQUIRED)
+
+set(MSGS
+  msg/AgentStatus.msg
+  msg/MultiAgentInfo.msg
+  msg/MultiAgentInfoArray.msg
+  msg/AgentLayerCellMeta.msg
+  msg/AgentLayerMetaArray.msg
+  msg/PathAgentConflictEvent.msg
+  msg/PathAgentConflictState.msg
+  msg/DecisionCmd.msg
+  msg/AreaPolygon.msg
+  msg/KeepoutMask.msg
+  msg/SpeedLimitMask.msg
+)
+
+set(SRVS
+  srv/ApplyKeepoutMask.srv
+)
+
+rosidl_generate_interfaces(${PROJECT_NAME}
+  ${MSGS}
+  ${SRVS}
+  DEPENDENCIES std_msgs geometry_msgs builtin_interfaces
+)
+
+ament_package()
+```
+
+---
+
+# 6) 운용 메모
+
+* `AgentStatus.phase`는 **단일 소스 오브 트루스**로 상위 상태를 제공하고,
+  `MultiAgentInfo`의 `mode/reroute/transferring/re_path_search` 등 **운영 플래그**는 별도 정책 입력으로 활용.
+* `area_id==0`을 NONE으로 통일하면 레이어/디사이더 로직 단순화.
+* `cross_agent_ids`는 `machine_id` 네임스페이스와 동일하게 맞출 것.
+* 레이어/밸리데이터/디사이더에서 “robot” 문자열이 남지 않도록 토픽/네임스페이스/로그 메시지도 **agent**로 정리.
+
+원하면, 이 스펙으로 바로 생성 가능한 **빈 .msg/.srv 파일 세트**와 간단 퍼블/서브 **C++ 예제(Modern C++17, Jazzy)**도 만들어줄게.
