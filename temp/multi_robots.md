@@ -614,7 +614,8 @@ bool   transferring               # 부하 이송/스테이션 상호작용 중
 bool   re_path_search             # 상위/플래너가 경로 재탐색 중
 
 # --- 품질/불확실도 ---
-float32 pose_covariance           # [m] 등가 표준편차(간이). 필요 시 Covariance로 확장
+float32 pos_std_m          # XY 위치 표준편차 [m], unknown이면 -1
+float32 yaw_std_rad        # 요 표준편차 [rad], unknown이면 -1
 ```
 
 ### `msg/MultiAgentInfoArray.msg`
