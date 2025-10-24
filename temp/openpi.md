@@ -1236,3 +1236,108 @@ docker compose -f examples/aloha_sim/compose.yml up --build
   * 서버 로그 or PolicyRecorder 기록 확인
 
 이렇게 쓰면 **프롬프트를 서버 한 곳에서 통제**할 수 있고, 필요 시 클라이언트에서 상황별로 덮어쓸 수도 있어요.
+  
+######################  
+#######################  
+좋아—“실제로 어떤 프롬프트가 적용되었는지”를 **서버 쪽**에서 확실히 찍는 2가지 방법을 줄게. (클라이언트에서 찍는 건 이미 해봤으니, 여기선 서버 기준)
+
+---
+
+# 방법 A) `serve_policy.py`에서 정책을 래핑해서 출력 (가장 간단/권장)
+
+`serve_policy.py`에서 `policy = create_policy(args)` 바로 아래에 **디버그 래퍼**를 씌워서, 매 `infer()` 호출 때 **실제로 쓰일 프롬프트**(obs에 있으면 그걸, 없으면 `default_prompt`)를 로깅합니다.
+
+```python
+# serve_policy.py
+
+# ... (imports 그대로)
+
+class DebugPromptPolicy(_policy.Policy):
+    """Prints the effective prompt used for each inference call.
+    Priority: obs['prompt'] > policy.default_prompt."""
+    def __init__(self, base: _policy.Policy, print_every_n: int = 50):
+        self._base = base
+        self._n = max(1, print_every_n)
+        self._i = 0
+
+    @property
+    def metadata(self):
+        return self._base.metadata
+
+    def infer(self, observation: dict) -> dict:
+        self._i += 1
+        if self._i % self._n == 1:
+            # 1) 클라이언트가 보낸 prompt
+            p = observation.get("prompt")
+            # 2) 없으면 서버가 가진 default_prompt 사용
+            if p is None:
+                p = getattr(self._base, "default_prompt", None)
+            # 짧게 출력
+            if isinstance(p, str):
+                short = (p[:200] + "...") if len(p) > 200 else p
+            else:
+                short = p
+            logging.info("[SERVER] effective prompt => %s", short)
+        return self._base.infer(observation)
+
+def main(args: Args) -> None:
+    policy = create_policy(args)
+
+    # ★ 여기서 래핑 (N 스텝마다 1번 출력; 필요시 값 조정)
+    policy = DebugPromptPolicy(policy, print_every_n=50)
+
+    policy_metadata = policy.metadata
+    if args.record:
+        policy = _policy.PolicyRecorder(policy, "policy_records")
+
+    # 이하 동일
+    hostname = socket.gethostname()
+    local_ip = socket.gethostbyname(hostname)
+    logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
+
+    server = websocket_policy_server.WebsocketPolicyServer(
+        policy=policy,
+        host="0.0.0.0",
+        port=args.port,
+        metadata=policy_metadata,
+    )
+    server.serve_forever()
+```
+
+* 이 방식은 **정책이 실제로 사용할 우선순위**(`obs['prompt']` 있으면 그걸, 없으면 `default_prompt`)를 그대로 반영해서 찍어요.
+* 로그가 너무 많으면 `print_every_n`을 100~200으로 키우세요.
+* 클라이언트가 `prompt`를 보낼 때와 안 보낼 때 모두 무엇이 쓰였는지 명확히 확인 가능.
+
+---
+
+# 방법 B) `websocket_policy_server`에서 수신 시점에 찍기 (빠른 확인)
+
+서버가 **받은 메시지**에 `prompt`가 있는지만 빠르게 보고 싶다면, `openpi/serving/websocket_policy_server.py`(또는 동등 파일)의 메시지 핸들러에서 **수신 직후** 찍으면 됩니다. 이건 “기본 프롬프트가 대체되었는지”까지는 알 수 없고, **클라이언트가 뭘 보냈는지**만 즉시 확인하는 용도예요.
+
+```python
+# websocket_policy_server.py (on_message 또는 handle_message 내부 초입)
+import json
+# ...
+def on_message(self, message):
+    try:
+        data = json.loads(message)
+    except Exception:
+        # ...
+        return
+    prompt_in_msg = data.get("prompt", None)
+    logging.info("[SERVER] received obs.prompt = %r", 
+                 (prompt_in_msg[:200] + "...") if isinstance(prompt_in_msg, str) and len(prompt_in_msg) > 200 else prompt_in_msg)
+    # 이후 원래 로직 계속
+```
+
+* 여기선 **obs에 실려온 prompt만** 확인합니다. obs에 없고 서버에 `--default-prompt`가 있는 경우, “최종 적용 프롬프트”는 방법 A처럼 정책 레벨에서 찍는 게 정확합니다.
+
+---
+
+## 어떤 걸 쓰면 좋나?
+
+* **최종 적용된 프롬프트를 보고 싶다** → **방법 A(정책 래퍼)**
+  (우선순위 로직까지 반영해서 진짜 쓰인 값을 찍음)
+* **클라이언트가 뭘 보냈는지만 빠르게 보고 싶다** → 방법 B
+
+둘 다 넣어도 무방합니다. 로그가 많은 환경이면 `print_every_n`(방법 A)와 로거 레벨을 적절히 조절하면 깔끔하게 운영할 수 있어요.
