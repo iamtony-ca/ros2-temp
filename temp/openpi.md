@@ -965,3 +965,180 @@ if __name__ == "__main__":
 * **반응성:** `--action-horizon 2`(기본) → 1로 더 민감, 3으로 약간 더 부드럽게.
 
 필요하면 `compose.yml`에서 CMD를 `python examples/aloha_sim/main.py --total-seconds 90 --live-view True` 처럼 덮어쓰는 예시도 만들어줄게.
+
+  #####################################  
+#####################################  
+#####################################  
+
+좋아! 아래는 **`examples/aloha_sim/env.py` 전체 코드**야.
+네가 올려둔 버전을 기반으로, 다음이 포함돼:
+
+* `max_episode_steps`를 `gymnasium.make(..., max_episode_steps=...)`로 안전하게 오버라이드
+* **에피소드 이어붙이기(concat_episodes)**: 성공/실패로 끝나면 내부에서 곧바로 `reset()` 해서 계속 진행
+* **세션 전체 길이 제한(max_total_steps)**: 원하면 전체 스텝 수 기준으로 종료
+* 디버깅 편의를 위한 **옵션 로그 출력(debug=True)**
+* 관측 변환은 기존과 동일 (`224x224`, `RGB → CHW`)
+
+```python
+# examples/aloha_sim/env.py
+
+import gym_aloha  # noqa: F401  # register tasks
+import gymnasium
+import numpy as np
+from typing import Optional, Dict, Any
+from typing_extensions import override
+
+from openpi_client import image_tools
+from openpi_client.runtime import environment as _environment
+
+
+class AlohaSimEnvironment(_environment.Environment):
+    """
+    A Gymnasium-backed environment wrapper for Aloha simulation tasks.
+
+    Features:
+      - max_episode_steps: per-episode TimeLimit override via gymnasium.make().
+      - concat_episodes: when True, auto-reset on (terminated or truncated) and keep going.
+      - max_total_steps: session-level step budget (None = unlimited).
+      - debug: print helpful info (spec.max_episode_steps, termination reasons).
+    """
+
+    def __init__(
+        self,
+        task: str,
+        obs_type: str = "pixels_agent_pos",
+        seed: int = 0,
+        max_episode_steps: Optional[int] = None,
+        concat_episodes: bool = True,
+        max_total_steps: Optional[int] = None,
+        debug: bool = False,
+    ) -> None:
+        # RNG
+        np.random.seed(seed)
+        self._rng = np.random.default_rng(seed)
+
+        # Options
+        self._concat_episodes = concat_episodes
+        self._max_total_steps = max_total_steps
+        self._debug = debug
+
+        # Build gym env with optional TimeLimit override
+        make_kwargs: Dict[str, Any] = dict(obs_type=obs_type)
+        if max_episode_steps is not None and max_episode_steps > 0:
+            # Gymnasium officially supports overriding EnvSpec via this kwarg.
+            make_kwargs["max_episode_steps"] = max_episode_steps
+
+        self._gym = gymnasium.make(task, **make_kwargs)
+
+        # Internal state
+        self._last_obs: Optional[dict] = None
+        self._done: bool = True
+        self._episode_reward: float = 0.0
+        self._total_steps: int = 0  # session-wide step counter
+        self._ep_steps: int = 0     # per-episode counter (for logging)
+
+        # Helpful debug prints
+        if self._debug:
+            spec_steps = getattr(self._gym.spec, "max_episode_steps", None)
+            print(f">>> gym.spec.max_episode_steps = {spec_steps}")
+            print(
+                f">>> concat_episodes={self._concat_episodes}, "
+                f"max_total_steps={self._max_total_steps}"
+            )
+
+    # --------------------------
+    # Environment API
+    # --------------------------
+
+    @override
+    def reset(self) -> None:
+        gym_obs, _ = self._gym.reset(seed=int(self._rng.integers(2**32 - 1)))
+        self._last_obs = self._convert_observation(gym_obs)  # type: ignore
+        self._done = False
+        self._episode_reward = 0.0
+        self._ep_steps = 0
+        if self._debug:
+            print(">>> episode reset")
+
+    @override
+    def is_episode_complete(self) -> bool:
+        # Session-wide termination condition (macro episode end)
+        if self._max_total_steps is not None and self._total_steps >= self._max_total_steps:
+            return True
+        return self._done
+
+    @override
+    def get_observation(self) -> dict:
+        if self._last_obs is None:
+            raise RuntimeError("Observation is not set. Call reset() first.")
+        return self._last_obs  # type: ignore
+
+    @override
+    def apply_action(self, action: dict) -> None:
+        # Step underlying gym env
+        gym_obs, reward, terminated, truncated, info = self._gym.step(action["actions"])
+
+        # Update counters
+        self._total_steps += 1
+        self._ep_steps += 1
+
+        # Convert & store observation
+        self._last_obs = self._convert_observation(gym_obs)  # type: ignore
+
+        # Handle termination
+        if terminated or truncated:
+            if self._debug:
+                print(
+                    f">>> done at steps={self._ep_steps} "
+                    f"(session={self._total_steps}), "
+                    f"terminated={terminated}, truncated={truncated}"
+                )
+
+            if self._concat_episodes:
+                # Auto-reset to continue the long session (video concatenation)
+                gym_obs, _ = self._gym.reset(seed=int(self._rng.integers(2**32 - 1)))
+                self._last_obs = self._convert_observation(gym_obs)  # type: ignore
+                self._done = False
+                self._episode_reward = 0.0
+                self._ep_steps = 0
+            else:
+                self._done = True
+        else:
+            self._done = False
+
+        # Track best episode reward (optional metric)
+        self._episode_reward = max(self._episode_reward, float(reward))
+
+    # --------------------------
+    # Helpers
+    # --------------------------
+
+    def _convert_observation(self, gym_obs: dict) -> dict:
+        """
+        Map raw gym observation to OpenPI client observation dict.
+
+        Expected gym_obs format (from gym_aloha):
+          - pixels["top"]: HxWxC RGB uint8
+          - agent_pos: low-dim proprio state
+        """
+        img = gym_obs["pixels"]["top"]
+        # Resize + pad to 224x224 and convert to uint8
+        img = image_tools.convert_to_uint8(
+            image_tools.resize_with_pad(img, 224, 224)
+        )
+        # HWC -> CHW
+        img = np.transpose(img, (2, 0, 1))
+
+        return {
+            "state": gym_obs["agent_pos"],
+            "images": {"cam_high": img},
+            # NOTE: prompt는 main.py의 PromptInjectorPolicy에서 주입됨.
+        }
+```
+
+### 사용 팁
+
+* **세션 길이**: `main.py`에서 `total_seconds`를 늘리면 `max_total_steps = max_hz * total_seconds`로 계산되어 자동 종료.
+* **콘캣 ON/OFF**: `concat_episodes=True/False`로 제어. (True면 성공/실패 후 즉시 `reset()`해 이어붙임)
+* **디버깅 로그**: `debug=True`로 켜면 `spec.max_episode_steps`, 종료 사유가 출력됨.
+* **프롬프트 주입**은 `main.py`의 `PromptInjectorPolicy`가 담당(여기선 건드리지 않음).
