@@ -520,3 +520,204 @@ policy = PromptInjectorPolicy(policy, args.prompt)
 
 [1]: https://raw.githubusercontent.com/Physical-Intelligence/openpi/main/docs/remote_inference.md "raw.githubusercontent.com"
 [2]: https://github.com/Physical-Intelligence/openpi "GitHub - Physical-Intelligence/openpi"
+
+############################  
+############################  
+좋아, 두 가지를 바로 해결하자.
+
+---
+
+# 1) prompt가 “정말” 전송되는지 확인하는 가장 쉬운 방법 3가지
+
+## (A) 클라이언트 쪽에서 바로 출력 (권장, 1분 컷)
+
+`PromptInjectorPolicy` 래퍼에 **보내기 직전의 obs["prompt"]** 를 찍자.
+
+```python
+# examples/aloha_sim/main.py
+class PromptInjectorPolicy:
+    def __init__(self, base_policy, prompt: str, echo_every_n: int = 50):
+        self._base = base_policy
+        self._prompt = prompt
+        self._i = 0
+    def infer(self, obs: dict) -> dict:
+        obs = dict(obs)
+        obs["prompt"] = self._prompt
+        self._i += 1
+        if self._i % 50 == 1:  # 너무 시끄럽지 않게 N스텝마다 1번만
+            print("[CLIENT] prompt ->", (obs["prompt"][:120] + "...") if len(obs["prompt"]) > 120 else obs["prompt"])
+        return self._base.infer(obs)
+```
+
+적용:
+
+```python
+policy = _websocket_client_policy.WebsocketClientPolicy(host=args.host, port=args.port)
+policy = PromptInjectorPolicy(policy, args.prompt, echo_every_n=50)
+agent = _policy_agent.PolicyAgent(policy=action_chunk_broker.ActionChunkBroker(policy=policy, action_horizon=args.action_horizon))
+```
+
+→ 이건 “**보내기 직전** 내가 obs에 prompt를 넣었다”는 증명.
+
+## (B) Subscriber로 관측에서 직접 확인
+
+전송 경로 중간에서 **Runtime가 본 observation**을 찍어보는 방법.
+
+```python
+# examples/aloha_sim/prompt_debugger.py
+from openpi_client.runtime import subscriber as _subscriber
+from typing_extensions import override
+class PromptDebugger(_subscriber.Subscriber):
+    def __init__(self, every_n: int = 50): self._n=every_n; self._i=0
+    @override
+    def on_step(self, observation: dict, action: dict) -> None:
+        self._i+=1
+        if self._i % self._n==1 and "prompt" in observation:
+            p = observation["prompt"]
+            print("[RUNTIME] prompt in obs:", (p[:120]+"...") if isinstance(p,str) and len(p)>120 else p)
+```
+
+`main.py`:
+
+```python
+import prompt_debugger as _pdbg
+subscribers = [
+    _saver.VideoSaver(args.out_dir),
+    _pdbg.PromptDebugger(every_n=50),
+]
+```
+
+→ **환경→에이전트로 넘어가는 관측**에 prompt가 실려 있음을 확인.
+
+## (C) 서버(모델)에서 수신 확인 (가능하면)
+
+`openpi_server`의 WebSocket 핸들러(예: `serve_policy.py`의 `on_message`)에서 JSON 디코드 직후:
+
+```python
+print("[SERVER] got prompt:", message.get("prompt", None))
+```
+
+→ **서버가 실제로 받은 prompt**를 확인. (접근 가능할 때만)
+
+> 추가 팁: 프롬프트에 타임스탬프 토큰(예: `PROMPT_ID=169...`)을 넣어두면 클/서 양쪽 로그에서 같은 토큰이 보이는지 매칭이 쉬워요.
+
+---
+
+# 2) action_horizon 낮추니 움직임만 빨라지고, “재시도 때 떨림” 발생 — 안정화 팩
+
+문제 원인: horizon을 1~2로 낮추면 **고주파 제어**가 됩니다. 관측에 민감해져서 좋은 면도 있지만, 잡아야 할 때 미세 오차에 반응해 **액션이 좌우로 오락가락(챠터링)** → “제자리 떨림”.
+해법은 3가지 층위에서 같이 쓰면 효과가 큽니다.
+
+## (1) 저역통과(EMA) + 변화율 제한(rate limit) + 데드밴드
+
+정책 출력을 “부드럽게” 만들고, 너무 작은 변화를 무시.
+
+```python
+import numpy as np
+
+class FilteredPolicy:
+    def __init__(self, base_policy, alpha: float = 0.5,  # EMA 0.0(강한 필터) ~ 1.0(무필터)
+                 max_step_delta: float = 0.05,          # 1스텝 최대 변화량 제한
+                 deadband: float = 1e-3):               # 아주 작은 변화는 0 취급
+        self._base = base_policy
+        self._alpha = alpha
+        self._max_step_delta = max_step_delta
+        self._deadband = deadband
+        self._last = None
+
+    def infer(self, obs: dict) -> dict:
+        act = self._base.infer(obs)
+        a = np.array(act["actions"], dtype=np.float32)
+
+        if self._last is None:
+            self._last = a.copy()
+        # rate limit
+        delta = np.clip(a - self._last, -self._max_step_delta, self._max_step_delta)
+        a_limited = self._last + delta
+        # EMA smoothing
+        a_smooth = self._alpha * a_limited + (1 - self._alpha) * self._last
+        # deadband
+        a_smooth[np.abs(a_smooth - self._last) < self._deadband] = self._last[np.abs(a_smooth - self._last) < self._deadband]
+
+        self._last = a_smooth
+        act["actions"] = a_smooth.tolist()
+        return act
+```
+
+적용 순서(프롬프트→필터→브로커):
+
+```python
+policy = _websocket_client_policy.WebsocketClientPolicy(host=args.host, port=args.port)
+policy = PromptInjectorPolicy(policy, args.prompt, echo_every_n=50)
+policy = FilteredPolicy(policy, alpha=0.6, max_step_delta=0.03, deadband=1e-3)
+agent = _policy_agent.PolicyAgent(policy=action_chunk_broker.ActionChunkBroker(policy=policy, action_horizon=args.action_horizon))
+```
+
+> 파라미터 추천 시작값: `alpha=0.6`, `max_step_delta=0.03` (조인트 스케일에 맞춰 조정).
+
+## (2) “급격한 상태전환 억제” — 최소 유지 스텝(min-hold)로 떨림 차단
+
+특히 그리퍼/핸드오버처럼 **단계가 바뀌는 DOF**는 한 번 바뀌면 **N스텝 유지**:
+
+```python
+class MinHoldPolicy:
+    def __init__(self, base_policy, hold_steps: int = 5, important_idx: list[int] = None):
+        self._base = base_policy
+        self._hold = hold_steps
+        self._idx = important_idx or []  # 그리퍼/특정 축 인덱스
+        self._last = None
+        self._counter = 0
+
+    def infer(self, obs: dict) -> dict:
+        act = self._base.infer(obs)
+        a = np.array(act["actions"], dtype=np.float32)
+        if self._last is None:
+            self._last = a.copy()
+        # 중요한 축이 크게 바뀌면 그 상태를 hold_steps 동안 유지
+        if any(abs(a[i] - self._last[i]) > 0.1 for i in self._idx):
+            self._counter = self._hold
+        if self._counter > 0:
+            a[self._idx] = self._last[self._idx]  # 급격한 토글 억제(혹은 마지막 명령 유지)
+            self._counter -= 1
+        self._last = a
+        act["actions"] = a.tolist()
+        return act
+```
+
+적용 예:
+
+```python
+policy = MinHoldPolicy(policy, hold_steps=5, important_idx=[gripper_index])
+```
+
+> 인덱스는 해당 액션 포맷에 맞게 설정 필요.
+
+## (3) 제어 주기 ↓ (max_hz를 50→30)
+
+고주파 챠터링이 심하면 **샘플링 주기를 낮춰** 물리 안정성↑
+
+```python
+runtime = _runtime.Runtime(..., max_hz=30)  # 30Hz
+```
+
+---
+
+# 3) “첫 실패 후 재시도 때 제대로 못 하고 떨림”을 더 줄이는 추가 팁
+
+* **action_horizon=2~3**: 1은 최단 반응이지만 불안정해지기 쉬워요. 2~3으로 약간만 늘리면 안정-반응 절충 가능.
+* **프롬프트를 더 구체화**:
+  “*If the object is not grasped (gripper width > w_min AND object height < h_min), keep reattempting grasp with small pose adjustments. Do **not** proceed to handover or lifting.*” 처럼 **조건을 수식 수준으로 명확히**.
+* **가드(후처리 제약)**: 관측으로 그립 실패가 확실하면, 핸드오버/리프트 관련 DOF를 0으로 **프로젝션**(강제 억제).
+* **Env 관점**: 관측 잡음이 크면 카메라/픽셀 다운샘플/리사이즈/정규화/패딩 과정에서 미세 플리커가 생길 수 있음. `live_viewer`로 프레임을 눈으로 확인하고, 필요 시 `every_n=2`로 절반만 정책에 주는 것도 한 방법(지연↑ vs 안정성↑ trade-off).
+
+---
+
+## 빠른 체크리스트
+
+1. (A) 또는 (B) 방식으로 **prompt 로그**가 실제로 찍히는지 확인
+2. `action_horizon=2`로 시작
+3. `FilteredPolicy(alpha=0.6, max_step_delta=0.03)` 적용
+4. 필요 시 `MinHoldPolicy(hold_steps=5, important_idx=[gripper_idx])` 추가
+5. 여전히 떨리면 `max_hz=30`로 낮춰 테스트
+
+원하면, 네 액션 벡터 포맷(조인트/EE/그리퍼 인덱스)을 알려줘. 그에 맞춰 **지금 쓸 수 있는 인덱스/권장 파라미터**를 꽂아준 래퍼 코드를 바로 만들어줄게.
