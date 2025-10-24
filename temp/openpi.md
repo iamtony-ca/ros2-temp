@@ -721,3 +721,247 @@ runtime = _runtime.Runtime(..., max_hz=30)  # 30Hz
 5. 여전히 떨리면 `max_hz=30`로 낮춰 테스트
 
 원하면, 네 액션 벡터 포맷(조인트/EE/그리퍼 인덱스)을 알려줘. 그에 맞춰 **지금 쓸 수 있는 인덱스/권장 파라미터**를 꽂아준 래퍼 코드를 바로 만들어줄게.
+  
+########################  
+#############################  
+
+좋아! 아래는 너가 바로 교체해서 쓸 수 있는 **`examples/aloha_sim/main.py` 전체 코드**야.
+프롬프트 주입, 프롬프트 로그 확인, 액션 필터(떨림 억제), 에피소드 이어붙이기(총 길이 제어), 간단 라이브뷰어(선택)를 한 파일에 넣었어. 필요 없는 기능은 CLI 인자로 끄면 돼.
+
+```python
+# examples/aloha_sim/main.py
+
+import dataclasses
+import logging
+import pathlib
+from typing import Optional, List
+
+import env as _env
+import saver as _saver
+
+from openpi_client import action_chunk_broker
+from openpi_client import websocket_client_policy as _websocket_client_policy
+from openpi_client.runtime import runtime as _runtime
+from openpi_client.runtime.agents import policy_agent as _policy_agent
+
+import numpy as np
+import tyro
+
+
+# ----------------------------
+# Policy wrappers (prompt, filters)
+# ----------------------------
+
+class PromptInjectorPolicy:
+    """Wraps a policy and injects a text prompt into the observation.
+    Also logs the prompt every N steps to verify it's actually being sent."""
+    def __init__(self, base_policy, prompt: str, echo_every_n: int = 50):
+        self._base = base_policy
+        self._prompt = prompt
+        self._i = 0
+        self._echo_n = max(1, echo_every_n)
+
+    def infer(self, obs: dict) -> dict:
+        obs = dict(obs)
+        obs["prompt"] = self._prompt
+        self._i += 1
+        if self._i % self._echo_n == 1:
+            short = self._prompt if len(self._prompt) <= 200 else self._prompt[:200] + "..."
+            print(f"[CLIENT] prompt -> {short}")
+        return self._base.infer(obs)
+
+
+class FilteredPolicy:
+    """EMA + rate limit + deadband to reduce oscillations (jitter)."""
+    def __init__(
+        self,
+        base_policy,
+        alpha: float = 0.6,
+        max_step_delta: float = 0.03,
+        deadband: float = 1e-3,
+    ):
+        self._base = base_policy
+        self._alpha = float(alpha)
+        self._max_step_delta = float(max_step_delta)
+        self._deadband = float(deadband)
+        self._last: Optional[np.ndarray] = None
+
+    def infer(self, obs: dict) -> dict:
+        act = self._base.infer(obs)
+        a = np.array(act["actions"], dtype=np.float32)
+
+        if self._last is None:
+            self._last = a.copy()
+
+        # Rate limit
+        delta = np.clip(a - self._last, -self._max_step_delta, self._max_step_delta)
+        a_limited = self._last + delta
+
+        # EMA smoothing
+        a_smooth = self._alpha * a_limited + (1.0 - self._alpha) * self._last
+
+        # Deadband
+        mask = np.abs(a_smooth - self._last) < self._deadband
+        a_smooth[mask] = self._last[mask]
+
+        self._last = a_smooth
+        act["actions"] = a_smooth.tolist()
+        return act
+
+
+# ----------------------------
+# Optional live viewer subscriber (OpenCV)
+# ----------------------------
+
+class _MaybeLiveViewer:
+    """Lightweight live viewer that uses OpenCV windows.
+    Only constructed when args.live_view is True and OpenCV is available."""
+    def __init__(self, window_name: str = "AlohaSim Live", every_n: int = 1):
+        try:
+            import cv2  # lazy import
+        except Exception as e:
+            raise RuntimeError(
+                "OpenCV (cv2) is required for live view. Install opencv-python inside the container."
+            ) from e
+        self._cv2 = cv2
+        self._win = window_name
+        self._n = max(1, every_n)
+        self._i = 0
+        self._cv2.namedWindow(self._win, self._cv2.WINDOW_NORMAL)
+
+    # Subscriber interface
+    def on_episode_start(self) -> None:
+        pass
+
+    def on_step(self, observation: dict, action: dict) -> None:
+        self._i += 1
+        if self._i % self._n:
+            return
+        im = observation["images"]["cam_high"]  # [C,H,W], RGB uint8
+        im = np.transpose(im, (1, 2, 0))        # [H,W,C]
+        im = self._cv2.cvtColor(im, self._cv2.COLOR_RGB2BGR)
+        self._cv2.imshow(self._win, im)
+        self._cv2.waitKey(1)
+
+    def on_episode_end(self) -> None:
+        self._cv2.waitKey(1)
+
+
+# ----------------------------
+# CLI args
+# ----------------------------
+
+@dataclasses.dataclass
+class Args:
+    # Outputs
+    out_dir: pathlib.Path = pathlib.Path("data/aloha_sim/videos")
+
+    # Task / env
+    task: str = "gym_aloha/AlohaInsertion-v0"
+    seed: int = 0
+    max_episode_steps: Optional[int] = 1000        # per-episode cap inside env
+    total_seconds: int = 60                        # concatenated session length (≈ run time)
+    concat_episodes: bool = True                   # auto-reset & keep going after success/fail
+
+    # Policy / server
+    host: str = "0.0.0.0"
+    port: int = 8000
+    action_horizon: int = 2                        # shorter horizon => more reactive
+    prompt: str = (
+        "Insertion task. Ensure a reliable grasp before any handover or lifting. "
+        "If grasp fails, keep reattempting with small pose adjustments; "
+        "do NOT proceed to handover until the object is securely grasped."
+    )
+    echo_prompt_every_n: int = 50                  # print prompt every N steps (sanity check)
+
+    # Filtering to suppress jitter (enable/disable & tune)
+    enable_filtering: bool = True
+    filter_alpha: float = 0.6
+    filter_max_step_delta: float = 0.03
+    filter_deadband: float = 1e-3
+
+    # Live view (OpenCV window). Requires opencv-python in container.
+    live_view: bool = False
+    live_view_every_n: int = 1
+
+    # Runtime
+    max_hz: int = 50
+
+
+def main(args: Args) -> None:
+    # Build environment (supports episode concat via your env.py patch)
+    max_total_steps = args.max_hz * args.total_seconds if args.total_seconds and args.total_seconds > 0 else None
+
+    env = _env.AlohaSimEnvironment(
+        task=args.task,
+        seed=args.seed,
+        max_episode_steps=args.max_episode_steps,
+        concat_episodes=args.concat_episodes,
+        max_total_steps=max_total_steps,
+    )
+
+    # Base websocket policy (remote inference)
+    policy = _websocket_client_policy.WebsocketClientPolicy(
+        host=args.host,
+        port=args.port,
+    )
+
+    # Inject prompt & log it periodically to confirm it's sent
+    policy = PromptInjectorPolicy(
+        policy,
+        prompt=args.prompt,
+        echo_every_n=args.echo_prompt_every_n,
+    )
+
+    # Optional action filtering to reduce oscillations
+    if args.enable_filtering:
+        policy = FilteredPolicy(
+            policy,
+            alpha=args.filter_alpha,
+            max_step_delta=args.filter_max_step_delta,
+            deadband=args.filter_deadband,
+        )
+
+    # Wrap with ActionChunkBroker (controls action horizon)
+    agent = _policy_agent.PolicyAgent(
+        policy=action_chunk_broker.ActionChunkBroker(
+            policy=policy,
+            action_horizon=args.action_horizon,
+        )
+    )
+
+    # Subscribers
+    subscribers: List[object] = [
+        _saver.VideoSaver(args.out_dir),
+    ]
+    if args.live_view:
+        try:
+            subscribers.append(_MaybeLiveViewer(every_n=args.live_view_every_n))
+        except Exception as e:
+            logging.warning(f"Live view disabled: {e}")
+
+    # Runtime
+    runtime = _runtime.Runtime(
+        environment=env,
+        agent=agent,
+        subscribers=subscribers,
+        max_hz=args.max_hz,
+    )
+
+    runtime.run()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, force=True)
+    tyro.cli(main)
+```
+
+### 사용 팁
+
+* **프롬프트 전송 확인:** 실행 로그에 `[CLIENT] prompt -> ...` 가 N스텝마다 찍히면 OK.
+* **길이 조정:** `--total-seconds 120`처럼 늘리면 비디오도 길어져.
+* **떨림 완화:** 기본으로 필터가 켜져 있음. 더 강하게 하고 싶으면 `--filter_alpha 0.5 --filter_max-step-delta 0.02` 등 조절.
+* **라이브 뷰:** 컨테이너에 `opencv-python` 설치 후 `--live-view True` 로 켜기. (X11 설정 필요 시 앞서 안내한 DISPLAY/X11 마운트 참고)
+* **반응성:** `--action-horizon 2`(기본) → 1로 더 민감, 3으로 약간 더 부드럽게.
+
+필요하면 `compose.yml`에서 CMD를 `python examples/aloha_sim/main.py --total-seconds 90 --live-view True` 처럼 덮어쓰는 예시도 만들어줄게.
