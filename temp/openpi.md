@@ -1341,3 +1341,127 @@ def on_message(self, message):
 * **클라이언트가 뭘 보냈는지만 빠르게 보고 싶다** → 방법 B
 
 둘 다 넣어도 무방합니다. 로그가 많은 환경이면 `print_every_n`(방법 A)와 로거 레벨을 적절히 조절하면 깔끔하게 운영할 수 있어요.
+######################  
+#########################  
+효과음 “None”… 원인/해결을 바로 찍어줄게.
+
+## 왜 `effective prompt => None`일까?
+
+서버 래퍼가 본 최종 프롬프트가 `None`이라는 건 두 가지가 **둘 다** 비어 있다는 뜻이야:
+
+1. 클라이언트 obs에 `prompt`가 안 들어옴
+2. 서버가 뜰 때 `--default-prompt`로 기본 지령을 못 받음(또는 정책 객체가 그 값을 노출하지 않음)
+
+아래 순서로 점검하면 바로 잡혀.
+
+---
+
+## 체크리스트 (빠르게 통과하면 바로 적용됨)
+
+### 1) 서버에 기본 프롬프트 주기 (1순위 해결)
+
+`compose` 올리기 전에 **반드시** 이렇게:
+
+```bash
+export SERVER_ARGS='--env ALOHA_SIM --default-prompt "Insertion task. Ensure a reliable grasp before handover. If grasp fails, reattempt grasp; do NOT hand over until secured."'
+docker compose -f examples/aloha_sim/compose.yml up --build
+```
+
+* 다시 띄운 후, 네 `DebugPromptPolicy` 로그가 `effective prompt => Insertion task...`로 바뀌면 OK.
+
+> 참고: 한 줄 인용(quote) 문제로 종종 값이 날아가니, 위처럼 `'... "..." ...'` 형태로 감싸는 걸 강력 권장.
+
+### 2) 클라이언트에서 obs에 prompt 주입 확실히 하기
+
+`PromptInjectorPolicy`가 **ActionChunkBroker 감싸기 전에** 들어가야 해.
+
+```python
+# main.py (요지)
+base = _websocket_client_policy.WebsocketClientPolicy(host=args.host, port=args.port)
+policy = PromptInjectorPolicy(base, args.prompt, echo_every_n=50)  # ★ 주입 + 클라이언트 로그
+agent = _policy_agent.PolicyAgent(
+    policy=action_chunk_broker.ActionChunkBroker(policy=policy, action_horizon=args.action_horizon)
+)
+```
+
+실행 로그에 `[CLIENT] prompt -> ...`가 **주기적으로 찍혀야** 해.
+그런데도 서버에서 `None`이면 3)로.
+
+### 3) 네가 만든 `DebugPromptPolicy`를 살짝 보강
+
+정책 구현에 따라 `default_prompt`가 `policy.default_prompt` 속성이 아닌 **metadata**에 들어있는 경우가 있어. 아래처럼 보강해줘:
+
+```python
+class DebugPromptPolicy(_policy.Policy):
+    def __init__(self, base: _policy.Policy, print_every_n: int = 50):
+        self._base = base; self._n = max(1, print_every_n); self._i = 0
+    @property
+    def metadata(self): return self._base.metadata
+    def _get_default_prompt(self):
+        # 1) 표준 위치
+        p = getattr(self._base, "default_prompt", None)
+        if p is not None: return p
+        # 2) 메타데이터 경유
+        meta = getattr(self._base, "metadata", {}) or {}
+        return meta.get("default_prompt", None)
+    def infer(self, observation: dict) -> dict:
+        self._i += 1
+        if self._i % self._n == 1:
+            p = observation.get("prompt", None)
+            if p is None: p = self._get_default_prompt()
+            short = (p[:200] + "...") if isinstance(p, str) and len(p) > 200 else p
+            logging.info("[SERVER] effective prompt => %s", short)
+        return self._base.infer(observation)
+```
+
+이렇게 하면 **클라이언트 주입 프롬프트**가 있으면 그걸, 없으면 **정책이 품고 있는 기본 프롬프트**(속성 또는 메타데이터)를 찍어.
+
+### 4) (필요 시) 서버에서 **강제 주입**까지 하기
+
+아예 서버에서 `prompt`가 비면 `args.default_prompt`를 **관측에 주입**해버리면 100% 보인다:
+
+```python
+class EnforcingPromptPolicy(_policy.Policy):
+    def __init__(self, base: _policy.Policy, fallback_prompt: str | None):
+        self._base = base; self._fallback = fallback_prompt
+    @property
+    def metadata(self): return self._base.metadata
+    def infer(self, observation: dict) -> dict:
+        if "prompt" not in observation and self._fallback:
+            observation = dict(observation)
+            observation["prompt"] = self._fallback
+        return self._base.infer(observation)
+
+# serve_policy.py main() 안에서:
+policy = create_policy(args)
+policy = EnforcingPromptPolicy(policy, args.default_prompt)   # ★ 서버 강제 주입
+policy = DebugPromptPolicy(policy, print_every_n=50)          # ★ 무엇이 쓰였는지 로깅
+```
+
+이러면 클라이언트가 안 보내도 서버가 반드시 채워 넣고, Debug 로그에도 정확히 찍혀.
+
+---
+
+## 중요: 체크포인트가 “텍스트 조건”을 지원하는지
+
+`DEFAULT_CHECKPOINT`에 `ALOHA_SIM`은 `pi0_aloha_sim`이야. 만약 **pi0 계열이 텍스트 조건(prompt) 미지원**이면, 아무리 넣어도 정책이 안 쓸 수 있어.
+그럴 땐 **pi05 계열(예: LIBERO/ALOHA/DROID)** 체크포인트를 지정해서 띄워봐:
+
+```bash
+export SERVER_ARGS='policy:checkpoint --policy.config pi05_libero --policy.dir /openpi_assets/checkpoints/pi05_libero/<your_run>/20000 --default-prompt "..."'
+docker compose -f examples/aloha_sim/compose.yml up --build
+```
+
+그리고 `effective prompt` 로그가 **문구로 찍히는지** + **동작 변화가 있는지**를 같이 확인.
+
+---
+
+## 최종 정리
+
+* 우선 `SERVER_ARGS`에 `--default-prompt`를 정확히 넣고(1),
+* 클라이언트 주입을 켜거나(2),
+* `DebugPromptPolicy`를 메타까지 보도록 보강(3),
+* 필요하면 서버에서 강제 주입(4).
+* pi0 → pi05 등 **프롬프트 대응 체크포인트**로 바꾸면 효과가 확실.
+
+이대로 하면 `effective prompt => None`는 사라지고, 실제 적용되는 프롬프트가 로그에 또렷하게 찍힐 거야.
