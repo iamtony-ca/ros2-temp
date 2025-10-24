@@ -149,3 +149,274 @@
 
 [1]: https://github.com/huggingface/gym-aloha "GitHub - huggingface/gym-aloha: A gym environment for ALOHA"
 [2]: https://farama.org/Gymnasium-Terminated-Truncated-Step-API?utm_source=chatgpt.com "Deep Dive: Gymnasium Terminated - Truncated Step API"
+
+############################  
+#############################  
+
+좋아, 두 가지를 한 번에 정리해줄게:
+
+1. AlohaInsertion-v0로 바꾸고 에피소드를 더 길게/여러 번 이어서 → 비디오 5초 넘기기
+
+
+2. 실시간으로 화면 보기(라이브 뷰)
+
+
+
+그리고 마지막에 네가 말한 “못 집었는데도 핸드오버(다른 팔에 건네기) 모션으로 넘어가는” 문제를 줄이는 팁도 같이 적었어.
+
+
+---
+
+1) AlohaInsertion-v0 + 더 긴 녹화
+
+지금 올려준 구조라면 다음 두 가지가 핵심이야.
+
+타임리밋이 아니라 조기 종료(terminated=True) 가 계속 뜨므로,
+“여러 에피소드를 자동으로 이어붙이기(concat)” 를 켜서 한 파일로 길게 찍는 게 현실적이야.
+
+이전에 보낸 concat_episodes / max_total_steps 패치를 env.py에 넣으면, 성공/실패로 한 에피소드가 끝나도 즉시 reset → 계속 진행하므로, 비디오 하나가 원하는 길이(예: 60초, 120초…)까지 쭉 이어져.
+
+
+이미 위 패치를 적용했다면 main.py에서 예를 들어 이렇게 실행하면 돼:
+
+# examples/aloha_sim/main.py (핵심 인자만)
+@dataclasses.dataclass
+class Args:
+    task: str = "gym_aloha/AlohaInsertion-v0"
+    max_episode_steps: int | None = 1000   # 개별 episode 한도(성공 전에 타임리밋 걸릴 일은 드묾)
+    total_seconds: int = 60                # 전체 세션 길이(예: 60s)
+    concat_episodes: bool = True           # 에피소드 붙이기
+    action_horizon: int = 2                # ★ 반응성↑ (아래 3) 참조)
+
+def main(args: Args) -> None:
+    max_total_steps = 50 * args.total_seconds  # max_hz=50 기준
+    runtime = _runtime.Runtime(
+        environment=_env.AlohaSimEnvironment(
+            task=args.task,
+            seed=args.seed,
+            max_episode_steps=args.max_episode_steps,
+            concat_episodes=args.concat_episodes,
+            max_total_steps=max_total_steps,
+        ),
+        ...
+        subscribers=[
+            _saver.VideoSaver(args.out_dir),
+            # (2)에서 라이브뷰어도 여기에 추가
+        ],
+        max_hz=50,
+    )
+
+> 이렇게 하면 조기 종료가 떠도 자동 reset이라, mp4 한 개가 60초(혹은 네가 준 길이) 로 나와.
+
+
+
+
+---
+
+2) 실시간 보기(라이브)
+
+옵션을 두 가지로 줄게. A(간단/빠른): OpenCV 윈도우. B(원격/헤드리스): 브라우저로 MJPEG 스트리밍.
+
+A) OpenCV 윈도우로 바로 보기 (로컬 X11/Wayland)
+
+(A-1) live_viewer.py 구독자 추가
+
+examples/aloha_sim/live_viewer.py:
+
+import numpy as np
+import cv2
+from openpi_client.runtime import subscriber as _subscriber
+from typing_extensions import override
+
+class LiveViewer(_subscriber.Subscriber):
+    def __init__(self, window_name: str = "AlohaSim Live", every_n: int = 1):
+        self._win = window_name
+        self._n = max(1, every_n)
+        self._i = 0
+        cv2.namedWindow(self._win, cv2.WINDOW_NORMAL)
+
+    @override
+    def on_episode_start(self) -> None:
+        pass
+
+    @override
+    def on_step(self, observation: dict, action: dict) -> None:
+        self._i += 1
+        if self._i % self._n:
+            return
+        im = observation["images"]["cam_high"]  # [C,H,W]
+        im = np.transpose(im, (1, 2, 0))        # [H,W,C]
+        im = cv2.cvtColor(im, cv2.COLOR_RGB2BGR)
+        cv2.imshow(self._win, im)
+        cv2.waitKey(1)
+
+    @override
+    def on_episode_end(self) -> None:
+        cv2.waitKey(1)
+
+(A-2) main.py에 구독자 추가
+
+import live_viewer as _live
+
+subscribers = [
+    _saver.VideoSaver(args.out_dir),
+    _live.LiveViewer(every_n=1),  # every_n=2로 가볍게도 가능
+]
+
+(A-3) 도커에서 X11 연결 (Linux 호스트)
+
+compose.yml의 runtime 서비스에 다음 추가:
+
+environment:
+  - DISPLAY=${DISPLAY}
+  - QT_X11_NO_MITSHM=1
+  - MUJOCO_GL=glfw        # 창 띄우려면 egl 대신 glfw 권장
+volumes:
+  - /tmp/.X11-unix:/tmp/.X11-unix:rw
+devices:
+  - /dev/dri:/dev/dri
+
+호스트에서:
+
+xhost +local:
+
+그리고 OpenCV GUI용 라이브러리가 필요해. Dockerfile에 다음 패키지 정도 추가 권장:
+
+RUN apt-get update && apt-get install -y \
+    libglib2.0-0 libsm6 libxrender1 libxext6 \
+    libgl1-mesa-glx libglfw3
+# requirements.txt에 opencv-python 추가
+
+> Wayland 환경이면 XWayland가 켜져 있어야 해. 안되면 xhost/DISPLAY 설정을 점검.
+
+
+
+B) 브라우저 스트리밍(MJPEG) – 헤드리스 서버에서도 OK
+
+OpenCV 없이 HTTP로 MJPEG 스트림을 내보내면, 브라우저에서 http://localhost:8090/stream로 볼 수 있어.
+
+examples/aloha_sim/mjpeg_streamer.py:
+
+import io, threading, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing_extensions import override
+import imageio.v3 as iio
+import numpy as np
+from openpi_client.runtime import subscriber as _subscriber
+
+class _FrameStore:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._jpg = None
+    def update(self, rgb):
+        # rgb: [H,W,C] uint8
+        with self._lock:
+            self._jpg = iio.imwrite("<bytes>", rgb, extension=".jpg")
+    def get(self):
+        with self._lock:
+            return self._jpg
+
+class _Handler(BaseHTTPRequestHandler):
+    store: _FrameStore = None  # injected
+    def do_GET(self):
+        if self.path != "/stream":
+            self.send_response(404); self.end_headers(); return
+        self.send_response(200)
+        self.send_header("Age", "0")
+        self.send_header("Cache-Control", "no-cache, private")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.end_headers()
+        try:
+            while True:
+                jpg = self.store.get()
+                if jpg is None:
+                    time.sleep(0.01); continue
+                self.wfile.write(b"--frame\r\n")
+                self.wfile.write(b"Content-Type: image/jpeg\r\n\r\n")
+                self.wfile.write(jpg)
+                self.wfile.write(b"\r\n")
+                time.sleep(1/20)  # ~20 FPS
+        except BrokenPipeError:
+            pass
+
+class MjpegStreamer(_subscriber.Subscriber):
+    def __init__(self, port: int = 8090, every_n: int = 1):
+        self._store = _FrameStore()
+        self._n = max(1, every_n); self._i = 0
+        self._server = HTTPServer(("0.0.0.0", port), _Handler)
+        self._server.RequestHandlerClass.store = self._store
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        print(f"[MJPEG] http://0.0.0.0:{port}/stream")
+
+    @override
+    def on_step(self, observation: dict, action: dict) -> None:
+        self._i += 1
+        if self._i % self._n: return
+        im = observation["images"]["cam_high"]  # [C,H,W]
+        im = np.transpose(im, (1,2,0))         # [H,W,C], RGB
+        self._store.update(im)
+
+main.py에:
+
+import mjpeg_streamer as _mjpeg
+subscribers = [
+    _saver.VideoSaver(args.out_dir),
+    _mjpeg.MjpegStreamer(port=8090, every_n=1),
+]
+
+> 이 방식은 X11 없이도 되고, 브라우저로 바로 시청 가능. (도커 포트는 host 네트워크라 그대로 접근)
+
+
+
+
+---
+
+3) “못 집었는데 핸드오버 모션으로 넘어가는” 문제 줄이기
+
+이건 정책(모델) 쪽의 오픈루프 습관 때문에 생깁니다. 시퀀스 안에 “집기→들기→건네주기”가 들어있어 성공 여부와 무관하게 다음 단계로 넘어가는 경향이 있어요. 클라이언트에서 할 수 있는 현실적인 완화책:
+
+action_horizon 값 낮추기 (권장)
+지금 10이면 50 Hz 기준 0.2초 동안 동일 chunk를 유지합니다.
+action_horizon=1~2 로 줄이면 매 스텝(또는 거의 매 스텝) 재계획해서 관측에 더 민감하게 반응합니다.
+
+여러 에피소드 붙여서 “계속 재시도”
+위의 concat_episodes=True + 큰 total_seconds를 쓰면, 성공/실패로 종료돼도 즉시 reset 되어 재시도가 이어집니다. “한 번 실패하면 바로 핸드오버로 넘어간다”는 느낌이 줄어요.
+
+정책 재프롬프팅(가능한 경우)
+만약 서버 정책이 프롬프트/지령을 받도록 되어 있다면(환경변수 SERVER_ARGS 옵션 제공 시),
+“큐브를 확실히 쥐기 전에는 핸드오버/리프트 단계로 진행하지 말라”, “그립 실패 시 그립 포즈를 재탐색하고 각도/진입을 조정하면서 재시도하라” 같은 문구를 명시하면 반응이 좋아집니다. (서버 옵션 노출이 없다면 생략)
+
+관측 기반 가드(고급)
+관측에서 그립 성공 신호(예: 물체 높이 > 임계값, gripper dist < 임계값) 가 없으면,
+핸드오버에 해당하는 DOF를 억제하는 에이전트 래퍼를 끼울 수 있습니다.
+(예: 기존 _policy_agent.PolicyAgent를 감싸서 decide_action() 결과를 후처리)
+다만 액션 포맷(조인트/EE/그리퍼 index) 을 정확히 알아야 하고, 정책 본래 동작을 바꾸는 거라 실험적인 방법이에요.
+
+
+
+---
+
+추천 세팅 요약
+
+1. task="gym_aloha/AlohaInsertion-v0"
+
+
+2. action_horizon=2 (혹은 1)
+
+
+3. concat_episodes=True, total_seconds=60 (원하는 길이)
+
+
+4. 실시간 보기:
+
+로컬이라면 OpenCV LiveViewer + X11( MUJOCO_GL=glfw )
+
+원격/헤드리스면 MJPEG 스트리머로 브라우저 시청
+
+
+
+
+이 조합이면, 비디오는 5초를 훨씬 넘어서 저장되고, 실시간 화면도 확인할 수 있어.
+그리고 “핸드오버로 성급히 넘어감” 문제도 horizon↓ + concat 재시도로 체감이 훨씬 나아질 거야.
