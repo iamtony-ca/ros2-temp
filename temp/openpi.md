@@ -409,3 +409,114 @@ subscribers = [
 
 이 조합이면, **비디오는 5초를 훨씬 넘어서** 저장되고, **실시간 화면도 확인**할 수 있어.
 그리고 “핸드오버로 성급히 넘어감” 문제도 **horizon↓ + concat 재시도**로 체감이 훨씬 나아질 거야.
+############################  
+############################  
+좋은 포인트야. 결론부터:
+
+* `SERVER_ARGS`는 **서버(모델) 띄울 때의 인자**를 넣는 곳이야. 예: `--env ALOHA_SIM` 또는 `policy:checkpoint --policy.config=... --policy.dir=...` 같은 것. **프롬프트(지령)는 여기가 아니라 “클라이언트가 매 스텝 보낼 observation 안에 넣는 것”**이 맞아. 공식 문서도 Remote Inference에서 서버는 `--env`로 체크포인트만 고르고, 실제 호출은 `{"...observation...", "prompt": task_instruction}` 형태로 보내라고 안내해. ([GitHub][1])
+
+즉, “정책 재프롬프팅”을 하려면 **클라이언트 쪽에서 `prompt` 필드를 매번 같이 보내야** 하고, `SERVER_ARGS`로는 못 해.
+
+---
+
+## 어떻게 넣나? (너의 ALOHA_SIM 예제 기준)
+
+지금 네 관측 딕셔너리는 대략 이렇게 생겼지:
+
+```python
+return {
+    "state": gym_obs["agent_pos"],
+    "images": {"cam_high": img},
+}
+```
+
+여기에 원하는 지령을 **그대로** 추가해:
+
+```python
+return {
+    "state": gym_obs["agent_pos"],
+    "images": {"cam_high": img},
+    "prompt": (
+        "Insertion task. First ensure a reliable grasp before any handover. "
+        "If grasp fails, reattempt grasp with adjusted approach; "
+        "do not proceed to handover until the object is securely grasped."
+    ),
+}
+```
+
+> 서버는 observation 딕셔너리의 `prompt` 키를 해석해 액션을 생성하도록 되어 있어. 문서 예시도 동일하게 `prompt`를 같이 보내라고 하거든. ([GitHub][1])
+
+### 더 깔끔하게(런타임에서 바꾸고 싶다면)
+
+`main.py`에 인자로 받아서 전달하도록:
+
+```python
+@dataclasses.dataclass
+class Args:
+    ...
+    prompt: str = ("Insertion task. Ensure a secure grasp before handover. "
+                   "If grasp fails, retry grasp; do not hand over until secured.")
+
+# PolicyAgent 앞단에서 observation에 prompt를 주입하는 간단 래퍼
+class PromptInjectorPolicy:
+    def __init__(self, base_policy, prompt: str):
+        self._base = base_policy
+        self._prompt = prompt
+    def infer(self, obs: dict) -> dict:
+        obs = dict(obs)
+        obs["prompt"] = self._prompt
+        return self._base.infer(obs)
+
+# 기존 ActionChunkBroker에 래핑
+policy=_websocket_client_policy.WebsocketClientPolicy(host=args.host, port=args.port)
+policy = PromptInjectorPolicy(policy, args.prompt)
+```
+
+(또는 `env._convert_observation()`에 바로 `prompt`를 추가해도 되고, 위처럼 정책 앞단에서 주입해도 돼.)
+
+---
+
+## `SERVER_ARGS`는 어디에 쓰나?
+
+* **프리셋 체크포인트로 서버 띄우기** (간단 모드):
+
+  ```bash
+  export SERVER_ARGS="--env ALOHA_SIM"
+  docker compose -f examples/aloha_sim/compose.yml up --build
+  ```
+
+  → 내부적으로 `scripts/serve_policy.py --env=ALOHA_SIM`를 실행해 ALOHA용 체크포인트를 올려. ([GitHub][1])
+
+* **원하는 체크포인트 지정해서 띄우기** (직접 모드):
+
+  ```bash
+  export SERVER_ARGS="policy:checkpoint --policy.config=pi05_libero --policy.dir=checkpoints/pi05_libero/your_run/20000"
+  docker compose -f examples/aloha_sim/compose.yml up --build
+  ```
+
+  → 문서에 나온 그대로 `serve_policy.py policy:checkpoint ...` 형태. ([GitHub][2])
+
+> 다시 강조하지만, **프롬프트는 여기서 못 바꿔**. 프롬프트는 **클라이언트가 observation에 `prompt`로** 넣어야 함. ([GitHub][1])
+
+---
+
+## “못 집었는데도 핸드오버로 넘어가는” 걸 줄이고 싶다면
+
+1. 위처럼 **명시적 프롬프트**로 “안 잡히면 계속 재시도, 잡히기 전엔 핸드오버 금지”를 지시. (지금 이게 핵심)
+2. `action_horizon`을 **1~2**로 낮춰 반응성을 올려(오픈루프 길이를 줄임).
+3. 필요하면 내가 전에 준 **에피소드 콘캣**으로 실패-리셋-재시도 루프가 자연스럽게 이어지게.
+4. 정말 강하게 제약하고 싶으면, **관측 신호 기반 후처리(가드)** 로 “그립 성공 전에 핸드오버 관련 DOF 억제” 같은 래퍼를 추가.
+
+---
+
+## 체크용 To-do
+
+* 모델 서버 뜨는 로그 OK (`SERVER_ARGS`로 체크포인트 선택) ✔️
+* 클라이언트에서 `prompt`가 실제 전송되는지 프린트로 확인 ✔️
+* `action_horizon` 1~2로 테스트 ✔️
+* 여전히 이상하면, 프롬프트 문구를 더 구체화(예: “**gripper width < X** and **object height > Y**일 때만 handover 단계 진행”)하고, 필요시 MJPEG/GUI 라이브뷰어로 실시간 확인 ✔️
+
+필요하면 네 환경에 맞는 `SERVER_ARGS` 예시(ALOHA_SIM, DROID 등)랑, 프롬프트 문구 템플릿 몇 개 더 만들어줄게!
+
+[1]: https://raw.githubusercontent.com/Physical-Intelligence/openpi/main/docs/remote_inference.md "raw.githubusercontent.com"
+[2]: https://github.com/Physical-Intelligence/openpi "GitHub - Physical-Intelligence/openpi"
