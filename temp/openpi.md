@@ -1142,3 +1142,97 @@ class AlohaSimEnvironment(_environment.Environment):
 * **콘캣 ON/OFF**: `concat_episodes=True/False`로 제어. (True면 성공/실패 후 즉시 `reset()`해 이어붙임)
 * **디버깅 로그**: `debug=True`로 켜면 `spec.max_episode_steps`, 종료 사유가 출력됨.
 * **프롬프트 주입**은 `main.py`의 `PromptInjectorPolicy`가 담당(여기선 건드리지 않음).
+
+#####################  
+######################  
+좋아, `serve_policy.py`를 보면 **서버 쪽에서 `default_prompt`를 줄 수 있게** 되어 있어요. 핵심 정리:
+
+* **우선순위**
+
+  1. 클라이언트 obs에 `prompt`가 있으면 그걸 사용
+  2. 없으면 서버가 띄울 때 준 `--default-prompt` 사용
+  3. 그것도 없으면 체크포인트 내부의 기본 프롬프트(있다면)
+* 그래서 “서버에서 기본 지령을 강제하고 싶다”면 `SERVER_ARGS`에 `--default-prompt "...문구..."`를 넣으면 됩니다.
+
+아래는 바로 복붙해서 쓰는 예시들이에요.
+
+---
+
+# 1) 기본 프롬프트를 서버에서 지정하기
+
+## (A) 기본(디폴트) 정책으로 ALOHA_SIM 띄우면서 default_prompt 지정
+
+```bash
+export SERVER_ARGS='--env ALOHA_SIM --default-prompt "Insertion task. Ensure a reliable grasp before any handover or lifting. If grasp fails, keep reattempting with small pose adjustments; do NOT proceed to handover until the object is securely grasped."'
+docker compose -f examples/aloha_sim/compose.yml up --build
+```
+
+## (B) 특정 체크포인트 직접 지정 + default_prompt 지정
+
+```bash
+export SERVER_ARGS='policy:checkpoint --policy.config pi05_libero --policy.dir /openpi_assets/checkpoints/pi05_libero/your_run/20000 --default-prompt "Your long instruction..."'
+docker compose -f examples/aloha_sim/compose.yml up --build
+```
+
+> 참고: `serve_policy.py`는 Tyro CLI를 쓰므로 공백/따옴표를 **쉘에서 제대로 인용(quote)** 해줘야 합니다. 위처럼 **전체를 작은따옴표('...')** 로 감싸고, 내부는 큰따옴표로 처리하면 안전해요. (Windows PowerShell이라면 `"` 인용 규칙이 다르니 주의)
+
+---
+
+# 2) 서버가 받은 프롬프트 “실제로” 쓰였는지 확인하는 쉬운 방법
+
+## (빠름) 클라이언트에서 obs에 prompt를 보내지 않고 테스트
+
+지금 너는 `PromptInjectorPolicy`로 obs에 `prompt`를 넣고 있어. **그걸 잠깐 끄고(main.py에서 주입 안 함)** 실행하면:
+
+* obs에 `prompt`가 없으므로 → 서버가 `--default-prompt`를 사용
+* 동작 변화가 보이면 서버 default 프롬프트가 적용된 것
+
+## (안전) 서버 로그로 확인 (코드 한 줄)
+
+`scripts/docker/serve_policy.Dockerfile`이 실행하는 엔트리(예: `openpi/serving/websocket_policy_server.py`나 `serve_policy.py`의 핸들러)에서 **수신 메시지 출력**을 잠깐 넣어도 됩니다. 예:
+
+```python
+# WebsocketPolicyServer.on_message(...) 내부 초입에 임시 로그
+data = json.loads(message)
+print("[SERVER] got prompt:", data.get("prompt"))
+```
+
+또는 `serve_policy.py`에서 `Args(record=True)`를 켜면 `PolicyRecorder`가 켜져서 정책 호출 입력/출력을 기록해 디버깅에 도움됩니다:
+
+```bash
+export SERVER_ARGS='--env ALOHA_SIM --default-prompt "..." --record True'
+docker compose -f examples/aloha_sim/compose.yml up --build
+```
+
+## (클라이언트 쪽 이중 체크)
+
+앞서 준 `PromptInjectorPolicy`의 로그를 켠 상태와 끈 상태 둘 다 비교하면,
+
+* 켠 상태: `[CLIENT] prompt -> ...` 출력을 보며 “obs에 prompt가 실렸다” 확인
+* 끈 상태: 서버에 준 `--default-prompt`만 사용
+
+---
+
+# 3) 자주 생기는 함정과 해결
+
+* **따옴표/개행 문제**: 프롬프트가 길면 개행 없이 한 줄로 넣는 게 안전합니다. 꼭 개행을 넣고 싶으면 `\n`로 이스케이프.
+* **쉘별 인용 차이**: bash/zsh는 위 예시처럼 `'... "..." ...'`가 좋고, PowerShell은 ``"...`"..."`` 형태가 필요할 수 있어요.
+* **클라이언트 쪽 prompt가 계속 덮어씀**: obs에 `prompt`가 있으면 그게 1순위이므로, 서버 `--default-prompt` 효과를 보고 싶으면 **클라이언트 주입을 잠시 끄세요.**
+* **정책/체크포인트 교체**: `--env` 대신 `policy:checkpoint --policy.config ... --policy.dir ...`를 쓰면 정확한 모델로 띄울 수 있습니다.
+
+---
+
+# 4) 추천 운영 조합
+
+* **서버**:
+  `SERVER_ARGS='--env ALOHA_SIM --default-prompt "지령문..." --record True'`
+* **클라이언트**:
+
+  * 프롬프트를 서버에서만 관리하고 싶으면 `PromptInjectorPolicy` 끄기
+  * 아니면 둘 다 쓰되, **클라이언트가 obs에 주입한 prompt가 항상 우선**임을 기억
+* **동작 확인**:
+
+  * 클라이언트 프롬프트 ON/OFF 비교
+  * 서버 로그 or PolicyRecorder 기록 확인
+
+이렇게 쓰면 **프롬프트를 서버 한 곳에서 통제**할 수 있고, 필요 시 클라이언트에서 상황별로 덮어쓸 수도 있어요.
