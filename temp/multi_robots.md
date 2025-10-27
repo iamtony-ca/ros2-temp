@@ -1060,3 +1060,104 @@ python3 multi_agent_mock_pub.py
 > 프레임은 `map` 으로 맞췄고, 레이어 파라미터 `use_path_header_frame:=true` 인 경우에도 통과합니다.
 
 필요하면 ID나 경로 모양, 주행 각속도/반경만 바꿔서 다양한 테스트 케이스를 바로 만들 수 있어요.
+  
+##########################################  
+##########################################  
+##########################################  
+맞아요. **agent_layer만으로도** 로봇의 footprint(다각형)와 truncated_path(포즈들)를 따라 **직접 코스트를 칠해서** “충돌금지 영역”을 만들 수 있어요. 그래서 *반드시* `inflation_layer`가 있어야 하는 건 아니에요. 다만 `inflation_layer`를 뒤에 두면, 우리가 칠한 lethal(254) 주변으로 **그라데이션 완충대**가 생겨 경로계획이 더 부드러워집니다.
+
+---
+
+# 병합 방식(Max-merge) 상세
+
+현재 코드는 `fillFootprintAt()`에서 **master 그리드에 바로 set**하고 있어요:
+
+```cpp
+grid->setCost(static_cast<unsigned int>(i),
+              static_cast<unsigned int>(j), cost);
+```
+
+이렇게 “그냥 덮어쓰기” 하면, **뒤에서 동작하는 다른 레이어가 값을 낮추거나(또는 덮어) 버릴 가능성**이 있어요.
+이를 막는 가장 단순하고 효과적인 방법이 바로 **Max 병합**이에요:
+
+> “쓸 때, **기존 값보다 클 때만** 올린다”
+
+즉,
+
+```cpp
+const unsigned char old = grid->getCost(i, j);
+if (cost > old) {
+  grid->setCost(i, j, cost);
+}
+```
+
+이렇게 하면 **다른 레이어가 얼마를 쓰든**, 최종 master에선 **가장 높은 비용(=가장 보수적인 장애물 해석)** 이 남습니다. 그래서 플래너가 그 셀을 **반드시 회피**하게 만들 수 있어요.
+
+---
+
+# 어디에 넣어야 하나? (구체 위치)
+
+당신 코드 기준으로, **이 두 군데 중 한 곳**에 넣으면 됩니다. (1번이 가장 직관적)
+
+## 1) `fillFootprintAt()` 안에서 “셀 찍는” 바로 그 자리
+
+```cpp
+// (중략) for (int j = min_j; j <= max_j; ++j) {
+  for (int i = min_i; i <= max_i; ++i) {
+    double wx, wy; grid->mapToWorld(i, j, wx, wy);
+    // inside 계산 (생략)
+
+    if (inside) {
+      // ★ 바꾸는 부분 (Max-merge)
+      const unsigned char old = grid->getCost(i, j);
+      if (cost > old) {
+        grid->setCost(static_cast<unsigned int>(i),
+                      static_cast<unsigned int>(j), cost);
+      }
+
+      if (meta_hits) meta_hits->emplace_back(
+          static_cast<unsigned int>(i), static_cast<unsigned int>(j));
+    }
+  }
+// }
+```
+
+* 장점: 지금 구조 그대로, **가장 작은 수정**으로 “항상 최댓값 유지”를 강제합니다.
+* 효과: 다른 레이어가 이후에 값을 덮어도 **우리를 낮출 수 없음**.
+
+## 2) `updateCosts()`로 옮겨서 한 번 더 안전망
+
+혹시 추후에 `fillFootprintAt()` 내부 구현을 바꿔도 안전하도록, `updateCosts()` 말미에 “우리가 찍은 좌표들”(`meta_hits`)을 **최댓값으로 보정**하는 것도 선택지입니다:
+
+```cpp
+for (auto & cell : meta_hits) {
+  auto [mx, my] = cell;
+  const unsigned char old = master_grid.getCost(mx, my);
+  if (my_value > old) { // my_value = 이번 사이클 우리가 의도한 코스트(예: waiting_cost_ 또는 moving_cost_)
+    master_grid.setCost(mx, my, my_value);
+  }
+}
+```
+
+* 단, 이 경우 `my_value`(우리가 의도한 cost)를 함께 보관해야 해서 1)보다 코드가 조금 더 커집니다.
+
+---
+
+# 한 단계 더: 내부 costmap을 쓰는 방법(선택)
+
+* Nav2의 많은 플러그인은 `nav2_costmap_2d::CostmapLayer`를 상속해 **자기 레이어 내부 costmap**에 먼저 그린 뒤,
+* 마지막에 `updateWithMax()` 같은 **헬퍼 병합**으로 master에 반영합니다.
+
+지금은 `nav2_costmap_2d::Layer`를 상속 중이라 내부 costmap과 헬퍼가 없어요.
+**상속을 `CostmapLayer`로 바꾸고** 그 흐름을 쓰면 구조가 더 견고해지지만, 구현량이 늘기 때문에 **현재 목적(확실히 막기)** 으론 위의 “Max-merge 한 줄”이 제일 간단하고 충분합니다.
+
+---
+
+# 요약 실전 팁
+
+1. **agent_layer만으로도** footprint+path를 칠해 “장애영역” 만들 수 있음(=inflation 없이도 됨).
+2. 경로가 관통하지 않게 하려면, **반드시 Max-merge** 하세요.
+
+   * 바꾸는 곳: `fillFootprintAt()` 내부의 `setCost()` 직전에
+   * 코드: `if (cost > grid->getCost(i, j)) setCost(i, j, cost);`
+3. 인플레이션을 쓰면(**agent_layer → inflation_layer** 순서), agent 영역 주변에 **그라데이션 완충대**가 생겨 더 자연스러운 회피가 됩니다.
