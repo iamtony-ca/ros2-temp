@@ -1161,3 +1161,65 @@ for (auto & cell : meta_hits) {
    * 바꾸는 곳: `fillFootprintAt()` 내부의 `setCost()` 직전에
    * 코드: `if (cost > grid->getCost(i, j)) setCost(i, j, cost);`
 3. 인플레이션을 쓰면(**agent_layer → inflation_layer** 순서), agent 영역 주변에 **그라데이션 완충대**가 생겨 더 자연스러운 회피가 됩니다.
+##################
+######################
+######################
+좋은 포인트 잡았어요—지금 “아무 것도 안 보이는” 건 **Max-merge 비교식** 때문입니다.
+
+## 왜 안 보였나?
+
+`master_grid.getCost(i,j)`가 **NO_INFORMATION(=255)** 인 셀에서,
+
+```cpp
+if (cost > old)  // old == 255
+```
+
+는 항상 거짓이 됩니다(당신이 쓰는 cost는 0~254 범위). 그래서 **전혀 쓰이지 않아요**.
+Global costmap은 초기값이 NO_INFORMATION(255)이고, static_layer가 아직 그 셀을 채우지 않았거나 창 범위 바깥이면 255가 남아있을 수 있어요.
+
+## 바로 고치는 한 줄
+
+NO_INFORMATION은 “0으로 간주”해서 비교해야 합니다. 아래처럼 바꿔주세요.
+
+```cpp
+const unsigned char old_raw = grid->getCost(i, j);
+const unsigned char old = (old_raw == nav2_costmap_2d::NO_INFORMATION) ? 0 : old_raw;
+
+if (cost > old) {
+  grid->setCost(static_cast<unsigned int>(i),
+                static_cast<unsigned int>(j), cost);
+}
+```
+
+> 이 변경만으로 다시 RViz에 agent_layer가 정상적으로 칠해질 겁니다.
+
+---
+
+## “inflation을 넣어도 똑같이 보이는” 이유 & 제대로 쓰는 법
+
+* 지금 agent_layer는 **단일 상수 코스트**(예: 200 또는 254)를 직접 칠합니다. 그러니 **단색**으로 보이는 게 정상이에요.
+* **그라데이션(색 번짐)** 을 원하면 `inflation_layer`가 **agent_layer 이후**에 와야 해요.
+
+  * 올바른 순서 예:
+
+    ```yaml
+    plugins: ["static_layer", "obstacle_layer", "voxel_layer", "agent_layer", "inflation_layer"]
+    ```
+  * 만약 `inflation_layer`가 agent_layer **앞**에 있으면, agent_layer가 나중에 덮어써 버려서 **inflation 효과가 안 보입니다.**
+* 또 하나, 당신 코드가 **상수 코스트**만 찍기 때문에 인플레이션 없이는 당연히 단색입니다. “인플레이션 없이도 완충대”를 원하면, `fillFootprintAt()`에서 가장자리에서 멀어질수록 코스트를 줄이는 **거리기반 falloff**(예: `LETHAL - k*distance`)로 직접 칠하면 됩니다.
+
+---
+
+## 체크리스트 (한 번에 정리)
+
+1. **NO_INFO 처리 추가**: 위 “한 줄 수정” 적용.
+2. **플러그인 순서**: `agent_layer` → `inflation_layer` 순으로 배치.
+3. **경로가 관통하는 문제**:
+
+   * 지금처럼 254(LETHAL에 근접)로 칠하고 Max-merge를 쓰면 **관통하지 않습니다**.
+   * 여전히 관통하면, 순서를 다시 확인하거나, planner가 쓰는 costmap이 global인지(local 아님)를 재확인하세요.
+4. **색이 단색인 이유**: agent_layer가 상수 코스트만 칠하기 때문.
+
+   * 그라데이션을 원하면 위 순서를 지키거나, agent_layer 내부에서 거리기반 코스트로 변경.
+
+원하시면, `fillFootprintAt()` 내부에 **거리기반 코스트 예시**(에지에서 중심으로 갈수록 낮아지는/높아지는 방식) 코드도 바로 넣어드릴게요.
