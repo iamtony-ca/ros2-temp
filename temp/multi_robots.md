@@ -1317,3 +1317,722 @@ YAML이 네임스페이스 불일치로 무시되니, 결국 코드 기본값(�
 ---
 
 필요하시면, 제가 **전체 파라미터 선언/조회 블록**을 `declareParameter`/`name_` 방식으로 전부 바꾼 패치를 한 번에 정리해 드릴게요.
+
+  #####################  
+######################  
+좋아요. 아래는 **상태별 정책(현재 footprint=치사, 경로=감쇠 소프트 필드)**를 반영한 **완전한 hpp/cpp**입니다.
+기존 구조와 최대한 호환되도록 했고, 다음이 핵심입니다.
+
+* 현재(각 에이전트의 **current_pose**)는 **footprint + 상태별 dilation**으로 **치사(대개 254)** 채움.
+* 미래(**truncated_path**)는 각 포즈의 **누적 길이 s**와 셀의 **횡거리 d**로 계산한
+  ( c = \min\big(c_\text{base} + C_\text{max} e^{-s/\lambda} e^{-d^2/(2\sigma^2)},, c_\text{cap}\big) )
+  를 **Max-merge**로 반영.
+* 진행방향 콘(옵션): 앞쪽 콘에 추가 버프(`cone_boost_`)를 가산.
+* 파라미터 전부 declare/get, YAML로 튜닝 가능.
+* 기존 `fillFootprintAt()`·`rasterizeAgentPath()`를 유지하면서, **경로 소프트 필드용 새 루틴**(원형 가우시안 주변만 스캔) 추가.
+
+---
+
+# `include/multi_agent_nav2/agent_layer.hpp`
+
+```cpp
+#pragma once
+
+#include <mutex>
+#include <vector>
+#include <string>
+#include <utility>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+
+#include <rclcpp/rclcpp.hpp>
+#include <rclcpp_lifecycle/lifecycle_node.hpp>
+
+#include <nav2_costmap_2d/layer.hpp>
+#include <nav2_costmap_2d/costmap_2d.hpp>
+
+#include <geometry_msgs/msg/point.hpp>
+#include <geometry_msgs/msg/polygon_stamped.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+
+#include <multi_agent_msgs/msg/multi_agent_info_array.hpp>
+#include <multi_agent_msgs/msg/agent_layer_meta_array.hpp>
+
+namespace multi_agent_nav2
+{
+
+class AgentLayer : public nav2_costmap_2d::Layer
+{
+public:
+  AgentLayer();
+
+  // lifecycle
+  void onInitialize() override;
+  void activate() override;
+  void deactivate() override;
+  void reset() override { current_ = true; }
+
+  // costmap callbacks
+  void updateBounds(double robot_x, double robot_y, double robot_yaw,
+                    double* min_x, double* min_y, double* max_x, double* max_y) override;
+
+  void updateCosts(nav2_costmap_2d::Costmap2D & master_grid,
+                   int min_i, int min_j, int max_i, int max_j) override;
+
+  bool isClearable() override { return true; }
+
+private:
+  // node
+  rclcpp_lifecycle::LifecycleNode::SharedPtr node_shared_;
+
+  // I/O
+  rclcpp::Subscription<multi_agent_msgs::msg::MultiAgentInfoArray>::SharedPtr sub_;
+  rclcpp::Publisher<multi_agent_msgs::msg::AgentLayerMetaArray>::SharedPtr meta_pub_;
+
+  // last data
+  std::mutex data_mtx_;
+  multi_agent_msgs::msg::MultiAgentInfoArray::SharedPtr last_infos_;
+  rclcpp::Time last_stamp_;
+
+  // basic parameters
+  bool        enabled_{true};
+  std::string topic_{"/multi_agent_infos"};
+  uint16_t    self_machine_id_{0};
+  std::string self_type_id_{};
+  bool        use_path_header_frame_{true};
+  double      roi_range_m_{12.0};
+  int         freshness_timeout_ms_{800};
+  int         max_poses_{40};
+  bool        qos_reliable_{true};
+  bool        publish_meta_{false};
+  int         meta_stride_{3};
+
+  // status → cost policy parameters
+  // footprint(현재 위치) 강도
+  unsigned char fp_cost_wait_like_{254};
+  unsigned char fp_cost_arrived_like_{254};
+  unsigned char fp_cost_error_like_{254};
+  unsigned char fp_cost_moving_like_{254};
+  unsigned char fp_cost_default_{240};
+
+  // 경로 소프트 필드 기본/캡/최대가산
+  unsigned char path_cost_base_{170};
+  unsigned char path_cost_cap_{253};
+  int           path_soft_cmax_{100};      // C_max
+  double        lambda_m_{2.0};            // 종방향 감쇠 길이
+  double        sigma_lat_m_{0.45};        // 횡방향 가우시안 폭
+
+  // 상태별 dilation (footprint 추가 여유)
+  double        dilate_wait_m_{0.2};
+  double        dilate_arrived_m_{0.35};
+  double        dilate_error_m_{0.5};
+  double        dilate_moving_curr_m_{0.1};
+  double        pos_sigma_k_{2.0};         // 위치 표준편차 가산 계수(불확실도)
+
+  // 진행방향 콘 옵션
+  double        heading_cone_deg_{40.0};
+  int           cone_boost_{40};
+
+  // bounds cache
+  double touch_min_x_{0.0}, touch_min_y_{0.0}, touch_max_x_{0.0}, touch_max_y_{0.0};
+  bool   touched_{false};
+
+  // helpers
+  void infosCallback(const multi_agent_msgs::msg::MultiAgentInfoArray::SharedPtr msg);
+  bool isSelf(const multi_agent_msgs::msg::MultiAgentInfo & a) const;
+  bool stale(const rclcpp::Time & stamp) const;
+
+  // 상태 프로파일
+  struct CostProfile
+  {
+    unsigned char fp_cost;  // 현재 footprint용 (대부분 254)
+    unsigned char base;     // 경로 소프트 필드의 c_base
+    double        dilate;   // footprint dilation
+  };
+  CostProfile profileFor(uint8_t phase) const;
+
+  // rasterizers
+  void rasterizeAgent(const multi_agent_msgs::msg::MultiAgentInfo & a,
+                      nav2_costmap_2d::Costmap2D * grid,
+                      std::vector<std::pair<unsigned int,unsigned int>> & meta_hits);
+
+  void fillFootprintAt(const geometry_msgs::msg::PolygonStamped & fp,
+                       const geometry_msgs::msg::Pose & pose,
+                       double extra_dilation_m,
+                       nav2_costmap_2d::Costmap2D * grid,
+                       unsigned char cost,
+                       std::vector<std::pair<unsigned int,unsigned int>> * meta_hits = nullptr);
+
+  // 경로 소프트 필드(라디얼 가우시안, 원형 이웃만 스캔)
+  void softenAlongPath(const std::vector<geometry_msgs::msg::PoseStamped> & path,
+                       nav2_costmap_2d::Costmap2D * grid,
+                       unsigned char c_base,
+                       std::vector<double> * prefix_s,   // 누적길이(미리계산)
+                       std::vector<std::pair<unsigned int,unsigned int>> * meta_hits);
+
+  // 유틸
+  static inline double yawOf(const geometry_msgs::msg::Quaternion & q);
+  static inline double hypot2(double dx, double dy) { return std::sqrt(dx*dx + dy*dy); }
+};
+
+} // namespace multi_agent_nav2
+```
+
+---
+
+# `src/agent_layer.cpp`
+
+```cpp
+#include "multi_agent_nav2/agent_layer.hpp"
+
+#include <pluginlib/class_list_macros.hpp>
+#include <tf2/utils.h>
+
+namespace multi_agent_nav2
+{
+
+AgentLayer::AgentLayer() {}
+
+void AgentLayer::onInitialize()
+{
+  node_shared_ = node_.lock();
+  if (!node_shared_) {
+    throw std::runtime_error("AgentLayer: failed to lock lifecycle node");
+  }
+
+  // === Declare parameters ===
+  node_shared_->declare_parameter("enabled", rclcpp::ParameterValue(true));
+  node_shared_->declare_parameter("topic", rclcpp::ParameterValue(std::string("/multi_agent_infos")));
+  node_shared_->declare_parameter("self_machine_id", rclcpp::ParameterValue(0));
+  node_shared_->declare_parameter("self_type_id", rclcpp::ParameterValue(std::string("")));
+  node_shared_->declare_parameter("use_path_header_frame", rclcpp::ParameterValue(true));
+  node_shared_->declare_parameter("roi_range_m", rclcpp::ParameterValue(12.0));
+  node_shared_->declare_parameter("freshness_timeout_ms", rclcpp::ParameterValue(800));
+  node_shared_->declare_parameter("max_poses", rclcpp::ParameterValue(40));
+  node_shared_->declare_parameter("qos_reliable", rclcpp::ParameterValue(true));
+  node_shared_->declare_parameter("publish_meta", rclcpp::ParameterValue(false));
+  node_shared_->declare_parameter("meta_stride", rclcpp::ParameterValue(3));
+
+  // footprint costs
+  node_shared_->declare_parameter("fp_cost_wait_like", rclcpp::ParameterValue(254));
+  node_shared_->declare_parameter("fp_cost_arrived_like", rclcpp::ParameterValue(254));
+  node_shared_->declare_parameter("fp_cost_error_like", rclcpp::ParameterValue(254));
+  node_shared_->declare_parameter("fp_cost_moving_like", rclcpp::ParameterValue(254));
+  node_shared_->declare_parameter("fp_cost_default", rclcpp::ParameterValue(240));
+
+  // path soft field
+  node_shared_->declare_parameter("path_cost_base", rclcpp::ParameterValue(170));
+  node_shared_->declare_parameter("path_cost_cap", rclcpp::ParameterValue(253));
+  node_shared_->declare_parameter("path_soft_cmax", rclcpp::ParameterValue(100));
+  node_shared_->declare_parameter("lambda_m", rclcpp::ParameterValue(2.0));
+  node_shared_->declare_parameter("sigma_lat_m", rclcpp::ParameterValue(0.45));
+
+  // dilations
+  node_shared_->declare_parameter("dilate_wait_m", rclcpp::ParameterValue(0.2));
+  node_shared_->declare_parameter("dilate_arrived_m", rclcpp::ParameterValue(0.35));
+  node_shared_->declare_parameter("dilate_error_m", rclcpp::ParameterValue(0.5));
+  node_shared_->declare_parameter("dilate_moving_curr_m", rclcpp::ParameterValue(0.1));
+  node_shared_->declare_parameter("pos_sigma_k", rclcpp::ParameterValue(2.0));
+
+  // heading cone
+  node_shared_->declare_parameter("heading_cone_deg", rclcpp::ParameterValue(40.0));
+  node_shared_->declare_parameter("cone_boost", rclcpp::ParameterValue(40));
+
+  // === Get parameters ===
+  node_shared_->get_parameter("enabled", enabled_);
+  node_shared_->get_parameter("topic", topic_);
+  {
+    int tmp = 0; node_shared_->get_parameter("self_machine_id", tmp);
+    self_machine_id_ = static_cast<uint16_t>(tmp);
+  }
+  node_shared_->get_parameter("self_type_id", self_type_id_);
+  node_shared_->get_parameter("use_path_header_frame", use_path_header_frame_);
+  node_shared_->get_parameter("roi_range_m", roi_range_m_);
+  node_shared_->get_parameter("freshness_timeout_ms", freshness_timeout_ms_);
+  node_shared_->get_parameter("max_poses", max_poses_);
+  node_shared_->get_parameter("qos_reliable", qos_reliable_);
+  node_shared_->get_parameter("publish_meta", publish_meta_);
+  node_shared_->get_parameter("meta_stride", meta_stride_);
+
+  int tmp_uc = 0;
+  node_shared_->get_parameter("fp_cost_wait_like", tmp_uc);        fp_cost_wait_like_   = static_cast<unsigned char>(std::clamp(tmp_uc, 0, 254));
+  node_shared_->get_parameter("fp_cost_arrived_like", tmp_uc);     fp_cost_arrived_like_= static_cast<unsigned char>(std::clamp(tmp_uc, 0, 254));
+  node_shared_->get_parameter("fp_cost_error_like", tmp_uc);       fp_cost_error_like_  = static_cast<unsigned char>(std::clamp(tmp_uc, 0, 254));
+  node_shared_->get_parameter("fp_cost_moving_like", tmp_uc);      fp_cost_moving_like_ = static_cast<unsigned char>(std::clamp(tmp_uc, 0, 254));
+  node_shared_->get_parameter("fp_cost_default", tmp_uc);          fp_cost_default_     = static_cast<unsigned char>(std::clamp(tmp_uc, 0, 254));
+
+  node_shared_->get_parameter("path_cost_base", tmp_uc);           path_cost_base_      = static_cast<unsigned char>(std::clamp(tmp_uc, 0, 254));
+  node_shared_->get_parameter("path_cost_cap", tmp_uc);            path_cost_cap_       = static_cast<unsigned char>(std::clamp(tmp_uc, 0, 254));
+  node_shared_->get_parameter("path_soft_cmax", path_soft_cmax_);
+  node_shared_->get_parameter("lambda_m", lambda_m_);
+  node_shared_->get_parameter("sigma_lat_m", sigma_lat_m_);
+
+  node_shared_->get_parameter("dilate_wait_m", dilate_wait_m_);
+  node_shared_->get_parameter("dilate_arrived_m", dilate_arrived_m_);
+  node_shared_->get_parameter("dilate_error_m", dilate_error_m_);
+  node_shared_->get_parameter("dilate_moving_curr_m", dilate_moving_curr_m_);
+  node_shared_->get_parameter("pos_sigma_k", pos_sigma_k_);
+
+  node_shared_->get_parameter("heading_cone_deg", heading_cone_deg_);
+  node_shared_->get_parameter("cone_boost", cone_boost_);
+
+  current_ = true;
+  matchSize();
+
+  if (enabled_) activate();
+}
+
+void AgentLayer::activate()
+{
+  auto qos = rclcpp::QoS(rclcpp::KeepLast(10));
+  if (qos_reliable_) qos.reliable(); else qos.best_effort();
+
+  sub_ = node_shared_->create_subscription<multi_agent_msgs::msg::MultiAgentInfoArray>(
+      topic_, qos, std::bind(&AgentLayer::infosCallback, this, std::placeholders::_1));
+
+  if (publish_meta_) {
+    meta_pub_ = node_shared_->create_publisher<multi_agent_msgs::msg::AgentLayerMetaArray>(
+        "agent_layer_meta", rclcpp::QoS(1).reliable().transient_local());
+  }
+}
+
+void AgentLayer::deactivate()
+{
+  sub_.reset();
+  meta_pub_.reset();
+}
+
+void AgentLayer::infosCallback(
+  const multi_agent_msgs::msg::MultiAgentInfoArray::SharedPtr msg)
+{
+  std::lock_guard<std::mutex> lk(data_mtx_);
+  last_infos_ = msg;
+  last_stamp_ = msg->header.stamp;
+}
+
+bool AgentLayer::stale(const rclcpp::Time & stamp) const
+{
+  return (node_shared_->now() - stamp) >
+         rclcpp::Duration::from_nanoseconds(
+           static_cast<int64_t>(freshness_timeout_ms_) * 1000000LL);
+}
+
+bool AgentLayer::isSelf(const multi_agent_msgs::msg::MultiAgentInfo & a) const
+{
+  return (a.machine_id == self_machine_id_) && (a.type_id == self_type_id_);
+}
+
+AgentLayer::CostProfile AgentLayer::profileFor(uint8_t phase) const
+{
+  using S = multi_agent_msgs::msg::AgentStatus;
+  switch (phase) {
+    case S::STATUS_ERROR:
+    case S::STATUS_WAITING_FOR_SAFETY:
+    case S::STATUS_AUTORECOVERY:
+    case S::STATUS_RECOVERING:
+      return {fp_cost_error_like_, static_cast<unsigned char>(std::max<int>(path_cost_base_, 190)), dilate_error_m_};
+    case S::STATUS_ARRIVED:
+    case S::STATUS_CHARGING:
+    case S::STATUS_CHARGE_DONE:
+      return {fp_cost_arrived_like_, static_cast<unsigned char>(std::max<int>(path_cost_base_, 185)), dilate_arrived_m_};
+    case S::STATUS_WAITING_FOR_OBS:
+    case S::STATUS_PAUSE:
+    case S::STATUS_WAITING_FOR_FLOWCONTROL:
+    case S::STATUS_MARKING:
+    case S::STATUS_LOADING:
+    case S::STATUS_UNLOADING:
+      return {fp_cost_wait_like_, static_cast<unsigned char>(std::max<int>(path_cost_base_, 180)), dilate_wait_m_};
+    case S::STATUS_MOVING:
+    case S::STATUS_PATH_SEARCHING:
+    case S::STATUS_MANUAL_RUNNING:
+      return {fp_cost_moving_like_, path_cost_base_, dilate_moving_curr_m_};
+    default:
+      return {fp_cost_default_, static_cast<unsigned char>(std::max<int>(path_cost_base_, 170)), 0.15};
+  }
+}
+
+void AgentLayer::updateBounds(double robot_x, double robot_y, double /*robot_yaw*/,
+                              double* min_x, double* min_y, double* max_x, double* max_y)
+{
+  if (!enabled_) return;
+
+  touched_ = false;
+  touch_min_x_ =  std::numeric_limits<double>::infinity();
+  touch_min_y_ =  std::numeric_limits<double>::infinity();
+  touch_max_x_ = -std::numeric_limits<double>::infinity();
+  touch_max_y_ = -std::numeric_limits<double>::infinity();
+
+  std::vector<multi_agent_msgs::msg::MultiAgentInfo> infos;
+  {
+    std::lock_guard<std::mutex> lk(data_mtx_);
+    if (!last_infos_ || stale(last_stamp_)) return;
+    infos.assign(last_infos_->agents.begin(), last_infos_->agents.end());
+  }
+
+  const std::string & global_frame = layered_costmap_->getGlobalFrameID();
+
+  for (const auto & a : infos) {
+    if (isSelf(a)) continue;
+
+    // ROI by distance from our robot
+    const double dx = a.current_pose.pose.position.x - robot_x;
+    const double dy = a.current_pose.pose.position.y - robot_y;
+    if (hypot2(dx, dy) > roi_range_m_) continue;
+
+    // frame check (optional)
+    if (use_path_header_frame_ && a.truncated_path.header.frame_id != global_frame) continue;
+
+    // 후보: current pose + truncated path 포즈들
+    const int limit = std::min<int>(a.truncated_path.poses.size(), max_poses_);
+
+    auto addPt = [&](double x, double y){
+      if (x < touch_min_x_) touch_min_x_ = x;
+      if (y < touch_min_y_) touch_min_y_ = y;
+      if (x > touch_max_x_) touch_max_x_ = x;
+      if (y > touch_max_y_) touch_max_y_ = y;
+      touched_ = true;
+    };
+
+    addPt(a.current_pose.pose.position.x, a.current_pose.pose.position.y);
+    for (int i = 0; i < limit; ++i) {
+      const auto & p = a.truncated_path.poses[i].pose.position;
+      addPt(p.x, p.y);
+    }
+  }
+
+  if (touched_) {
+    *min_x = std::min(*min_x, touch_min_x_);
+    *min_y = std::min(*min_y, touch_min_y_);
+    *max_x = std::max(*max_x, touch_max_x_);
+    *max_y = std::max(*max_y, touch_max_y_);
+  }
+}
+
+void AgentLayer::updateCosts(nav2_costmap_2d::Costmap2D & master_grid,
+                             int /*min_i*/, int /*min_j*/, int /*max_i*/, int /*max_j*/)
+{
+  if (!enabled_) return;
+
+  std::vector<multi_agent_msgs::msg::MultiAgentInfo> infos;
+  {
+    std::lock_guard<std::mutex> lk(data_mtx_);
+    if (!last_infos_ || stale(last_stamp_)) return;
+    infos.assign(last_infos_->agents.begin(), last_infos_->agents.end());
+  }
+
+  std::vector<std::pair<unsigned int,unsigned int>> meta_hits;
+  meta_hits.reserve(512);
+
+  for (const auto & a : infos) {
+    if (isSelf(a)) continue;
+    rasterizeAgent(a, &master_grid, meta_hits);
+  }
+
+  if (publish_meta_ && meta_pub_) {
+    multi_agent_msgs::msg::AgentLayerMetaArray arr;
+    arr.header.frame_id = layered_costmap_->getGlobalFrameID();
+    arr.header.stamp = node_shared_->now();
+    for (size_t k = 0; k < meta_hits.size(); k += std::max(1, meta_stride_)) {
+      auto [mx, my] = meta_hits[k];
+      double wx, wy; master_grid.mapToWorld(mx, my, wx, wy);
+      multi_agent_msgs::msg::AgentLayerCellMeta cm;
+      cm.header = arr.header;
+      cm.machine_id = 0;
+      cm.phase = 0;
+      cm.mode = "";
+      cm.reroute = false;
+      cm.re_path_search = false;
+      cm.transferring = false;
+      cm.area_id = 0;
+      cm.position.x = wx; cm.position.y = wy; cm.position.z = 0.0;
+      cm.mx = mx; cm.my = my;
+      cm.t_first_hit = -1.0f;
+      cm.sigma = 0.0f;
+      arr.cells.emplace_back(std::move(cm));
+    }
+    meta_pub_->publish(std::move(arr));
+  }
+}
+
+static inline std::vector<geometry_msgs::msg::Point>
+dilatePolygon(const std::vector<geometry_msgs::msg::Point32> & in, double d)
+{
+  std::vector<geometry_msgs::msg::Point> out; out.reserve(in.size());
+  if (in.empty()) return out;
+
+  // centroid
+  double cx=0, cy=0;
+  for (auto & p : in) { cx += p.x; cy += p.y; }
+  cx /= static_cast<double>(in.size());
+  cy /= static_cast<double>(in.size());
+
+  for (auto & p : in) {
+    double vx = p.x - cx, vy = p.y - cy;
+    double n = std::hypot(vx, vy); if (n < 1e-6) n = 1.0;
+    geometry_msgs::msg::Point q;
+    q.x = p.x + d * (vx / n);
+    q.y = p.y + d * (vy / n);
+    q.z = 0.0;
+    out.push_back(q);
+  }
+  return out;
+}
+
+inline double AgentLayer::yawOf(const geometry_msgs::msg::Quaternion & q)
+{
+  return tf2::getYaw(q);
+}
+
+void AgentLayer::rasterizeAgent(
+  const multi_agent_msgs::msg::MultiAgentInfo & a,
+  nav2_costmap_2d::Costmap2D * grid,
+  std::vector<std::pair<unsigned int,unsigned int>> & meta_hits)
+{
+  const auto prof = profileFor(a.status.phase);
+
+  // 1) 현재 footprint를 '치사' 등으로 채움 (상태별 dilation + 위치불확실도)
+  double dilation = prof.dilate;
+  if (a.pos_std_m >= 0.0) dilation += pos_sigma_k_ * a.pos_std_m;
+  fillFootprintAt(a.footprint, a.current_pose.pose, dilation, grid, prof.fp_cost, &meta_hits);
+
+  // 2) 경로 소프트 필드(선택: truncated_path가 있으면)
+  if (!a.truncated_path.poses.empty()) {
+    // 프레임 일치 검사 (옵션)
+    if (use_path_header_frame_) {
+      if (a.truncated_path.header.frame_id != layered_costmap_->getGlobalFrameID())
+        return;
+    }
+    // 누적 길이 prefix sum
+    const int limit = std::min<int>(a.truncated_path.poses.size(), max_poses_);
+    std::vector<geometry_msgs::msg::PoseStamped> path;
+    path.reserve(limit);
+    for (int i=0; i<limit; ++i) path.push_back(a.truncated_path.poses[i]);
+
+    std::vector<double> prefix_s(limit, 0.0);
+    for (int i=1; i<limit; ++i) {
+      const auto &p0 = path[i-1].pose.position;
+      const auto &p1 = path[i  ].pose.position;
+      const double ds = hypot2(p1.x - p0.x, p1.y - p0.y);
+      prefix_s[i] = prefix_s[i-1] + ds;
+    }
+    softenAlongPath(path, grid, prof.base, &prefix_s, &meta_hits);
+  }
+}
+
+void AgentLayer::fillFootprintAt(const geometry_msgs::msg::PolygonStamped & fp,
+                                 const geometry_msgs::msg::Pose & pose,
+                                 double extra_dilation_m,
+                                 nav2_costmap_2d::Costmap2D * grid,
+                                 unsigned char cost,
+                                 std::vector<std::pair<unsigned int,unsigned int>> * meta_hits)
+{
+  // 1) inflate local polygon
+  auto poly = dilatePolygon(fp.polygon.points, extra_dilation_m);
+
+  // 2) transform to world by pose
+  const double yaw = yawOf(pose.orientation);
+  const double c = std::cos(yaw), s = std::sin(yaw);
+  for (auto & p : poly) {
+    const double x = p.x, y = p.y;
+    p.x = pose.position.x + c * x - s * y;
+    p.y = pose.position.y + s * x + c * y;
+  }
+
+  // 3) bbox in world
+  double minx=std::numeric_limits<double>::infinity();
+  double miny=std::numeric_limits<double>::infinity();
+  double maxx=-std::numeric_limits<double>::infinity();
+  double maxy=-std::numeric_limits<double>::infinity();
+  for (auto & p : poly) {
+    if (p.x < minx) minx = p.x;
+    if (p.y < miny) miny = p.y;
+    if (p.x > maxx) maxx = p.x;
+    if (p.y > maxy) maxy = p.y;
+  }
+
+  // 4) bbox→map index
+  int min_i, min_j, max_i, max_j;
+  grid->worldToMapEnforceBounds(minx, miny, min_i, min_j);
+  grid->worldToMapEnforceBounds(maxx, maxy, max_i, max_j);
+
+  // 5) fill by point-in-polygon (ray-casting)
+  const size_t n = poly.size();
+  for (int j = min_j; j <= max_j; ++j) {
+    for (int i = min_i; i <= max_i; ++i) {
+      double wx, wy; grid->mapToWorld(i, j, wx, wy);
+
+      bool inside = false;
+      for (size_t k=0, h=n-1; k<n; h=k++) {
+        const double xi = poly[k].x, yi = poly[k].y;
+        const double xh = poly[h].x, yh = poly[h].y;
+        const bool hit = ((yi > wy) != (yh > wy)) &&
+                         (wx < (xh - xi) * (wy - yi) / std::max(1e-12, (yh - yi)) + xi);
+        if (hit) inside = !inside;
+      }
+
+      if (inside) {
+        // True overwrite: footprint은 치사 성격이므로 그대로 덮어씀(또는 Max-merge도 OK)
+        grid->setCost(static_cast<unsigned int>(i),
+                      static_cast<unsigned int>(j), cost);
+        if (meta_hits) meta_hits->emplace_back(
+            static_cast<unsigned int>(i), static_cast<unsigned int>(j));
+      }
+    }
+  }
+
+  // 6) bounds bookkeeping for updateBounds
+  if (!touched_) {
+    touch_min_x_ = minx; touch_min_y_ = miny;
+    touch_max_x_ = maxx; touch_max_y_ = maxy;
+    touched_ = true;
+  } else {
+    touch_min_x_ = std::min(touch_min_x_, minx);
+    touch_min_y_ = std::min(touch_min_y_, miny);
+    touch_max_x_ = std::max(touch_max_x_, maxx);
+    touch_max_y_ = std::max(touch_max_y_, maxy);
+  }
+}
+
+// 경로 소프트 필드: 각 포즈 주변 반지름 R ≈ 3*sigma 내 셀만 스캔, 가우시안 * 종방향 감쇠 * (옵션)헤딩콘버프
+void AgentLayer::softenAlongPath(const std::vector<geometry_msgs::msg::PoseStamped> & path,
+                                 nav2_costmap_2d::Costmap2D * grid,
+                                 unsigned char c_base,
+                                 std::vector<double> * prefix_s,
+                                 std::vector<std::pair<unsigned int,unsigned int>> * meta_hits)
+{
+  if (path.empty()) return;
+
+  const double R = std::max(1.0, 3.0 * sigma_lat_m_); // 검색 반경(m)
+  const double R2 = R * R;
+  const double inv_2sigma2 = (sigma_lat_m_ > 1e-6) ? (1.0 / (2.0 * sigma_lat_m_ * sigma_lat_m_)) : 1e6;
+  const double cone_rad = heading_cone_deg_ * M_PI / 180.0;
+
+  // 셀 크기
+  const double res = grid->getResolution();
+
+  const size_t N = path.size();
+  for (size_t idx = 0; idx < N; ++idx) {
+    const auto & ps = path[idx].pose;
+    const double x = ps.position.x, y = ps.position.y;
+    const double yaw = yawOf(ps.orientation);
+    const double cos_y = std::cos(yaw), sin_y = std::sin(yaw);
+
+    // 종방향 감쇠 w_long(s)
+    const double s = (*prefix_s)[idx];
+    const double wlong = (lambda_m_ > 1e-6) ? std::exp(-s / lambda_m_) : 1.0;
+
+    // 포즈 중심을 포함하는 맵 인덱스 박스
+    double minx = x - R, miny = y - R, maxx = x + R, maxy = y + R;
+    int min_i, min_j, max_i, max_j;
+    grid->worldToMapEnforceBounds(minx, miny, min_i, min_j);
+    grid->worldToMapEnforceBounds(maxx, maxy, max_i, max_j);
+
+    for (int j = min_j; j <= max_j; ++j) {
+      for (int i = min_i; i <= max_i; ++i) {
+        double wx, wy; grid->mapToWorld(i, j, wx, wy);
+        const double dx = wx - x, dy = wy - y;
+        const double r2 = dx*dx + dy*dy;
+        if (r2 > R2) continue; // 원 반경 바깥은 skip
+
+        // 횡방향 거리 근사: 로컬 프레임으로 회전 → |y_local|
+        const double x_local =  cos_y * dx + sin_y * dy;
+        const double y_local = -sin_y * dx + cos_y * dy;
+        const double d = std::fabs(y_local);
+
+        // 가우시안 횡감쇠
+        const double wlat = std::exp( - (d*d) * inv_2sigma2 );
+
+        // 헤딩 콘(앞쪽만 가산)
+        int cone = 0;
+        if (cone_boost_ > 0) {
+          // 셀 벡터의 각도(로컬 x축 기준)
+          const double theta = std::atan2(y_local, x_local);
+          if (std::fabs(theta) <= cone_rad && x_local >= 0.0) {
+            cone = cone_boost_;
+          }
+        }
+
+        // 최종 소프트 코스트
+        int c_soft = static_cast<int>(c_base) +
+                     static_cast<int>(std::round(wlong * wlat * static_cast<double>(path_soft_cmax_))) +
+                     cone;
+
+        c_soft = std::clamp(c_soft, static_cast<int>(c_base), static_cast<int>(path_cost_cap_));
+
+        // Max-merge
+        const unsigned char old = grid->getCost(i, j);
+        const unsigned char neu = static_cast<unsigned char>(std::max<int>(old, c_soft));
+        if (neu != old) {
+          grid->setCost(static_cast<unsigned int>(i),
+                        static_cast<unsigned int>(j), neu);
+          if (meta_hits) meta_hits->emplace_back(
+              static_cast<unsigned int>(i), static_cast<unsigned int>(j));
+        }
+      }
+    }
+
+    // bounds bookkeeping (updateBounds에서 전체 경로 bbox를 이미 포함하지만 보수적으로 갱신)
+    touch_min_x_ = std::min(touch_min_x_, minx);
+    touch_min_y_ = std::min(touch_min_y_, miny);
+    touch_max_x_ = std::max(touch_max_x_, maxx);
+    touch_max_y_ = std::max(touch_max_y_, maxy);
+    touched_ = true;
+  }
+}
+
+} // namespace multi_agent_nav2
+
+// pluginlib export
+PLUGINLIB_EXPORT_CLASS(multi_agent_nav2::AgentLayer, nav2_costmap_2d::Layer)
+```
+
+---
+
+## 사용/튜닝 포인트
+
+* YAML 예시:
+
+```yaml
+global_costmap:
+  global_costmap:
+    plugins: ["static_layer", "obstacle_layer", "agent_layer"]
+    agent_layer:
+      plugin: multi_agent_nav2::AgentLayer
+      enabled: true
+      topic: /multi_agent_infos
+      roi_range_m: 12.0
+      freshness_timeout_ms: 800
+      max_poses: 40
+      qos_reliable: true
+
+      # footprint 강도
+      fp_cost_wait_like: 254
+      fp_cost_arrived_like: 254
+      fp_cost_error_like: 254
+      fp_cost_moving_like: 254
+      fp_cost_default: 240
+
+      # 경로 소프트 필드
+      path_cost_base: 170
+      path_cost_cap: 253
+      path_soft_cmax: 110
+      lambda_m: 2.0
+      sigma_lat_m: 0.45
+
+      # 상태별 dilation + 불확실도 가산
+      dilate_wait_m: 0.2
+      dilate_arrived_m: 0.35
+      dilate_error_m: 0.5
+      dilate_moving_curr_m: 0.1
+      pos_sigma_k: 2.0
+
+      # 진행방향 콘
+      heading_cone_deg: 40.0
+      cone_boost: 40
+```
+
+* **경로를 ‘뚫고 간다’**면: `path_cost_base`↑, `path_soft_cmax`↑, `lambda_m`↑, `sigma_lat_m`↑, `cone_boost`↑ 순으로 강화.
+* **너무 우회**하면: 반대로 낮추거나 `max_poses`/경로간격을 줄여 필드를 희박화.
+
+필요하면 이 코드에 맞춘 **작은 벤치마크/가시화(셀별 색상 다른 팔레트)**도 곧바로 붙여드릴게요.
