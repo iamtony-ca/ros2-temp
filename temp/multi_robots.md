@@ -1223,3 +1223,97 @@ if (cost > old) {
    * 그라데이션을 원하면 위 순서를 지키거나, agent_layer 내부에서 거리기반 코스트로 변경.
 
 원하시면, `fillFootprintAt()` 내부에 **거리기반 코스트 예시**(에지에서 중심으로 갈수록 낮아지는/높아지는 방식) 코드도 바로 넣어드릴게요.
+
+
+#################  
+################  
+맞아요—이 증상은 **파라미터 네임스페이스가 안 맞아서** YAML 값이 코드에 안 들어오는 전형적인 경우예요.
+지금 코드는 `node_shared_->declare_parameter("waiting_cost", ...)`처럼 **루트(전역) 파라미터**로 선언/조회하고 있고, 실제 YAML은 보통
+
+```
+global_costmap:
+  global_costmap:
+    agent_layer:
+      plugin: multi_agent_nav2::AgentLayer
+      waiting_cost: 254
+```
+
+처럼 **플러그인 인스턴스 이름(`agent_layer`) 아래**에 들어가 있습니다. 즉, 선언/조회할 때 **플러그인 이름 접두사**를 붙여야 해요.
+
+## 고치는 법 (안전·권장)
+
+Costmap2D의 `Layer`가 제공하는 **헬퍼**를 쓰면 깔끔합니다.
+
+* 선언은 `declareParameter("키", 기본값)`
+* 조회는 `node_->get_parameter(name_ + ".키", 변수)`
+
+  * 여기서 `name_`은 이 레이어 인스턴스의 이름(예: `agent_layer`)이고, `Layer`의 멤버입니다.
+
+### 코드 수정 예
+
+```cpp
+// before (전역 이름으로 선언 → YAML 네임스페이스와 불일치)
+node_shared_->declare_parameter("waiting_cost", rclcpp::ParameterValue(200));
+int tmp = 200;
+node_shared_->get_parameter("waiting_cost", tmp);
+
+// after (플러그인 이름 접두사 자동 처리)
+declareParameter("waiting_cost", rclcpp::ParameterValue(200));  // ← Layer::declareParameter 사용
+int tmp = 200;
+node_->get_parameter(name_ + std::string(".waiting_cost"), tmp);
+waiting_cost_ = static_cast<unsigned char>(std::clamp(tmp, 0, 254));
+```
+
+> 위와 같은 패턴으로 `enabled`, `moving_cost`, `lethal_cost` 등 **모든 플러그인 파라미터**를 바꿔주세요.
+> (`declareParameter(...)`는 `Layer`가 제공, `node_`/`name_`도 `Layer`의 멤버입니다.)
+
+## 대안 (헬퍼 안 쓰고 직접 접두사 붙이기)
+
+헬퍼 대신 직접 문자열을 합쳐도 됩니다.
+
+```cpp
+const std::string ns = name_ + ".";
+node_shared_->declare_parameter(ns + "waiting_cost", rclcpp::ParameterValue(200));
+int tmp = 200;
+node_shared_->get_parameter(ns + "waiting_cost", tmp);
+```
+
+## YAML 구조 체크리스트
+
+Iron/Jazzy 스타일(단일 `plugins` + `plugin:` 키)일 때:
+
+```yaml
+global_costmap:
+  global_costmap:
+    plugins: ["static_layer", "obstacle_layer", "agent_layer", "inflation_layer"]
+
+    agent_layer:
+      plugin: multi_agent_nav2::AgentLayer
+      enabled: true
+      waiting_cost: 254
+      moving_cost: 180
+      lethal_cost: 254
+      # ... 기타 파라미터
+```
+
+* **플러그인 인스턴스 이름**(`agent_layer`)이 `name_`와 일치해야 합니다.
+* `plugin:` 타입은 `agent_layer_plugin.xml`의 `type`과 같아야 합니다(예: `multi_agent_nav2::AgentLayer`).
+* 이 YAML은 **해당 노드**(`/global_costmap/global_costmap`)의 파라미터로 들어갑니다.
+  확인:
+
+  ```
+  ros2 param get /global_costmap/global_costmap agent_layer.waiting_cost
+  ```
+
+## 반영 타이밍
+
+* 대부분의 레이어 파라미터는 **configure 시점**에 읽습니다. YAML만 바꾸고 **Nav2 재실행**(또는 해당 lifecycle 노드 `deactivate→cleanup→configure→activate`)을 해야 적용됩니다.
+* 런타임 동적 파라미터가 아니면 live-update는 안 돼요.
+
+## 왜 C++ 상수만 바꾸면 “바로 먹히는” 것처럼 보였나?
+
+YAML이 네임스페이스 불일치로 무시되니, 결국 코드 기본값(상수)이 그대로 적용된 겁니다. C++의 기본값을 바꾸면 그게 곧바로 반영된 것처럼 느껴진 거죠.
+
+---
+
+필요하시면, 제가 **전체 파라미터 선언/조회 블록**을 `declareParameter`/`name_` 방식으로 전부 바꾼 패치를 한 번에 정리해 드릴게요.
