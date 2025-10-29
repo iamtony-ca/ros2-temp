@@ -278,3 +278,66 @@ behavior_server:
 2.  **YAML (`spin` 파라미터)**: "회전할 때는 최대 속도 0.8, 1.5초 앞을 내다보면서 해." 라고 **어떻게** 동작할지에 대한 세부 규칙을 정합니다.
 
 이 두 가지 설정이 함께 동작하여 `Spin` 기능이 완성됩니다.
+#####################  
+########################  
+네, 사용자님의 예상이 거의 맞습니다. 하지만 정확히는 **'현재 pose'가 아니라 '시뮬레이션된 미래의 pose'들**의 footprint와 \*\*'Local Costmap'\*\*을 비교합니다.
+
+`Spin` 코드의 `isCollisionFree` 함수 내부를 보면 충돌 검사 로직이 명확히 드러납니다.
+
+```cpp
+// [Spin::isCollisionFree 함수 내부]
+
+// ...
+bool fetch_data = true;
+
+while (cycle_count < max_cycle_count) {
+    // 1. 미래의 각도(theta) 계산
+    sim_position_change = cmd_vel.angular.z * (cycle_count / cycle_frequency_);
+    pose2d.theta = init_pose.theta + sim_position_change;
+    cycle_count++;
+    
+    // 2. 목표 회전량을 넘어가면 시뮬레이션 중단
+    if (abs(relative_yaw) - abs(sim_position_change) <= 0.) {
+        break;
+    }
+
+    // 3. 💥 핵심: 시뮬레이션된 pose로 충돌 검사
+    if (!local_collision_checker_->isCollisionFree(pose2d, fetch_data)) {
+        return false; // 충돌 감지!
+    }
+    fetch_data = false;
+}
+return true; // 충돌 없음
+```
+
+-----
+
+### 📍 충돌 검사(Collision Check)의 상세 과정
+
+`Spin` 동작의 충돌 검사는 2단계로 이루어집니다.
+
+#### 1\. `Spin` 노드: 미래 경로 시뮬레이션
+
+`Spin` 노드 자체는 충돌 검사 방법을 모릅니다. 단지 "만약 내가 `simulate_ahead_time` (예: 2.0초) 동안 이 속도(`cmd_vel.angular.z`)로 회전하면 어떻게 될까?"를 시뮬레이션합니다.
+
+1.  **시뮬레이션 루프**: `simulate_ahead_time` 동안 (예: 20Hz 주기로 40회) 루프를 돕니다.
+2.  **미래 Pose 계산**: 각 루프마다 로봇이 도달할 미래의 `theta` 값을 계산합니다. (Spin은 제자리 회전이므로 `x`, `y`는 `init_pose`의 값으로 고정됩니다).
+3.  **검사기(Checker) 호출**: 계산된 이 **미래의 `pose2d`** (x, y, theta)를 `local_collision_checker_`에게 전달하며 "이 자세, 안전해?"라고 물어봅니다.
+
+#### 2\. `local_collision_checker_`: 실제 검사 수행
+
+`local_collision_checker_`는 `behavior_server`가 가지고 있는 실제 충돌 검사 플러그인입니다. (보통 `CostmapAwareCollisionChecker`가 사용됩니다). 이 검사기가 실제 작업을 수행합니다.
+
+1.  **Costmap 가져오기**: `fetch_data = true`일 때 (루프의 첫 번째), `behavior_server`로부터 **최신 Local Costmap** 데이터를 가져옵니다.
+2.  **Footprint 가져오기**: 로봇의 **Footprint (외곽선)** 정보를 가져옵니다. (이 정보는 `nav2_params.yaml`에 정의되어 있습니다).
+3.  **Footprint 투영**: `Spin` 노드가 요청한 **시뮬레이션된 `pose2d`** (x, y, theta) 위치에 로봇의 Footprint를 "도장"처럼 찍습니다.
+4.  **Costmap 값 확인**: Footprint가 찍힌 영역(픽셀)에 해당하는 **Local Costmap의 모든 셀 값**을 확인합니다.
+5.  **충돌 판정**: 만약 이 셀들 중 **단 하나라도** `LETHAL_OBSTACLE` (치명적 장애물) 또는 `INSCRIBED_INFLATION` (내접 팽창 영역) 값과 같거나 그 이상이면, `false` (충돌)를 반환합니다.
+
+-----
+
+### 요약
+
+`Spin` 노드는 **제자리 회전 경로를 따라 여러 개의 미래 자세(pose)를 생성**하고, `local_collision_checker_`는 **그 각각의 미래 자세에서 로봇의 Footprint가 Local Costmap 상의 장애물과 겹치는지**를 검사합니다.
+
+`simulate_ahead_time` 동안의 시뮬레이션 경로 중 단 한 지점이라도 충돌이 예상되면, `Spin` 노드는 즉시 `FAILED`를 반환하고 로봇을 정지시킵니다.
