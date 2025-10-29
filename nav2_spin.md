@@ -111,3 +111,80 @@
     * **누적 상대 회전 각도 (rad)**입니다.
     * `Spin` 동작이 시작된 후 **현재까지 실제로 회전한 총 각도**를 누적합니다.
     * `onRun`에서 0으로 초기화되며, `onCycleUpdate`에서 계산된 `delta_yaw`가 이 변수에 계속 더해집니다. 이 값이 `cmd_yaw_`에 도달하면 동작이 성공합니다.
+###################
+######################
+정확하게 파악하셨습니다. BT.xml에서 사용하려는 것이라면 `nav2_behavior_tree`의 `spin_action.cpp` (SpinAction)가 맞습니다.
+
+두 코드는 Nav2의 Behavior Tree가 ROS 2 액션(Action)을 호출하는 방식을 보여주는 전형적인 **클라이언트-서버(Client-Server) 구조**입니다.
+
+간단히 말해, \*\*`nav2_behavior_tree`의 코드는 '손님(Client)'\*\*이고, \*\*`nav2_behaviors`의 코드는 '요리사(Server)'\*\*입니다.
+
+-----
+
+### 1\. `nav2_behavior_tree/plugins/action/spin_action.cpp` (BT 노드 / 클라이언트)
+
+이 코드는 **Behavior Tree XML 파일 내부에서 사용되는 `<Spin>` 태그 그 자체**를 정의합니다.
+
+  * **역할**: Behavior Tree의 "프론트엔드" 또는 "인터페이스"입니다.
+  * **상속**: `BtActionNode<nav2_msgs::action::Spin>`를 상속받습니다.
+      * `BtActionNode`는 ROS 2 액션 클라이언트를 Behavior Tree 노드로 쉽게 포장해주는 템플릿입니다.
+  * **주요 기능**:
+    1.  **XML 파라미터 읽기**: `initialize()` 함수에서 `getInput("spin_dist", ...)`를 호출합니다. 이는 `bt.xml` 파일에 `<Spin spin_dist="3.14" ... />`와 같이 정의된 **입력 포트(port)에서 값을 읽어오는** 역할입니다.
+    2.  **액션 목표(Goal) 생성**: 읽어온 `spin_dist` 값을 `goal_.target_yaw`에 채워 넣어 `nav2_msgs::action::Spin` 타입의 ROS 2 액션 목표 메시지를 만듭니다.
+    3.  **액션 서버 호출**: `on_tick()`이 호출되면 (부모 클래스인 `BtActionNode`가) 이 `goal_` 메시지를 `/spin`이라는 이름의 ROS 2 액션 서버로 전송합니다.
+    4.  **결과 반환**: 액션 서버로부터 응답(성공, 실패, 중단)이 오면, `on_success()`, `on_aborted()` 등이 호출되어 BT 상태(`BT::NodeStatus::SUCCESS` 또는 `FAILURE`)로 변환하여 트리에 보고합니다.
+  * **플러그인 등록**:
+    ```cpp
+    BT_REGISTER_NODES(factory)
+    {
+    ...
+    factory.registerBuilder<nav2_behavior_tree::SpinAction>("Spin", builder);
+    }
+    ```
+    이 부분이 `BehaviorTree.Cpp` 라이브러리에 "Spin"이라는 이름의 노드를 등록하는 코드입니다. **이 코드가 있어야만 XML에서 `<Spin ... />` 태그를 인식할 수 있습니다.**
+
+-----
+
+### 2\. `nav2_behaviors/plugins/spin.cpp` (행동 플러그인 / 서버)
+
+이 코드는 \*\*실제로 로봇을 회전시키는 모든 로직을 수행하는 "엔진"\*\*입니다.
+
+  * **역할**: Behavior Tree의 "백엔드" 또는 "실행부"입니다. Nav2의 **Behavior Server** (`behavior_server` 노드)에 의해 로드되는 플러그인입니다.
+  * **상속**: `TimedBehavior<SpinAction>`를 상속받습니다.
+      * `TimedBehavior`는 `nav2_core::Behavior`를 기반으로 하며, `/spin` 액션 서버의 기능을 구현합니다.
+  * **주요 기능**:
+    1.  **액션 목표 수신**: `/spin` 액션 서버로 요청이 들어오면 `onRun()`이 호출됩니다. 여기서 `command->target_yaw` (즉, BT 노드가 보낸 `spin_dist`)를 `cmd_yaw_`에 저장합니다.
+    2.  **지속적인 실행 및 검사**: `onCycleUpdate()`가 주기적으로 호출됩니다.
+    3.  **충돌 검사**: `isCollisionFree()`를 호출하여 **Local Costmap을 기반으로 미래 경로의 충돌을 시뮬레이션**합니다.
+    4.  **로봇 제어**: 충돌이 없다고 판단되면 `vel_pub_->publish()`를 통해 **실제 `/cmd_vel` 토픽에 속도 명령을 게시**하여 로봇을 회전시킵니다.
+    5.  **피드백 및 결과 전송**: 목표 각도에 도달하면 `ResultStatus{Status::SUCCEEDED, ...}`를 반환하여 액션 클라이언트(BT 노드)에게 성공을 알립니다. 충돌이 감지되면 `FAILED`를 반환합니다.
+  * **플러그인 등록**:
+    ```cpp
+    PLUGINLIB_EXPORT_CLASS(nav2_behaviors::Spin, nav2_core::Behavior)
+    ```
+    이 부분이 `pluginlib`를 통해 이 클래스를 `nav2_core::Behavior` 타입의 플러그인으로 등록하는 코드입니다. **이 코드가 있어야만 `behavior_server`가 이 플러그인을 로드할 수 있습니다.**
+
+-----
+
+### 🚀 전체 동작 흐름
+
+1.  **BT.xml**: 사용자가 `<Spin spin_dist="1.57" />` 노드를 BT.xml에 추가합니다.
+2.  **BT 실행**: Behavior Tree가 이 `<Spin>` 노드를 "틱(tick)"합니다.
+3.  **`SpinAction` (BT 노드 / 클라이언트)**:
+      * `spin_action.cpp`의 `SpinAction` 클래스가 활성화됩니다.
+      * `initialize()`가 `spin_dist="1.57"` 값을 읽습니다.
+      * `target_yaw = 1.57`로 설정된 `nav2_msgs::action::Spin` 목표(goal)를 생성하여 `/spin` 액션 서버로 전송합니다.
+4.  **`behavior_server` (중간 관리자)**:
+      * `/spin` 액션 요청을 수신합니다.
+      * 자신에게 로드된 플러그인 중 `nav2_behaviors::Spin` (서버) 플러그인에게 이 요청을 전달합니다.
+5.  **`Spin` (행동 플러그인 / 서버)**:
+      * `spin.cpp`의 `Spin` 클래스가 활성화됩니다.
+      * `onRun()`이 호출되어 `cmd_yaw_ = 1.57`로 설정됩니다.
+      * `onCycleUpdate()` 루프가 시작됩니다.
+      * 루프마다 `isCollisionFree()`로 충돌을 검사하고, 안전하면 `vel_pub_->publish()`로 로봇을 조금씩 회전시킵니다.
+      * 로봇이 1.57 라디안을 모두 회전하면, `SUCCEEDED`를 반환합니다.
+6.  **결과 전송**:
+      * `behavior_server`는 이 `SUCCEEDED` 결과를 `SpinAction` (클라이언트)에게 다시 전송합니다.
+7.  **BT 노드 완료**:
+      * `SpinAction`의 `on_success()`가 호출됩니다.
+      * `SpinAction` 노드는 `BT::NodeStatus::SUCCESS`를 Behavior Tree에 반환하고, BT는 다음 노드를 실행하러 갑니다.
