@@ -2659,3 +2659,238 @@ PLUGINLIB_EXPORT_CLASS(multi_agent_nav2::AgentLayer, nav2_costmap_2d::Layer)
 * 파라미터 오버라이드는 `nav2_params.yaml`에서 반드시 같은 네임스페이스에 두세요(이전 이슈 원인).
 
 필요하면 `nav2_params.yaml`의 기본값(폭/세기/길이)을 더 낮춰서 더 얌전하게 만들 수 있어요.
+#################################  
+####################################  
+
+좋은 포인트! 지금 forward_smear_m 을 “반지름에 더하는 방식”으로 처리해서, 결과적으로 **모든 방향으로** footprint가 커졌던 거예요.
+원하는 건 “주행 **전방(heading +x)** 으로만” 여유를 늘리는 거니까, 아래처럼 바꾸면 딱 맞습니다.
+
+---
+
+# 코드 수정 (핵심만)
+
+## 1) 전방 스미어를 반지름에 *더하지 말고*, 폴리곤을 **로컬 프레임에서 전방(+x)으로만 늘리기**
+
+### 변경 1: `computeDilation()` 은 “기본(등방성) 팽창”만 반환
+
+```cpp
+double AgentLayer::computeDilation(const multi_agent_msgs::msg::MultiAgentInfo & a) const
+{
+  // 등방성(모든 방향) 기본 여유만 계산
+  double r = dilation_m_;
+  if (a.pos_std_m >= 0.0) r += sigma_k_ * a.pos_std_m;
+  // NOTE: forward_smear_m_ 는 여기서 더하지 않습니다 (방향성 처리는 fillFootprintAt에서!)
+  return r;
+}
+```
+
+### 변경 2: 전방 스미어를 로컬 좌표계에서 **+x 방향으로만** 적용하는 헬퍼 추가
+
+```cpp
+static inline std::vector<geometry_msgs::msg::Point>
+dilateFootprintDirectional(const std::vector<geometry_msgs::msg::Point32> & in,
+                           double iso_dilate_m,
+                           double forward_len_m)
+{
+  std::vector<geometry_msgs::msg::Point> out; out.reserve(in.size());
+  if (in.empty()) return out;
+
+  // 로컬 폴리곤의 무게중심
+  double cx=0, cy=0;
+  for (auto & p : in) { cx += p.x; cy += p.y; }
+  cx /= static_cast<double>(in.size());
+  cy /= static_cast<double>(in.size());
+
+  // 폴리곤 각 꼭짓점 처리
+  for (auto & p : in) {
+    // 1) 등방성(모든 방향) 기본 여유: 중심에서 바깥으로 iso_dilate_m 밀어냄
+    double vx = p.x - cx, vy = p.y - cy;
+    double n = std::hypot(vx, vy); if (n < 1e-6) n = 1.0;
+
+    double x_local = p.x + iso_dilate_m * (vx / n);
+    double y_local = p.y + iso_dilate_m * (vy / n);
+
+    // 2) 전방(+x) 여유: 중심 기준 전방측(x>=cx) 점들만 +x로 추가 밀어냄
+    if (forward_len_m > 1e-6 && (p.x - cx) >= 0.0) {
+      x_local += forward_len_m;
+    }
+
+    geometry_msgs::msg::Point q;
+    q.x = x_local; q.y = y_local; q.z = 0.0;
+    out.push_back(q);
+  }
+  return out;
+}
+```
+
+### 변경 3: `fillFootprintAt()` 에서 위 헬퍼 사용하고, “이동 중일 때만” 전방 스미어 적용
+
+```cpp
+void AgentLayer::fillFootprintAt(const geometry_msgs::msg::PolygonStamped & fp,
+                                 const geometry_msgs::msg::Pose & pose,
+                                 double extra_dilation_m,
+                                 nav2_costmap_2d::Costmap2D * grid,
+                                 unsigned char cost,
+                                 std::vector<std::pair<unsigned int,unsigned int>> * meta_hits)
+{
+  // ---- 0) 이동중 여부 판단을 위해 pose나 상태값이 필요하면 인자로 넘기거나,
+  //       호출측에서 forward_len 을 계산해서 전달해도 됩니다.
+  //       여기서는 간단히: 이동중이면 forward_len = forward_smear_m_, 아니면 0.
+  double forward_len = 0.0;
+  // 호출부에서 a.status.phase 를 아는 건 rasterizeAgentPath() 이므로,
+  // 거기서 fillFootprintAt() 호출 직전에 forward_len을 계산/전달해도 OK.
+  // 편의상: extra_dilation_m 은 등방성만 의미하도록 유지
+  // 여기서는 forward_len=0 으로 시작하고, 아래에서 pose의 yaw는 회전때 사용.
+
+  // === 1) 로컬 좌표계에서 폴리곤을 등방성 + 전방(+x)으로만 늘리기
+  //    (전방 스미어는 이동 중일 때만 적용되도록, 호출부에서 forward_len 조정 권장)
+  auto poly_local = dilateFootprintDirectional(fp.polygon.points, extra_dilation_m, forward_len);
+
+  // === 2) 로컬→월드 변환
+  const double yaw = tf2::getYaw(pose.orientation);
+  const double c = std::cos(yaw), s = std::sin(yaw);
+
+  // 월드 좌표계 폴리곤
+  for (auto & p : poly_local) {
+    const double x = p.x, y = p.y;
+    p.x = pose.position.x + c * x - s * y;
+    p.y = pose.position.y + s * x + c * y;
+  }
+
+  // === 3) bbox 계산, 4) worldToMapEnforceBounds, 5) 내부 픽셀 채우기(기존 동일)
+  // (아래는 기존 코드 그대로 — bbox/래스터/Max-merge 부분 생략)
+  // ...
+}
+```
+
+### 호출부에서 “이동 중일 때만” 전방 길이를 적용
+
+가장 간단한 방법은 `rasterizeAgentPath()` 에서 현재 footprint를 찍을 때, 이동 중이면 `forward_len = forward_smear_m_`, 아니면 `0.0` 으로 넘기는 것입니다.
+예시:
+
+```cpp
+void AgentLayer::rasterizeAgentPath(const MultiAgentInfo & a,
+                                    nav2_costmap_2d::Costmap2D * grid,
+                                    std::vector<std::pair<unsigned int,unsigned int>> & meta_hits)
+{
+  // 1) 현재 footprint
+  const unsigned char cost_now = computeCost(a);
+  const double iso_extra = computeDilation(a);              // 등방성만
+  const double fwd_len   = isMovingPhase(a.status.phase) ?  // 이동중일 때만 전방 여유
+                           forward_smear_m_ : 0.0;
+
+  // fillFootprintAt() 시그니처를 forward_len까지 받도록 바꾸는 게 가장 깔끔합니다.
+  // (위에 제시한 함수 시그니처 그대로 쓸 경우, 내부에서 forward_len=0으로 두지 말고
+  //  인자로 넘겨 적용하세요.)
+  fillFootprintAt(a.footprint, a.current_pose.pose, iso_extra, grid, cost_now, &meta_hits /*, fwd_len*/);
+
+  // 2) 경로 소프트필드(이전 로직 동일)
+  // ...
+}
+```
+
+> 요약: **forward_smear_m_은 “반지름에 더하기”가 아니라, 로컬 +x로만 평행이동하여 앞쪽(진행방향)으로만 footprint를 늘리도록 처리**해야 합니다.
+
+---
+
+# 파라미터 설명 & 튜닝 가이드
+
+아래는 현재 에이전트 레이어에서 쓰는 주요 파라미터와 **의미 / 영향 / 권장 튜닝 순서**입니다.
+
+## 기본 동작/입출력
+
+* `enabled` (bool, 기본 true)
+  레이어 활성/비활성.
+* `topic` (string, 기본 `/multi_agent_infos`)
+  다른 로봇 정보 배열 토픽 이름.
+* `qos_reliable` (bool, 기본 true)
+  구독 QoS. 네트워크 품질이 낮으면 false(best effort) 고려.
+
+## 자기식별 / ROI / 프레임
+
+* `self_machine_id` (uint16) / `self_type_id` (string)
+  자신 로봇 식별. 동일한 에이전트는 무시.
+* `roi_range_m` (double, 기본 12.0m)
+  현재 로봇 중심에서 이 거리 밖 에이전트는 무시(성능/잡음 방지).
+* `use_path_header_frame` (bool, 기본 true)
+  경로 frame이 costmap 글로벌 프레임과 다르면 무시. TF가 안정적이면 false로 완화 가능.
+
+## 코스트(가중치)
+
+* `lethal_cost` (uchar, 기본 254)
+  치사(충돌) 코스트. 정지 로봇 footprint 등에 사용 권장.
+* `waiting_cost` (uchar, 기본 200)
+  정지/대기 계열 상태 기본 코스트.
+* `moving_cost` (uchar, 기본 180)
+  이동중 footprint 기본 코스트(치사보다 낮게 두는 게 일반적).
+* `manual_cost_bias` (int, 기본 +30)
+  mode=="manual"일 때 추가 바이어스. 수동 조작 시 더 보수적으로 피하도록.
+
+**튜닝 팁**
+
+* 정지 로봇은 글로벌 플래너가 **절대 관통하지 않도록** `waiting_cost ≈ lethal_cost(254)`로 두는 게 안전.
+* 이동 로봇은 엄청난 우회 강제보다 “경로 소프트필드”로 **우회 선호**를 주고, footprint는 180~220대 권장.
+
+## footprint 팽창
+
+* `dilation_m` (double, 기본 0.05)
+  **등방성(모든 방향)** 기본 여유 거리. 로봇 형상 오차/네트워크 지연 대비.
+* `sigma_k` (double, 기본 2.0) & (메시지의) `pos_std_m`
+  위치 표준편차가 클수록 `dilation_m + sigma_k*pos_std_m`로 더 크게.
+* `forward_smear_m` (double, 기본 0.25)
+  **이동 중에만** 전방(+x)으로 늘릴 길이. 위 수정대로 **전방만** 확장.
+
+**튜닝 순서**
+
+1. `dilation_m` 으로 “항상 확보할 최소 여유”를 정함(0.03~0.10m).
+2. 위치잡음이 있으면 `sigma_k`로 가변 여유 부여(1.0~3.0 추천).
+3. **moving일 때만** `forward_smear_m`으로 “앞쪽 안전거리” 조절(0.1~0.5m).
+
+   * 너무 크면 통로가 과도하게 막힐 수 있음.
+   * 지금 요구처럼 전방만 키우면, 좁은 통로에서도 과도한 차단을 줄일 수 있음.
+
+## 경로 소프트필드(“관통 억제 but 과도 차단 X”)
+
+* `soft_path_only_when_moving` (bool, 기본 true)
+  이동 중일 때만 생성(정지 로봇은 footprint만).
+* `path_sigma_lat_m` (double, 기본 0.25)
+  경로에 **수직(횡)** 방향 표준편차. 작을수록 **가늘고 선명**한 띠.
+* `path_lambda_long_m` (double, 기본 1.5)
+  경로 **진행방향(종)** 감쇠 길이. 작을수록 근거리에서만 영향.
+* `path_cost_base` (int, 기본 180)
+  소프트필드 강도 기본값. 150~210 범위에서 플래너가 “가능하면 피함”.
+* `path_cost_cap` (int, 기본 230)
+  상한값(치사 미만 유지 권장). 210~240 적당.
+* `path_cone_boost` (double, 기본 0.0)
+  전방 콘 형태 추가 가중(0으로 비활성). 필요 시 0.1~0.3 소량만.
+
+**튜닝 순서**
+
+1. 먼저 **footprint 쪽**이 원하는 대로 보이는지(정지=치사, 이동=적절한 여유) 확인.
+2. 소프트필드 가늘기: `path_sigma_lat_m` 0.15~0.30 사이로 조정.
+3. 영향 거리: `path_lambda_long_m` 1.0~2.0 사이. 좁은 통로면 1.2~1.5 추천.
+4. 강도: `path_cost_base` 170~200. 플래너가 가끔 관통하면 +10씩.
+5. 너무 막히면 `path_cost_cap`을 낮추거나 `path_cost_base`를 낮춰 “관통 허용” 여지를 줌.
+6. 정면 충돌 회피를 더 강하게 하고 싶으면 `path_cone_boost`를 0.1~0.2로 아주 작게.
+
+## 기타
+
+* `freshness_timeout_ms` (기본 800ms)
+  에이전트 정보 유효 기간. 통신지연/주기(10Hz 등) 고려해서 0.8~1.2초 권장.
+* `max_poses` (기본 40)
+  truncated_path에서 사용할 포즈 수. 너무 크면 CPU 부담↑, 너무 작으면 띠가 듬성듬성.
+* `publish_meta`, `meta_stride`
+  디버그/시각화 메타 셀 샘플링. 성능/디버깅 균형 맞추기.
+
+---
+
+# 현상/효과 정리
+
+* **이전(문제)**: forward_smear_m 을 반지름에 더해 등방성으로 커짐 → 모든 방향으로 퍼져 통로 과도 차단.
+* **수정 후(의도)**: forward_smear_m 은 로컬 **+x(주행전방)** 으로만 적용 →
+
+  * 정지 로봇: footprint만 (전방 스미어 0).
+  * 이동 로봇: footprint 앞쪽만 길어짐(뒤/옆은 불필요 확장 X).
+  * 경로 소프트필드와 조합해 “우회 선호”는 주되, **치사 차단은 필요 최소**로.
+
+원하시면 제가 위 변경 사항 반영한 전체 파일(hpp/cpp) 버전으로 다시 정리해 드릴게요.
