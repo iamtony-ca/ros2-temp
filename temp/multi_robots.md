@@ -2894,3 +2894,238 @@ void AgentLayer::rasterizeAgentPath(const MultiAgentInfo & a,
   * 경로 소프트필드와 조합해 “우회 선호”는 주되, **치사 차단은 필요 최소**로.
 
 원하시면 제가 위 변경 사항 반영한 전체 파일(hpp/cpp) 버전으로 다시 정리해 드릴게요.
+###########################  
+###############################  
+아래는 요청하신 두 함수만 “완벽히” 작성한 C++ 구현입니다.
+(시그니처는 기존과 동일하게 유지했습니다. 이동 중 전방(+x) 스미어 길이는 **파일-지역 static 변수**를 통해 전달합니다.)
+
+```cpp
+// ===== 파일 상단(또는 본 함수들 위) 보조 유틸 =====
+#include <cmath>
+#include <algorithm>
+#include <utility>
+
+// 전방 스미어 길이를 fillFootprintAt()에 넘기기 위한 파일-지역 변수
+static thread_local double s_forward_len_for_fp = 0.0;
+
+// 로컬 좌표계 폴리곤을 등방성 + 전방(+x)으로만 늘리는 헬퍼
+static inline std::vector<geometry_msgs::msg::Point>
+dilateFootprintDirectional(const std::vector<geometry_msgs::msg::Point32> & in,
+                           double iso_dilate_m,
+                           double forward_len_m)
+{
+  std::vector<geometry_msgs::msg::Point> out; out.reserve(in.size());
+  if (in.empty()) return out;
+
+  // 중심
+  double cx = 0.0, cy = 0.0;
+  for (const auto & p : in) { cx += p.x; cy += p.y; }
+  cx /= static_cast<double>(in.size());
+  cy /= static_cast<double>(in.size());
+
+  for (const auto & p : in) {
+    // 1) 등방성 팽창
+    double vx = p.x - cx, vy = p.y - cy;
+    double n  = std::hypot(vx, vy); if (n < 1e-6) n = 1.0;
+
+    double x_local = p.x + iso_dilate_m * (vx / n);
+    double y_local = p.y + iso_dilate_m * (vy / n);
+
+    // 2) 전방(+x)으로만 추가 확장: 중심 기준 전방측 점들만 밀어냄
+    if (forward_len_m > 1e-6 && (p.x - cx) >= 0.0) {
+      x_local += forward_len_m;
+    }
+
+    geometry_msgs::msg::Point q;
+    q.x = x_local; q.y = y_local; q.z = 0.0;
+    out.push_back(q);
+  }
+  return out;
+}
+
+// 간단한 레이캐스팅 PIP
+static inline bool pointInPoly(const std::vector<geometry_msgs::msg::Point> & poly,
+                               double x, double y)
+{
+  bool inside = false;
+  const size_t n = poly.size();
+  for (size_t i=0, j=n-1; i<n; j=i++) {
+    const double xi = poly[i].x, yi = poly[i].y;
+    const double xj = poly[j].x, yj = poly[j].y;
+    const bool hit = ((yi > y) != (yj > y)) &&
+                     (x < (xj - xi) * (y - yi) / std::max(1e-12, (yj - yi)) + xi);
+    if (hit) inside = !inside;
+  }
+  return inside;
+}
+```
+
+```cpp
+// ====== 1) fillFootprintAt() ======
+void AgentLayer::fillFootprintAt(const geometry_msgs::msg::PolygonStamped & fp,
+                                 const geometry_msgs::msg::Pose & pose,
+                                 double extra_dilation_m,
+                                 nav2_costmap_2d::Costmap2D * grid,
+                                 unsigned char cost,
+                                 std::vector<std::pair<unsigned int,unsigned int>> * meta_hits)
+{
+  // 1) 로컬 폴리곤을 등방성 + 전방(+x)으로만 팽창
+  //    (전방 길이는 thread_local 변수로 전달됨)
+  auto poly_local = dilateFootprintDirectional(fp.polygon.points,
+                                               /*iso_dilate_m*/ extra_dilation_m,
+                                               /*forward_len_m*/ s_forward_len_for_fp);
+
+  // 2) 로컬→월드 변환
+  const double yaw = tf2::getYaw(pose.orientation);
+  const double c = std::cos(yaw), s = std::sin(yaw);
+
+  for (auto & p : poly_local) {
+    const double x = p.x, y = p.y;
+    p.x = pose.position.x + c * x - s * y;
+    p.y = pose.position.y + s * x + c * y;
+  }
+
+  // 3) 월드 bbox
+  double minx=1e9, miny=1e9, maxx=-1e9, maxy=-1e9;
+  for (const auto & p : poly_local) {
+    minx = std::min(minx, p.x); miny = std::min(miny, p.y);
+    maxx = std::max(maxx, p.x); maxy = std::max(maxy, p.y);
+  }
+
+  // 4) 맵 인덱스 범위
+  int min_i, min_j, max_i, max_j;
+  grid->worldToMapEnforceBounds(minx, miny, min_i, min_j);
+  grid->worldToMapEnforceBounds(maxx, maxy, max_i, max_j);
+
+  // 5) 내부 픽셀 채우기 (Max-merge)
+  for (int j = min_j; j <= max_j; ++j) {
+    for (int i = min_i; i <= max_i; ++i) {
+      double wx, wy; grid->mapToWorld(i, j, wx, wy);
+      if (!pointInPoly(poly_local, wx, wy)) continue;
+
+      const unsigned char old = grid->getCost(i, j);
+      if (cost > old) {
+        grid->setCost(static_cast<unsigned int>(i),
+                      static_cast<unsigned int>(j), cost);
+      }
+
+      if (meta_hits) meta_hits->emplace_back(
+          static_cast<unsigned int>(i), static_cast<unsigned int>(j));
+    }
+  }
+
+  // 6) updateBounds()용 터치 영역 기록
+  if (!touched_) {
+    touch_min_x_ = minx; touch_min_y_ = miny;
+    touch_max_x_ = maxx; touch_max_y_ = maxy;
+    touched_ = true;
+  } else {
+    touch_min_x_ = std::min(touch_min_x_, minx);
+    touch_min_y_ = std::min(touch_min_y_, miny);
+    touch_max_x_ = std::max(touch_max_x_, maxx);
+    touch_max_y_ = std::max(touch_max_y_, maxy);
+  }
+}
+```
+
+```cpp
+// ====== 2) rasterizeAgentPath() ======
+void AgentLayer::rasterizeAgentPath(
+  const multi_agent_msgs::msg::MultiAgentInfo & a,
+  nav2_costmap_2d::Costmap2D * grid,
+  std::vector<std::pair<unsigned int,unsigned int>> & meta_hits)
+{
+  if (a.truncated_path.poses.empty()) return;
+
+  // 이동/정지 판별
+  using S = multi_agent_msgs::msg::AgentStatus;
+  const uint8_t ph = a.status.phase;
+  const bool is_moving = (ph == S::STATUS_MOVING) || (ph == S::STATUS_PATH_SEARCHING);
+
+  // 1) 현재 footprint 찍기: 등방성 여유 + (이동중이면) 전방 스미어
+  const unsigned char cost_now = computeCost(a);
+  const double iso_extra = computeDilation(a); // 등방성만 포함(전방 스미어는 별도)
+  s_forward_len_for_fp = is_moving ? forward_smear_m_ : 0.0; // thread_local 전달
+
+  fillFootprintAt(a.footprint, a.current_pose.pose, iso_extra,
+                  grid, cost_now, &meta_hits);
+
+  // 2) 이동 중일 때만 truncated path 소프트 필드 생성 (가늘고 길게)
+  if (soft_path_only_when_moving_ && !is_moving) return;
+
+  const double sigma_lat = std::max(1e-3, path_sigma_lat_m_);   // 횡 방향 표준편차
+  const double lambda    = std::max(1e-3, path_lambda_long_m_); // 종 방향 감쇠 길이 [m]
+  const double res       = grid->getResolution();
+  const int    limit     = std::min<int>(a.truncated_path.poses.size(), max_poses_);
+
+  // 경로 따라가며, 각 포즈 주변(±3sigma) 원 범위에서 가우시안 횡/지수 종 가중으로 코스트 부여
+  double acc_s = 0.0; // 누적 arc-length(대략적인 종 방향 거리)
+  geometry_msgs::msg::Pose last_pose;
+  bool have_last = false;
+
+  for (int k = 0; k < limit; ++k) {
+    const auto & ps = a.truncated_path.poses[k].pose;
+
+    if (have_last) {
+      const double dx = ps.position.x - last_pose.position.x;
+      const double dy = ps.position.y - last_pose.position.y;
+      acc_s += std::hypot(dx, dy);
+    }
+    last_pose = ps; have_last = true;
+
+    // 종방향 감쇠
+    const double long_decay = std::exp(-acc_s / lambda);
+
+    // 작업 창: ±3*sigma_lat
+    const double R = 3.0 * sigma_lat;
+    int min_i, min_j, max_i, max_j;
+    grid->worldToMapEnforceBounds(ps.position.x - R, ps.position.y - R, min_i, min_j);
+    grid->worldToMapEnforceBounds(ps.position.x + R, ps.position.y + R, max_i, max_j);
+
+    // 포즈 기준 yaw (진행방향 정규화용)
+    const double yaw = tf2::getYaw(ps.orientation);
+    const double c = std::cos(yaw), s = std::sin(yaw);
+
+    for (int j = min_j; j <= max_j; ++j) {
+      for (int i = min_i; i <= max_i; ++i) {
+        double wx, wy; grid->mapToWorld(i, j, wx, wy);
+
+        // 포즈 로컬 좌표 (x: 진행, y: 횡)
+        const double dx = wx - ps.position.x;
+        const double dy = wy - ps.position.y;
+        const double x_local =  c * dx + s * dy; // 진행방향
+        const double y_local = -s * dx + c * dy; // 횡(좌우)
+
+        // 횡 방향 가우시안
+        const double d_lat = std::abs(y_local);
+        const double w_lat = std::exp(-0.5 * (d_lat / sigma_lat) * (d_lat / sigma_lat));
+
+        // 최종 코스트
+        double cc = static_cast<double>(path_cost_base_) * long_decay * w_lat;
+        if (cc <= 1.0) continue; // 미미하면 건너뛰기
+
+        const unsigned char new_cost = static_cast<unsigned char>(
+            std::clamp(static_cast<int>(std::round(cc)), 0, path_cost_cap_));
+
+        // Max-merge
+        const unsigned char old = grid->getCost(i, j);
+        if (new_cost > old) {
+          grid->setCost(static_cast<unsigned int>(i),
+                        static_cast<unsigned int>(j), new_cost);
+          meta_hits.emplace_back(static_cast<unsigned int>(i),
+                                 static_cast<unsigned int>(j));
+        }
+      }
+    }
+  }
+
+  // 이후 updateBounds()는 fillFootprintAt() 내부에서 이미 bbox를 갱신했으므로,
+  // path 영역까지 확장 반영이 필요하면 별도 bbox 병합을 추가하세요(옵션).
+}
+```
+
+> 사용법 요약
+>
+> * **전방 스미어 길이**는 `rasterizeAgentPath()`에서 이동 상태일 때만 `s_forward_len_for_fp = forward_smear_m_`로 설정됩니다.
+> * `fillFootprintAt()`는 이 값을 읽어 **로컬 +x 방향으로만** footprint를 늘려 그리며, 나머지는 기존과 동일하게 **Max-merge**로 비용을 씁니다.
+> * 경로 소프트필드는 가늘고(σ=path_sigma_lat_m_) 길게(λ=path_lambda_long_m_) 만들고, **치사 미만(cap)** 으로 묶어 “우회 선호”만 주도록 구성했습니다.
