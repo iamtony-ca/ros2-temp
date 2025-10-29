@@ -56,52 +56,58 @@
 
 #####################  
 ######################  
-네, `spin.cpp` 코드에 등장하는 주요 파라미터들에 대해 설명해 드리겠습니다.
-
-이 파라미터들은 크게 두 가지로 나뉩니다.
-1.  **ROS 2 파라미터**: 노드가 로드될 때 YAML 파일 등을 통해 설정하는 값입니다. (주로 `onConfigure` 함수에서 로드)
-2.  **Behavior Tree 입력 (Action Goal)**: BT XML 파일에서 `Spin` 노드를 호출할 때 `input_port`를 통해 전달하는 값입니다. (주로 `onRun` 함수에서 읽음)
+네, `Spin` 생성자 리스트에 있는 각 멤버 변수들의 역할은 다음과 같습니다.
 
 ---
 
-### 1. ROS 2 파라미터 (YAML 설정)
+### 1. 기반 클래스 및 피드백
 
-이 값들은 `nav2_params.yaml` (또는 설정 파일)의 `spin_behavior` (BT Navigator의 Behavior Server 플러그인 설정) 섹션에서 설정합니다.
+* **`TimedBehavior<SpinAction>()`**
+    * `Spin` 노드의 **기반(Base) 클래스 생성자**입니다.
+    * `Spin`이 Nav2 Behavior Tree의 플러그인으로 동작하는 데 필요한 모든 기본 기능을 초기화합니다. `onRun`, `onCycleUpdate` 같은 핵심 함수와 `end_time_` 같은 타임아웃 로직을 이 클래스로부터 상속받습니다.
 
-* `**simulate_ahead_time**`
-    * **설명**: 충돌 검사를 위해 **미리 시뮬레이션할 시간(초)**입니다.
-    * **용도**: `onCycleUpdate` 루프가 돌 때마다, `isCollisionFree` 함수는 현재 속도로 이 시간만큼 미래에 로봇이 있을 위치까지의 궤적을 계산합니다. 그리고 그 궤적이 Local Costmap 상에서 장애물과 충돌하는지 검사합니다.
-    * **기본값**: 2.0 (초)
-
-* `**max_rotational_vel**`
-    * **설명**: 로봇이 회전할 때 도달할 수 있는 **최대 각속도 (rad/s)**입니다.
-    * **용도**: `onCycleUpdate`에서 계산된 속도(`vel`)가 이 값을 초과하지 않도록 제한합니다.
-    * **기본값**: 1.0 (rad/s)
-
-* `**min_rotational_vel**`
-    * **설명**: 로봇이 회전할 때 유지해야 할 **최소 각속도 (rad/s)**입니다.
-    * **용도**: 목표 각도에 거의 도달하여 계산된 속도가 이 값보다 느려지더라도, 최소한 이 속도로는 회전하도록 보장합니다. 이는 로봇이 너무 느린 속도 명령에 반응하지 않거나 멈칫거리는 현상을 방지합니다.
-    * **기본값**: 0.4 (rad/s)
-
-* `**rotational_acc_lim**`
-    * **설명**: 로봇의 **각가속도 제한 (rad/s²)**입니다.
-    * **용도**: `onCycleUpdate`에서 남은 회전 각도(`remaining_yaw`)를 바탕으로 현재 틱에서 사용할 속도를 계산할 때 사용됩니다. (`vel = sqrt(2 * rotational_acc_lim_ * remaining_yaw)`) 이는 목표 지점에 가까워질수록 부드럽게 감속하는 프로파일을 만드는 데 사용됩니다.
-    * **기본값**: 3.2 (rad/s²)
+* **`feedback_(std::make_shared<SpinAction::Feedback>())`**
+    * **액션(Action) 피드백**을 위한 메시지 객체입니다.
+    * `Spin` 동작이 실행되는 동안 BT(Behavior Tree)나 다른 상위 노드에게 현재 상태를 알리는 데 사용됩니다.
+    * `onCycleUpdate` 루프 내에서 `angular_distance_traveled`(현재까지 회전한 각도) 같은 정보를 담아 게시(publish)합니다.
 
 ---
 
-### 2. Behavior Tree 입력 (Action Goal)
+### 2. ROS 파라미터 (운동 역학 및 시뮬레이션)
 
-이 값들은 Behavior Tree의 XML 파일 내에서 `Spin` 노드에 **Input Port**로 전달됩니다.
+이 변수들은 `onConfigure` 함수에서 ROS 파라미터 서버로부터 값을 읽어와 채워집니다.
 
-* `**target_yaw**`
-    * **설명**: **목표 회전 각도 (rad)**입니다.
-    * **용도**: 로봇이 현재 자세를 기준으로 얼마만큼 회전해야 하는지를 지정합니다. 양수(+)는 반시계 방향(CCW), 음수(-)는 시계 방향(CW) 회전을 의미합니다.
-    * **코드 위치**: `onRun` 함수에서 `command->target_yaw`로 읽어옵니다.
+* **`min_rotational_vel_(0.0)`**
+    * **최소 회전 속도 (rad/s)**입니다. (ROS 파라미터: `min_rotational_vel`)
+    * `onCycleUpdate`에서 속도를 계산할 때, 이 값보다 느려지지 않도록 보장합니다. 로봇이 너무 느리게 움직이거나 멈칫거리는 것을 방지합니다.
 
-* `**time_allowance**`
-    * **설명**: `Spin` 동작을 완료하는 데 허용되는 **최대 시간 (초)**입니다.
-    * **용도**: `onCycleUpdate`에서 이 시간을 초과하면 `Spin` 행동은 `TIMEOUT` 상태로 실패(FAILED) 처리됩니다. 만약 0.0으로 설정하면 시간제한 없이 동작합니다.
-    * **코드 위치**: `onRun` 함수에서 `command->time_allowance`로 읽어옵니다.
+* **`max_rotational_vel_(0.0)`**
+    * **최대 회전 속도 (rad/s)**입니다. (ROS 파라미터: `max_rotational_vel`)
+    * 로봇의 물리적 한계를 넘지 않도록 속도를 제한하는 상한선입니다.
 
-궁금한 점이 더 있으신가요?
+* **`rotational_acc_lim_(0.0)`**
+    * **각가속도 제한 (rad/s²)**입니다. (ROS 파라미터: `rotational_acc_lim`)
+    * 목표 각도까지 부드럽게 감속하며 도달하기 위한 속도를 계산할 때 사용됩니다. (`vel = sqrt(2 * accel * remaining_angle)` 공식에 사용됨)
+
+* **`simulate_ahead_time_(0.0)`**
+    * **미래 시뮬레이션 시간 (sec)**입니다. (ROS 파라미터: `simulate_ahead_time`)
+    * `isCollisionFree` 함수가 충돌 검사를 수행할 때, **현재 속도로 "몇 초" 앞의 미래까지를 예측하여 검사할지** 결정합니다. 기본값은 2.0초입니다.
+
+---
+
+### 3. 내부 상태 변수 (State Tracking)
+
+이 변수들은 `Spin` 동작이 실행되는 동안 내부적으로 상태를 추적하기 위해 사용됩니다.
+
+* **`cmd_yaw_(0.0)`**
+    * **목표 회전 각도 (rad)**입니다.
+    * `onRun`이 호출될 때 BT로부터 전달받은 최종 목표 회전량(예: 1.57 rad)을 저장합니다.
+
+* **`prev_yaw_(0.0)`**
+    * **이전 틱(tick)의 Yaw (rad)**입니다.
+    * `onCycleUpdate`가 매번 호출될 때마다, 직전 주기에서 측정한 로봇의 Yaw 값을 저장하는 데 사용됩니다. *현재* Yaw 값과의 차이(`delta_yaw`)를 계산하기 위해 필요합니다.
+
+* **`relative_yaw_(0.0)`**
+    * **누적 상대 회전 각도 (rad)**입니다.
+    * `Spin` 동작이 시작된 후 **현재까지 실제로 회전한 총 각도**를 누적합니다.
+    * `onRun`에서 0으로 초기화되며, `onCycleUpdate`에서 계산된 `delta_yaw`가 이 변수에 계속 더해집니다. 이 값이 `cmd_yaw_`에 도달하면 동작이 성공합니다.
