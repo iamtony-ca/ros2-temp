@@ -341,3 +341,61 @@ return true; // 충돌 없음
 `Spin` 노드는 **제자리 회전 경로를 따라 여러 개의 미래 자세(pose)를 생성**하고, `local_collision_checker_`는 **그 각각의 미래 자세에서 로봇의 Footprint가 Local Costmap 상의 장애물과 겹치는지**를 검사합니다.
 
 `simulate_ahead_time` 동안의 시뮬레이션 경로 중 단 한 지점이라도 충돌이 예상되면, `Spin` 노드는 즉시 `FAILED`를 반환하고 로봇을 정지시킵니다.
+
+###################  
+######################  
+
+그 핵심 로직은 `Spin` 코드(`spin.cpp`)가 아니라, `Spin`이 사용하는 **`local_collision_checker_`** 내부에 있습니다.
+
+이 `local_collision_checker_`는 `behavior_server`가 로드하는 별도의 플러그인이며, Nav2의 기본 설정에서는 `nav2_costmap_2d` 패키지의 **`CostmapAwareCollisionChecker`** 클래스가 이 역할을 수행합니다.
+
+따라서 사용자님이 찾으시는 로직은 크게 두 단계의 파일에 나뉘어 있습니다.
+
+---
+
+### 1. 📍 Collision Checker (플러그인): `CostmapAwareCollisionChecker`
+
+`Spin` 노드가 `isCollisionFree`를 호출할 때, 실제로는 이 클래스의 함수가 실행됩니다.
+
+* **패키지**: `nav2_costmap_2d`
+* **파일**: `nav2_costmap_2d/src/costmap_aware_collision_checker.cpp`
+* **핵심 함수**: `CostmapAwareCollisionChecker::isCollisionFree()`
+
+이 함수의 역할은 다음과 같습니다.
+1.  `Spin` 노드로부터 전달받은 `pose2d` (시뮬레이션된 미래 자세)를 사용합니다.
+2.  `behavior_server`로부터 **최신 Local Costmap** (`costmap_`)을 가져옵니다.
+3.  로봇의 **Footprint** (`footprint_`)를 가져옵니다.
+4.  이 Footprint를 `pose2d`에 맞게 변환(transform)합니다.
+5.  변환된 Footprint가 Costmap과 겹치는지 검사하기 위해, **Costmap2D 클래스의 `footprintCost()` 함수를 호출**합니다.
+
+---
+
+### 2. 🔍 실제 픽셀 검사 로직 (Costmap2D)
+
+`CostmapAwareCollisionChecker`가 호출하는 `footprintCost()` 함수에 바로 사용자님이 궁금해하신 "Footprint와 LETHAL/INSCRIBED 영역이 겹치는지" 확인하는 **실제 픽셀 단위 검사 로직**이 들어있습니다.
+
+* **패키지**: `nav2_costmap_2d`
+* **파일**: `nav2_costmap_2d/src/costmap_2d.cpp`
+* **핵심 함수**: `Costmap2D::footprintCost()`
+
+#### `footprintCost()`의 동작 방식
+
+이 함수는 매우 효율적으로 설계되어 있습니다.
+
+1.  **입력**: 변환된 로봇의 Footprint (꼭짓점들의 리스트)를 입력으로 받습니다.
+2.  **다각형(Polygon) 스캔**: 이 Footprint가 Costmap 그리드 상에서 어떤 셀(픽셀)들을 덮는지 계산합니다. (다각형 내부를 채우는 래스터화(rasterization)와 유사)
+3.  **셀 순회**: Footprint 내부에 포함되는 **모든 Costmap 셀**을 하나씩 순회(iterate)합니다.
+4.  **Cost 값 확인**: 각 셀의 Cost 값을 읽습니다.
+5.  **충돌 판정**:
+    * 만약 순회 중인 셀의 Cost 값이 `LETHAL_OBSTACLE` (254) 또는 `INSCRIBED_OBSTACLE` (253)이면, **더 이상 검사하지 않고 즉시 해당 Cost 값을 반환**합니다.
+    * Footprint 내부의 모든 셀을 검사했는데 LETHAL/INSCRIBED가 없으면, 그중 가장 높았던 Cost 값(예: `CIRCUMSCRIBED_COST` 또는 `FREE_SPACE`)을 반환합니다.
+
+---
+
+### 요약
+
+`Spin` 노드의 충돌 검사는 다음과 같은 3단 구조로 이루어집니다.
+
+1.  **`Spin` (in `nav2_behaviors`)**: "앞으로 2초간 회전할 건데, 이 경로 상의 자세들(`pose2d` 리스트)이 안전한지 알려줘."
+2.  **`CostmapAwareCollisionChecker` (in `nav2_costmap_2d`)**: "알았어. 네가 준 각 `pose2d`마다 Footprint를 변환해서, `Costmap2D`에게 이 Footprint 영역의 비용(cost)이 얼마인지 물어볼게."
+3.  **`Costmap2D` (in `nav2_costmap_2d`)**: "내가 가진 Costmap 그리드에서 그 Footprint 내부의 모든 픽셀을 스캔할게. 어! 여기 `LETHAL_OBSTACLE` 픽셀이 하나 걸렸네. 즉시 '충돌'이라고 보고할게."
