@@ -3969,3 +3969,133 @@ local_costmap:
 
 필요하면 이 YAML을 현재 쓰시는 파일에 **global/local costmap 블록만 병합**해서 써도 됩니다.
 혹시 TB3가 아닌 실제 로봇이라 Lidar FoV나 footprint가 다르면, `footprint`, `inflation_radius`, `obstacle_range`를 먼저 맞춰 주세요.
+########################  
+########################  
+좋은 포인트예요. “예전엔 보였는데 지금은 아예 안 보인다”라면, 아래 **두 군데**가 유력한 범인입니다. 둘 다 지금 올려주신 코드에 그대로 있습니다.
+
+---
+
+# 1) Max-merge 조건이 `NO_INFORMATION(255)`에 져서 아예 안 찍힘
+
+지금 `fillFootprintAt()`에서 이렇게 병합하고 있죠:
+
+```cpp
+const unsigned char old = grid->getCost(i, j);
+if (cost > old) {
+  grid->setCost(i, j, cost);
+}
+```
+
+Nav2의 기본 cost 값은:
+
+* `FREE_SPACE = 0`
+* `LETHAL_OBSTACLE = 254`
+* `NO_INFORMATION = 255`
+
+초기 맵 영역이 `NO_INFORMATION(255)`인 셀이라면, `moving_cost=180`, `waiting_cost=200` 같은 “정상적인” 값은 **절대 255보다 클 수 없어서** 위 조건이 성립하지 않습니다. 즉, **단 한 셀도 쓰지 못해** 레이어가 통째로 안 보입니다.
+
+### 수정 (추천)
+
+`NO_INFORMATION`이면 비교 기준을 0으로 간주해서 “비어있는 셀”로 취급하고, 그 외엔 Max-merge:
+
+```cpp
+const unsigned char old_raw = grid->getCost(i, j);
+const unsigned char old = (old_raw == nav2_costmap_2d::NO_INFORMATION) ? 0 : old_raw;
+
+if (cost > old) {
+  grid->setCost((unsigned int)i, (unsigned int)j, cost);
+}
+```
+
+이 2줄만 바꿔도, **UNKNOWN 영역에도 정상적으로 코스트가 찍혀서** RViz에 보입니다.
+(참고: 전역맵이 StaticLayer로 이미 채워진 곳이라면 `old`가 0~252대라 그대로도 보였을 거라, “예전엔 보였는데 지금은 안 보임” 현상이 재현됩니다.)
+
+---
+
+# 2) `updateBounds()`가 프레임 불일치로 **통째로 `continue;`** 해서 bounds를 전혀 안 만짐
+
+지금 `updateBounds()` 흐름이 이렇습니다:
+
+```cpp
+// ROI 통과 후...
+// (문제) 여기서 frame 불일치면 continue로 에이전트 전체 skip
+if (use_path_header_frame_ && a.truncated_path.header.frame_id != global_frame) {
+  continue;
+}
+
+// 그 다음에 '현재 위치 + truncated path'를 bounds에 반영
+{ /* current_pose -> bounds */ }
+for (...) { /* path poses -> bounds */ }
+```
+
+즉, **경로 헤더 frame이 `map`과 다르면 현재 위치조차 bounds에 포함 안 되고** `touched_`가 false로 남습니다. 그러면 이 레이어가 “이번 사이클에 업데이트할 영역 없다”고 선언하는 것과 같아서, 상위가 우리 레이어의 `updateCosts()`를 안 부르거나, 업데이트 윈도우가 0으로 잡혀 시각적으로 아무것도 안 보일 수 있습니다. (이전 버전에서 보였던 건 이 `continue`가 없었기 때문일 가능성 큽니다.)
+
+### 수정 (추천)
+
+* **현재 위치는 항상 bounds에 포함**하세요.
+* **경로 포즈만** 프레임 불일치 시 건너뜁니다.
+
+```cpp
+// 1) 현재 위치는 항상 bounds에 포함
+{
+  const auto & p = a.current_pose.pose.position;
+  touch_min_x_ = std::min(touch_min_x_, p.x);
+  touch_min_y_ = std::min(touch_min_y_, p.y);
+  touch_max_x_ = std::max(touch_max_x_, p.x);
+  touch_max_y_ = std::max(touch_max_y_, p.y);
+  touched_ = true;
+}
+
+// 2) truncated_path는 frame 일치할 때만 bounds에 반영
+if (!use_path_header_frame_ || a.truncated_path.header.frame_id == global_frame) {
+  const int limit = std::min<int>(a.truncated_path.poses.size(), max_poses_);
+  for (int i = 0; i < limit; ++i) {
+    const auto & p = a.truncated_path.poses[i].pose.position;
+    touch_min_x_ = std::min(touch_min_x_, p.x);
+    touch_min_y_ = std::min(touch_min_y_, p.y);
+    touch_max_x_ = std::max(touch_max_x_, p.x);
+    touch_max_y_ = std::max(touch_max_y_, p.y);
+    touched_ = true;
+  }
+}
+```
+
+> 참고: `rasterizeAgentPath()`는 이미 “현재 위치는 무조건 찍고(path는 주석처리)”라서, **bounds만 제대로 만져주면** 상위에서 정상적으로 갱신 창을 열고 우리가 찍은 값이 보이게 됩니다.
+
+---
+
+## 체크리스트 (빠르게 확인)
+
+1. **merge 로직 수정했는지?**
+
+   * `old_raw==255`일 때 0으로 바꿔 비교했는지.
+
+2. **bounds 로직 수정했는지?**
+
+   * `current_pose`는 프레임 상관없이 bounds에 포함시키고,
+   * `truncated_path`만 프레임 일치 시 포함했는지.
+
+3. **여전히 안 보이면**
+
+   * `lethal_cost`만 254, 나머지는 180~210이면 잘 보입니다.
+   * `roi_range_m`가 너무 작아 에이전트까지 못 미치진 않는지.
+   * `freshness_timeout_ms`보다 오래된 메시지(stale) 아닌지.
+   * `use_path_header_frame=true`인데 pub되는 `truncated_path.header.frame_id`가 `map`인지 확인. (`ros2 topic echo`로 frame 확인)
+
+---
+
+## 패치 요약
+
+* `fillFootprintAt()` 안의 병합부만 이렇게 교체:
+
+```cpp
+const unsigned char old_raw = grid->getCost(i, j);
+const unsigned char old = (old_raw == nav2_costmap_2d::NO_INFORMATION) ? 0 : old_raw;
+if (cost > old) {
+  grid->setCost((unsigned int)i, (unsigned int)j, cost);
+}
+```
+
+* `updateBounds()`에서 **현재 위치는 항상 bounds 포함**, 경로는 프레임 일치시에만 포함(위 코드블록 그대로).
+
+이 두 군데만 바꾸면, 이전과 동일한 입력으로도 다시 RViz에 다른 로봇이 **안정적으로** 보일 거예요.
