@@ -407,3 +407,62 @@ sudo netfilter-persistent save
 ---
 
 필요하면 너의 실제 내부망 대역(10.40.?.?), PC1의 인터페이스 이름(예: `enp3s0`/`eth0`), 현재 NAT 유무를 반영해서 **복붙 즉시 적용 가능한 스크립트** 형태로 딱 정리해 줄게.
+########################  
+#########################  
+네, 돼요. PC2가 10.42.* 대역이면 `-s 10.40.0.0/16` 자리를 `-s 10.42.0.0/16`으로 바꿔주면 됩니다. (혹은 PC2 한 대만 막고 싶으면 `-s 10.42.x.y/32`처럼 정확한 IP로 좁히면 돼요.)
+
+아래는 10.42 대역 기준 예시입니다.
+
+## HTTPS(443) 차단 (Ollama Cloud 접속 끊기)
+
+```bash
+sudo iptables -A FORWARD -s 10.42.0.0/16 -d 34.117.123.45 -p tcp --dport 443 -j DROP
+sudo iptables -A FORWARD -s 10.42.0.0/16 -d 104.18.11.89 -p tcp --dport 443 -j DROP
+```
+
+## (선택) DNS까지 차단해서 nslookup도 못 하게
+
+```bash
+sudo iptables -A FORWARD -s 10.42.0.0/16 -p udp --dport 53 -j DROP
+sudo iptables -A FORWARD -s 10.42.0.0/16 -p tcp --dport 53 -j DROP
+```
+
+## 규칙 확인/저장
+
+```bash
+sudo iptables -L FORWARD -v -n
+sudo apt -y install netfilter-persistent
+sudo netfilter-persistent save
+```
+
+## 이전 10.40 대역 규칙 지우기 (있다면)
+
+규칙 번호 확인:
+
+```bash
+sudo iptables -L FORWARD -v -n --line-numbers
+```
+
+해당 번호로 삭제:
+
+```bash
+sudo iptables -D FORWARD <번호>
+```
+
+끝나면 다시 저장:
+
+```bash
+sudo netfilter-persistent save
+```
+
+### 팁
+
+* PC2 한 대만 막고 싶으면 `-s 10.42.x.y/32`처럼 /32로 지정하면 다른 장비는 영향 없음.
+* 10.42.* 안의 여러 장비를 모두 막고 싶으면 지금처럼 /16(또는 실제 서브넷에 맞춰 /24 등) 사용.
+* 실제 서브넷 확인:
+
+  * PC2에서 `ip -4 addr`로 IP/마스크 확인
+  * PC1에서 `ip route`로 내부망 프리픽스 확인
+* IP가 바뀔 수 있는 Ollama 측(클라우드/CDN)을 더 튼튼히 막고 싶으면 ipset을 써서 목적지 IP 목록을 관리하는 방식도 좋아요.
+
+필요하면 네 환경(정확한 PC2 IP/서브넷, NAT 인터페이스) 기준으로 복붙 스크립트 버전도 만들어줄게요.
