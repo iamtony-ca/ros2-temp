@@ -3328,3 +3328,97 @@ float64[] y                      # 경로상의 최초 충돌 지점 y
 float32[]  ttc_first                     # 최초 추돌 예상시각 [s], 모르면 음수
 string[]   note 
 ```
+########################  
+#########################  
+#########################  
+이 에러는 **서로 다른 시간 소스(Clock Type)의 rclcpp::Time 끼리 뺄셈**을 해서 터진 겁니다.
+메시지 타임스탬프(예: `msg->header.stamp`)는 “소스가 없는” `builtin_interfaces/Time` 이고, 당신 노드의 `this->now()` 는 노드의 Clock 타입(ROS_TIME / SYSTEM_TIME)을 따릅니다. 지금 코드에서
+
+* `last_agents_stamp_ = msg->header.stamp;`
+* `if ((this->now() - last_agents_stamp_).nanoseconds() > ...) { ... }`
+
+처럼 섞어 쓰면서 **[1 != 2]** (예: ROS_TIME vs SYSTEM_TIME) 충돌이 났습니다.
+`last_replan_time_`의 초기값(디폴트 생성)과 `this->now()`의 Clock 타입이 달라도 같은 문제가 납니다.
+
+아래처럼 “**항상 같은 Clock Type으로 래핑**”해주면 해결됩니다.
+
+---
+
+# 필수 패치(최소 수정)
+
+### 1) 생성자에서 기준 Clock Type 확보 & 초기화
+
+```cpp
+// ctor 끝부분 어딘가에서, 반드시 한 번 실행
+const rcl_clock_type_t CT = this->get_clock()->get_clock_type();
+
+// last_replan_time_을 노드 clock 타입으로 초기화(에폭 0)
+last_replan_time_ = rclcpp::Time(0, 0, CT);
+```
+
+### 2) Agents 콜백에서 stamp를 노드 clock 타입으로 변환해 저장
+
+```cpp
+void PathValidatorNode::agentsCallback(
+    const multi_agent_msgs::msg::MultiAgentInfoArray::SharedPtr msg)
+{
+  std::lock_guard<std::mutex> lock(agents_mutex_);
+  last_agents_ = msg;
+
+  // ★ 핵심: 노드 clock 타입으로 래핑
+  const auto CT = this->get_clock()->get_clock_type();
+  last_agents_stamp_ = rclcpp::Time(msg->header.stamp, CT);
+}
+```
+
+### 3) freshness 체크도 같은 타입으로
+
+```cpp
+// whoCoversPoint() 내부 freshness 체크 부분을 다음처럼 유지하면 OK
+if ((this->now() - last_agents_stamp_).nanoseconds() >
+     static_cast<int64_t>(agents_freshness_timeout_ms_) * 1000000LL) {
+  return out;
+}
+```
+
+### 4) replan 쿨다운도 같은 타입으로
+
+```cpp
+void PathValidatorNode::triggerReplan(const std::string & reason)
+{
+  const rclcpp::Time now = this->now();  // 노드 clock
+  // last_replan_time_은 ctor에서 같은 clock으로 초기화됨
+  if ((now - last_replan_time_).seconds() <= cooldown_sec_) {
+    return;
+  }
+  last_replan_time_ = now;
+  ...
+}
+```
+
+> 위 네 군데만 고치면 `can't subtract times with different time sources`는 사라집니다.
+
+---
+
+# 권장(선택) 개선
+
+* **지속시간 측정(쿨다운, DB 만료 등)은 STEADY_CLOCK 사용**이 가장 안전합니다(시뮬/ROS time 변경 영향 없음).
+  예: `rclcpp::Clock steady_clock(RCL_STEADY_TIME);`를 멤버로 두고,
+  `rclcpp::Time now_steady = steady_clock.now();` 로 쿨다운/DB시간을 관리.
+  (메시지/헤더에 넣는 stamp 는 기존대로 `this->now()` 유지)
+
+* 다른 메시지 stamp 를 내부 상태로 저장할 때도 동일 원칙:
+  `rclcpp::Time(msg->header.stamp, this->get_clock()->get_clock_type())`
+
+---
+
+# 왜 이런 일이 생기나?
+
+* ROS2 에서 `rclcpp::Time` 은 **Clock Type** 을 가진 시간입니다(ROS_TIME, SYSTEM_TIME, STEADY_TIME 등).
+* `this->now()` 는 노드의 현재 Clock(보통 시스템 시간, `use_sim_time=true`면 ROS 시간).
+* 반면 `builtin_interfaces/Time` → `rclcpp::Time` 로 암시 변환하면 **SYSTEM_TIME** 로 잡히는 경우가 많습니다.
+* 그래서 ROS_TIME(1) - SYSTEM_TIME(2) 처럼 타입이 다르면 예외가 납니다.
+
+---
+
+필요하면 제가 **STEADY_CLOCK 버전으로 리팩터링한 diff**도 바로 만들어 줄게요.
