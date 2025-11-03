@@ -3605,3 +3605,189 @@ bool agentMaskBlockedNearWorld(double wx, double wy,
 * [ ] 지워지지 않는 큰 코스트는 **AgentLayer 합성 방식 리팩터**(내부맵 사용 + `updateWithMax()`).
 
 필요하면 AgentLayer 쪽도 “내부맵 + 클리어 + updateWithMax”로 바꾼 완전체 코드를 다시 내줄게.
+
+  #################  
+  ##################  
+오케이—지금 상황은 “마스터 코스트맵으로 막힘은 인지 → 리플랜 트리거 OK”인데, “agent 유래인지 판별해서 PathAgentCollisionInfo 퍼블리시”가 안 되는 거죠. 대부분 아래 3가지 중 하나 때문에 그렇습니다.
+
+1. **에이전트 마스크(costmap_raw)와 마스터 코스트맵의 좌표 변환/메타 불일치**
+2. **에이전트 마스크 자체가 안 들어오거나(latest 없는 상태) QoS 미스매치**
+3. **마스크 확인 통과에 실패해서(약간 비켜간 셀/threshold/버퍼 문제) footprint 직접 대조까지 안 가는 로직 흐름**
+
+아래 “확인 체크리스트”를 먼저 돌리고, 바로 효과가 나는 **코드 패치(디버그 로그 + 강건화)** 를 붙여드립니다.
+
+---
+
+# 빠른 확인 체크리스트 (1분 점검)
+
+* `ros2 topic echo /agent_layer/costmap_raw/metadata | head -n 30`
+  `resolution, origin(x,y), size_x,y` 값이 **/global_costmap/costmap_raw** 와 다를 수 있어요. 다르면 **반드시 월드좌표로 매칭**해야 합니다(아래 패치에서 해결).
+
+* `ros2 topic hz /agent_layer/costmap_raw`
+  수신이 0Hz면 마스크가 안 들어옵니다 → `compare_agent_mask:=false` 로 먼저 테스트해 보세요(아래 ❷).
+
+* `ros2 topic echo /multi_agent_infos | head`
+  프레임이 `map` 인지, 타임스탬프가 최신인지 확인. Stale이면 히트 안 납니다(아래에서 freshness 로그 추가).
+
+* `agent_cost_threshold` 임시로 **180** 까지 낮추고, `agent_mask_manhattan_buffer:=2` 로 넉넉하게.
+
+---
+
+# 바로 적용하는 코드 패치 (핵심 4가지)
+
+## ❶ 마스크-확인: 반드시 월드좌표로 검사 + 진단 로그 추가
+
+이미 월드좌표 기반 함수 추가하셨다면, **호출부에서 로그와 fallback을 추가**하세요.
+
+```cpp
+// (validateWithPoints / validateWithFootprint)에서 blocked_here가 true일 때:
+
+double wx, wy;
+{
+  std::lock_guard<std::mutex> lock(costmap_mutex_);
+  costmap->mapToWorld(hit_mx, hit_my, wx, wy);
+}
+
+// 1) 에이전트 마스크 사용 시: 월드좌표로 검사
+bool agent_hit_mask = false;
+if (compare_agent_mask_) {
+  if (!agent_mask_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+      "[agent-mask] agent_mask_ not ready yet (no messages on %s)",
+      agent_mask_topic_.c_str());
+  } else {
+    agent_hit_mask = agentMaskBlockedNearWorld(
+        wx, wy,
+        static_cast<unsigned char>(agent_cost_threshold_),
+        agent_mask_manhattan_buffer_);
+    RCLCPP_DEBUG(get_logger(),
+      "[agent-mask] @ (%.3f, %.3f) hit=%s thr=%.0f buf=%d",
+      wx, wy, agent_hit_mask ? "true":"false",
+      agent_cost_threshold_, agent_mask_manhattan_buffer_);
+  }
+}
+```
+
+## ❷ 마스크 없을 때도 **footprint 직접 대조로 에이전트 판정**(옵션)
+
+마스크가 없거나 히트 실패해도, 진짜 에이전트이면 **footprint 겹침(whoCoversPoint)** 으로 잡을 수 있어야 합니다.
+아래처럼 **새 파라미터**를 하나 두고, false로 두면 footprint만으로도 충돌 메시지를 퍼블리시하게 만드세요.
+
+```cpp
+// HPP에 파라미터 추가
+bool require_agent_mask_confirmation_{true};
+
+// 생성자에서 declare + get:
+declare_parameter("require_agent_mask_confirmation", true);
+require_agent_mask_confirmation_ = get_parameter("require_agent_mask_confirmation").as_bool();
+
+// 퍼블리시 분기:
+bool should_publish_agent = false;
+if (compare_agent_mask_) {
+  if (agent_hit_mask) {
+    should_publish_agent = true;
+  } else if (!require_agent_mask_confirmation_) {
+    RCLCPP_DEBUG(get_logger(), "[agent-mask] no hit, but fallback to footprint-match is enabled");
+    should_publish_agent = true;  // 마스크 미확인이라도 footprint로 시도
+  }
+} else {
+  should_publish_agent = true; // 마스크 비교 자체를 끔
+}
+
+if (should_publish_agent && publish_agent_collision_) {
+  auto hits = whoCoversPoint(wx, wy);
+  RCLCPP_DEBUG(get_logger(), "[whoCoversPoint] matches=%zu", hits.size());
+  if (!hits.empty()) {
+    publishAgentCollisionList(hits);
+  } else {
+    RCLCPP_DEBUG(get_logger(), "[whoCoversPoint] no agent polygon covers the point");
+  }
+}
+```
+
+> 테스트 팁: 일단 `compare_agent_mask:=false` 로 돌려보면, **마스크 없이 footprint로만** 잡는지 바로 확인 가능합니다. 이게 되면 마스크 경로/메타/QoS 문제로 좁혀집니다.
+
+## ❸ `MultiAgentInfoArray` freshness & frame 진단 로그
+
+```cpp
+std::lock_guard<std::mutex> lk(agents_mutex_);
+if (!last_agents_) {
+  RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "[agents] no data yet on %s", agents_topic_.c_str());
+  return out;
+}
+const auto age_ns = (this->now() - last_agents_stamp_).nanoseconds();
+if (age_ns > static_cast<int64_t>(agents_freshness_timeout_ms_) * 1000000LL) {
+  RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+    "[agents] stale: age=%.3fs > %dms", age_ns*1e-9, agents_freshness_timeout_ms_);
+  return out;
+}
+if (!last_agents_->header.frame_id.empty() && last_agents_->header.frame_id != global_frame_) {
+  RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+    "[agents] frame mismatch: agents='%s' vs global='%s'",
+    last_agents_->header.frame_id.c_str(), global_frame_.c_str());
+  return out;
+}
+```
+
+## ❹ `last_agents_stamp_` clock type 맞추기
+
+```cpp
+last_agents_stamp_ = rclcpp::Time(msg->header.stamp, this->get_clock()->get_clock_type());
+```
+
+---
+
+# 예상되는 원인별 “즉시 효과” 튜닝
+
+* **마스크가 안 온다/메타 다르다** → `compare_agent_mask:=false` 먼저 시도.
+  이 상태에서 충돌 메시지가 뜨면, 문제는 마스크 경로/메타(QoS 포함)입니다.
+
+* **셀 살짝 빗나감** → `agent_mask_manhattan_buffer:=2` 또는 `3`.
+  코스트맵 해상도가 0.05m라면, 2~3 셀 버퍼는 0.1~0.15m 여유.
+
+* **threshold 과도** → `agent_cost_threshold:=180 ~ 220`에서 먼저 감도 확인.
+
+* **footprint 매칭이 빡빡** → `agent_match_dilate_m:=0.10 ~ 0.15` 로 키워서 도형을 살짝 확장.
+
+---
+
+# “커진 코스트가 안 없어지는 현상” 재확인
+
+그건 `AgentLayer`가 **마스터 그리드에 직접 setCost**하는 패턴일 때 흔히 생깁니다.
+가능한 빨리 **내부 costmap_ 사용 + 각 사이클 클리어 + `updateWithMax()`** 구조로 바꾸세요.
+(원하시면 이 부분 완전체 코드도 다시 정리해 드릴게요.)
+
+---
+
+# 최소 실행 예시(강추 파라미터)
+
+```bash
+# 1) 먼저 마스크 비교 끄고 footprint 매칭만으로 충돌 퍼블리시가 되는지 확인
+ros2 run replan_monitor path_validator_node \
+  --ros-args -p compare_agent_mask:=false \
+             -p publish_agent_collision:=true \
+             -p use_footprint_check:=true \
+             -p footprint_step_m:=0.1 \
+             -p cost_threshold:=200.0 \
+             -p consecutive_threshold:=2 \
+             -p agent_match_dilate_m:=0.12
+```
+
+→ 이 상태에서 **충돌 메시지 뜨면** 마스크쪽 문제 확정.
+
+```bash
+# 2) 마스크 다시 켜되, 확인 강제하지 않고(footprint fallback 허용)
+ros2 run replan_monitor path_validator_node \
+  --ros-args -p compare_agent_mask:=true \
+             -p require_agent_mask_confirmation:=false \
+             -p agent_mask_topic:=/agent_layer/costmap_raw \
+             -p agent_cost_threshold:=200.0 \
+             -p agent_mask_manhattan_buffer:=2
+```
+
+→ 여기서도 잘 뜨면, 마지막으로 `require_agent_mask_confirmation:=true` 로 엄격 모드 복귀.
+
+---
+
+필요하면, 수정한 조각을 붙여서 **통째 파일** 형태로도 정리해 줄게요.
+일단 위 패치 4개만 넣고 `compare_agent_mask:=false`로 테스트 → OK 확인 → 점차 엄격하게 올리는 순서로 가면 빠르게 원인이 좁혀집니다.
