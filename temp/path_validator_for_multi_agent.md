@@ -3120,3 +3120,193 @@ void PathValidatorNode::triggerReplan(const std::string & reason)
 
 원하는 흐름(마스터 차단 → agent_mask 확인 → 실제 MultiAgent로 가해자 식별 → 커스텀 메시지 퍼블리시)을 그대로 구현해 두었어.
 테스트하면서 매칭이 과하거나 부족하면 `agent_mask_manhattan_buffer`, `agent_match_dilate_m`, `agent_cost_threshold`를 먼저 손봐줘.
+#####################  
+######################  
+좋아! 아래에 **`path_validator_node`**용 샘플 `yaml`과, 포함된 **모든 파라미터 설명**을 정리했어. 그대로 붙여 넣고 값만 너 환경에 맞게 바꾸면 된다.
+
+---
+
+# 샘플 `nav2_params.yaml` (혹은 별도 params 파일)
+
+```yaml
+path_validator_node:
+  ros__parameters:
+
+    # --- 좌표계 / TF ---
+    global_frame: "map"
+    base_frame: "base_link"
+
+    # --- 리플랜 트리거 일반 조건 ---
+    cooldown_sec: 1.0                 # 리플랜 트리거 쿨다운(초)
+    consecutive_threshold: 3           # 연속 차단 포인트 개수 임계값
+    obstacle_persistence_sec: 0.5      # 차단 셀의 지속 시간 요구치(초)
+    max_speed: 0.5                     # 로봇 속도 상한(lookahead 계산용)
+    lookahead_time_sec: 15.0           # 속도 기반 lookahead 시간(초)
+    min_lookahead_m: 2.0               # lookahead 최소 거리(m)
+    cost_threshold: 200.0              # 마스터 코스트맵 차단 임계(권장: 200~254)
+    ignore_unknown: true               # NO_INFORMATION(255) 무시 여부
+
+    # --- 차단 후보 DB(ROI 스캔) ---
+    db_update_frequency: 5.0           # DB 갱신 주기(Hz)
+    obstacle_prune_timeout_sec: 3.0    # DB에서 관측 끊긴 셀 제거 시간(초)
+    db_stride: 2                       # ROI 스캔 격자 스텝(1=전셀, 2=샘플링)
+    cone_angle_deg: 100.0              # 전방 부채꼴 각도(도)
+    kernel_half_size: 1                # 2*K+1 커널(1 => 3x3)로 주변 셀 검사
+
+    # --- 경로 검사 범위 ---
+    path_check_distance_m: 6.0         # 경로 따라 검사하는 최대 거리(m)
+
+    # --- 리플랜 플래그 퍼블리시 ---
+    publish_false_pulse: true          # true 펄스 후 false로 클리어할지
+    flag_pulse_ms: 120                 # false 펄스 지연(ms)
+
+    # --- 검사 방식 전환(포인트 vs 로봇 footprint) ---
+    use_footprint_check: false         # true면 footprint 방식, false면 점방식
+    footprint_step_m: 0.15             # footprint 방식에서 경로 샘플 간격(m)
+
+    # --- 에이전트 마스크(AgentLayer 코스트맵) 비교 ---
+    compare_agent_mask: true
+    agent_mask_topic: "/agent_layer/costmap_raw"  # AgentLayer가 퍼블리시하는 마스크 토픽
+    agent_cost_threshold: 254.0        # 에이전트 마스크에서 차단으로 간주하는 임계
+    agent_mask_manhattan_buffer: 1     # 맨해튼 반경(셀) 내에 마스크가 있으면 히트로 간주
+
+    # --- MultiAgentInfoArray 연동(가해자 식별용) ---
+    agents_topic: "/multi_agent_infos" # MultiAgentInfoArray 토픽
+    agents_freshness_timeout_ms: 800   # 최신 에이전트 정보 허용 지연(ms)
+    agent_match_dilate_m: 0.05         # 가해자 매칭 시 footprint 소확장(m)
+
+    # --- 충돌 메타 퍼블리시(커스텀 메시지) ---
+    publish_agent_collision: true
+    agent_collision_topic: "/path_agent_collision_info"
+
+    # --- Nav2 footprint/radius (둘 중 하나만 실사용) ---
+    # footprint 가 유효한 다각형 문자열이면 그것을 사용,
+    # 아니면 robot_radius 를 원형 발자국으로 사용
+    footprint: "[]"                    # 예: "[[0.3,0.25],[0.3,-0.25],[-0.3,-0.25],[-0.3,0.25]]"
+    robot_radius: 0.30                 # footprint 미지정 시 사용되는 반지름(m)
+```
+
+> 노드 이름(`path_validator_node`)은 실행 파일에서 쓰는 실제 이름과 맞춰줘.
+
+---
+
+# 파라미터 상세 설명
+
+### 좌표계 / TF
+
+* **`global_frame`** *(string, default: `"map"`)*
+  내부 모든 연산(코스트맵, 경로, 에이전트)을 맞추는 기준 프레임.
+* **`base_frame`** *(string, default: `"base_link"`)*
+  로봇의 베이스 링크 프레임. 현재 포즈 TF 조회에 사용.
+
+### 리플랜 트리거 일반 조건
+
+* **`cooldown_sec`** *(double, 1.0)*
+  리플랜 트리거 후 다음 트리거까지 최소 대기시간.
+* **`consecutive_threshold`** *(int, 3)*
+  경로를 따라 연속으로 “차단” 판정된 샘플 수가 이 값 이상이면 리플랜.
+* **`obstacle_persistence_sec`** *(double, 0.5)*
+  동일 셀이 일정 시간 이상 연속으로 차단이어야 “진짜 장애물”로 간주.
+* **`max_speed`** *(double, 0.5 m/s)*
+  lookahead 거리 산정(= `max_speed * lookahead_time_sec`)에 사용되는 상한.
+* **`lookahead_time_sec`** *(double, 15.0)*
+  속도 기반 lookahead 시간. 실제 검사 거리는 `min_lookahead_m`와의 max를 사용.
+* **`min_lookahead_m`** *(double, 2.0 m)*
+  lookahead 최소 거리 하한.
+* **`cost_threshold`** *(double, 200.0)*
+  글로벌(마스터) 코스트맵에서 차단으로 간주할 최소 코스트.
+
+  * 레이저/장애물/인플레이션 포함 전체 코스트 기준.
+  * 엄격하게 하려면 254, 살짝 여유는 200~240 권장.
+* **`ignore_unknown`** *(bool, true)*
+  코스트 255(NO_INFORMATION)를 무시할지 여부.
+
+### 차단 후보 DB (전방 ROI 스캔)
+
+* **`db_update_frequency`** *(double, 5.0 Hz)*
+  전방 ROI를 스캔해 “차단 후보 셀” DB를 갱신하는 주기.
+* **`obstacle_prune_timeout_sec`** *(double, 3.0)*
+  DB에 저장된 셀이 이 시간 동안 안 보이면 제거.
+* **`db_stride`** *(int, 2)*
+  ROI 스캔 시 샘플링 스텝(셀 단위). 1이면 모든 셀 검사.
+* **`cone_angle_deg`** *(double, 100.0°)*
+  로봇 헤딩 기준 전방 부채꼴 각. 전방성 강조용.
+* **`kernel_half_size`** *(int, 1)*
+  포인트 검사에서 주변 `(2K+1)x(2K+1)` 셀을 함께 차단으로 볼지.
+
+### 경로 검사 범위
+
+* **`path_check_distance_m`** *(double, 6.0 m)*
+  경로를 따라 검사하는 최대 거리(lookahead 거리와의 min 사용).
+
+### 리플랜 플래그 퍼블리시
+
+* **`publish_false_pulse`** *(bool, true)*
+  `/replan_flag`를 true로 쏜 뒤, 잠시 후 false 한번 더 쏘아주는지.
+* **`flag_pulse_ms`** *(int, 120 ms)*
+  false 펄스 지연 시간.
+
+### 검사 방식 전환
+
+* **`use_footprint_check`** *(bool, false)*
+
+  * `false`: 경로의 포인트(혹은 소커널)만 검사 → 가볍고 빠름.
+  * `true`: 로봇 **footprint**(원형/다각형)를 경로 샘플마다 채워서 검사 → 충돌 실제성↑.
+* **`footprint_step_m`** *(double, 0.15 m)*
+  footprint 방식에서 경로 샘플 간격. 너무 작으면 무거워짐.
+
+### 에이전트 마스크(AgentLayer) 비교
+
+* **`compare_agent_mask`** *(bool, true)*
+  마스터 코스트맵에서 차단이 보이면, **에이전트 마스크**에서도 같은 위치가 lethal인지 확인.
+  → 다른 로봇이 원인인지 판별.
+* **`agent_mask_topic`** *(string, `"/agent_layer/costmap_raw"`)*
+  `AgentLayer`가 퍼블리시하는 전용 costmap_raw 토픽.
+* **`agent_cost_threshold`** *(double, 254.0)*
+  에이전트 마스크에서 차단으로 볼 최소 코스트(보통 lethal).
+* **`agent_mask_manhattan_buffer`** *(int, 1)*
+  (mx,my) 주변 맨해튼 반경 안에 에이전트 마스크가 있으면 히트로 인정.
+  센서/해상도 오차 흡수.
+
+### MultiAgentInfoArray 연동 (가해자 식별)
+
+* **`agents_topic`** *(string, `"/multi_agent_infos"`)*
+  다른 로봇 상태/발자국/경로가 들어 있는 토픽.
+* **`agents_freshness_timeout_ms`** *(int, 800 ms)*
+  최신 에이전트 메시지가 이 시간 이내여야 가해자 판정에 사용.
+* **`agent_match_dilate_m`** *(double, 0.05 m)*
+  가해자 매칭 시 상대 footprint를 소폭 키워 겹침 허용오차 확보.
+
+### 충돌 메타 퍼블리시 (커스텀 메시지)
+
+* **`publish_agent_collision`** *(bool, true)*
+  가해자 판정이 나면 `PathAgentCollisionInfo`를 퍼블리시할지.
+* **`agent_collision_topic`** *(string, `"/path_agent_collision_info"`)*
+  커스텀 메시지 퍼블리시 토픽.
+
+### Nav2 footprint / radius
+
+* **`footprint`** *(string, `"[]"`)*
+  다각형 footprint 문자열. 유효하면 **이 값을 우선** 사용.
+  예시:
+  `[[0.30,0.25],[0.30,-0.25],[-0.30,-0.25],[-0.30,0.25]]`
+* **`robot_radius`** *(double, 0.30 m)*
+  `footprint`가 비었거나 파싱 실패 시 **원형 footprint**로 사용되는 반지름.
+
+---
+
+## 튜닝 가이드 (짧게)
+
+* **민감도(리플랜 많이 뜸)**
+  `cost_threshold` 낮춤(200→170), `consecutive_threshold` 낮춤(3→2),
+  `kernel_half_size`↑, `use_footprint_check`=true, `footprint_step_m`↓.
+* **보수적(오탐 줄임)**
+  `cost_threshold`↑(200→254), `consecutive_threshold`↑,
+  `obstacle_persistence_sec`↑, `agent_mask_manhattan_buffer`↓.
+* **에이전트 판별 강도**
+  더 강하게: `agent_cost_threshold`=254, `agent_mask_manhattan_buffer`=0~1
+  느슨하게: `agent_cost_threshold`=200, `agent_mask_manhattan_buffer`=2~3
+* **성능**
+  `use_footprint_check=false`(가벼움), `db_stride`↑, `footprint_step_m`↑.
+
+필요하면 네 현재 맵 해상도, footprint, 마스크 특성에 맞춰 초깃값을 추천해줄게!
