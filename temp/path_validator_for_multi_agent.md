@@ -3422,3 +3422,186 @@ void PathValidatorNode::triggerReplan(const std::string & reason)
 ---
 
 필요하면 제가 **STEADY_CLOCK 버전으로 리팩터링한 diff**도 바로 만들어 줄게요.
+######################  
+#######################  
+########################  
+좋아, 증상 3가지를 각각 정리해서 **원인 → 수정 포인트(코드) → 체크리스트**로 바로 잡아줄게.
+
+---
+
+# 1) `what(): can't subtract times with different time sources` 해결
+
+`last_replan_time_`만 초기화해 준 걸로 1차 해결됐지만, **`MultiAgentInfoArray`의 `header.stamp`와 노드 clock 타입이 다르면** 똑같은 문제가 다른 경로(가해자 식별 freshness 체크)에서도 다시 터질 수 있어요.
+→ **에이전트 메시지의 stamp도 노드 clock 타입으로 래핑해서 저장**해야 합니다.
+
+### 수정 (CPP)
+
+```cpp
+// 기존
+// last_agents_stamp_ = msg->header.stamp;
+
+// 변경
+last_agents_stamp_ = rclcpp::Time(msg->header.stamp, this->get_clock()->get_clock_type());
+```
+
+그리고 비교부에서도 굳이 캐스팅할 필요 없이 지금처럼 `this->now()`와 뺄셈하면 clock type이 맞으니 OK.
+
+---
+
+# 2) 에이전트 충돌 메타가 안 퍼블리시되는 원인 (마스터 vs 에이전트 costmap 인덱스 불일치)
+
+현재 코드는 마스터 코스트맵에서 찾은 `(mx,my)` **인덱스를 그대로** 에이전트 마스크에서 검사해요.
+하지만 **두 코스트맵의 origin / resolution / size가 조금이라도 다르면** 같은 인덱스가 다른 세계좌표를 가리킵니다. 그래서 agent 마스크 히트를 **영영 못 잡는** 경우가 생겨요.
+
+### 해결 전략
+
+* 마스터에서 차단 셀을 찾으면 **반드시 (wx, wy) 월드좌표**로 바꾸고,
+* 에이전트 마스크는 **그 월드좌표를 `worldToMap`** 해서 자기 인덱스 공간으로 변환한 뒤 주변을 검사해야 합니다.
+
+### 헤더(HPP) 변경
+
+```cpp
+// 기존
+inline bool agentCellBlockedNear(unsigned int mx, unsigned int my,
+                                 unsigned char thr, int manhattan_buf) const;
+
+// 추가 (월드좌표 기반 검사)
+bool agentMaskBlockedNearWorld(double wx, double wy,
+                               unsigned char thr, int manhattan_buf) const;
+```
+
+### 구현(CPP) 추가
+
+```cpp
+bool PathValidatorNode::agentMaskBlockedNearWorld(double wx, double wy,
+                                                  unsigned char thr, int manhattan_buf) const
+{
+  std::lock_guard<std::mutex> lock(agent_mask_mutex_);
+  if (!agent_mask_) return false;
+
+  unsigned int cx, cy;
+  if (!agent_mask_->worldToMap(wx, wy, cx, cy)) {
+    return false;
+  }
+
+  const int sx = static_cast<int>(agent_mask_->getSizeInCellsX());
+  const int sy = static_cast<int>(agent_mask_->getSizeInCellsY());
+  const int ix = static_cast<int>(cx);
+  const int iy = static_cast<int>(cy);
+
+  for (int dx = -manhattan_buf; dx <= manhattan_buf; ++dx) {
+    for (int dy = -manhattan_buf; dy <= manhattan_buf; ++dy) {
+      if (std::abs(dx) + std::abs(dy) > manhattan_buf) continue;
+      const int x = ix + dx;
+      const int y = iy + dy;
+      if (x < 0 || y < 0 || x >= sx || y >= sy) continue;
+
+      const unsigned char a = agent_mask_->getCost(static_cast<unsigned int>(x),
+                                                   static_cast<unsigned int>(y));
+      if (a >= thr) return true;
+    }
+  }
+  return false;
+}
+```
+
+### 호출부 변경(포인트 방식)
+
+```cpp
+// 기존 (마스터 인덱스 바로 검사)
+const bool agent_hit = agentCellBlockedNear(mx, my,
+                         static_cast<unsigned char>(agent_cost_threshold_),
+                         agent_mask_manhattan_buffer_);
+
+// 변경 (월드좌표로 변환 후 에이전트 마스크 검사)
+double wx, wy;
+{
+  std::lock_guard<std::mutex> lock(costmap_mutex_);
+  costmap_->mapToWorld(mx, my, wx, wy);
+}
+const bool agent_hit = agentMaskBlockedNearWorld(wx, wy,
+                        static_cast<unsigned char>(agent_cost_threshold_),
+                        agent_mask_manhattan_buffer_);
+```
+
+### 호출부 변경(footprint 방식)
+
+```cpp
+// 기존
+const bool agent_hit = agentCellBlockedNear(hit_mx, hit_my, agent_thr,
+                                            agent_mask_manhattan_buffer_);
+
+// 변경
+double wx, wy; {
+  std::lock_guard<std::mutex> lock(costmap_mutex_);
+  costmap->mapToWorld(hit_mx, hit_my, wx, wy);
+}
+const bool agent_hit = agentMaskBlockedNearWorld(wx, wy, agent_thr,
+                                                 agent_mask_manhattan_buffer_);
+```
+
+이렇게 하면 **마스터/에이전트 코스트맵 메타데이터가 달라도** 정확히 매칭돼서, agent 유래 충돌을 안정적으로 검출하고 `PathAgentCollisionInfo`가 퍼집니다.
+
+> 팁: 우선 값이 잘 나오나 보려면 `agent_cost_threshold`를 임시로 `200.0` 정도로 낮춰 테스트해 보세요. 이후 254로 올려 타이트하게 쓰면 됩니다.
+
+---
+
+# 3) “다른 로봇보다 약간 크게 생긴 코스트가 안 사라짐” 원인
+
+이건 `path_validator_node`가 아니라 **`AgentLayer` 구현 방식** 때문에 생길 확률이 매우 높습니다.
+
+* 지금 `AgentLayer`가 **`master_grid.setCost()`로 직접 마스터에 그려 넣는 방식**(Max-merge 수동 구현)일 텐데,
+  이 방법은 **에이전트가 사라져도 지난 프레임 셀을 지울 방법이 없습니다.**
+* 정석은: **이 레이어의 내부 costmap(`costmap_`)에만 그림 → 각 주기마다 해당 레이어 내부맵을 초기화(clear) → 마지막에 `updateWithMax()`(혹은 Overwrite)** 로 마스터에 합치는 구조입니다. 이렇게 해야 **에이전트가 사라지면 자동으로 흔적이 지워**져요.
+
+### 빠른 임시 방편 (AgentLayer 쪽)
+
+* 최소한 `updateCosts()` 시작 시 **지난 번 touched bounds를 FREE_SPACE로 초기화**하고 다시 그리도록 바꾸세요.
+  하지만 이것도 안전치 않습니다(정확한 bound 계산/클리어가 어렵고 race가 생길 수 있음).
+* **권장:** Nav2 튜토리얼 패턴처럼 **내부맵 사용 + `updateWithMax()`** 로 리팩터링하세요.
+
+---
+
+# 4) 전체 패치 요약 (넣어야 할 것만 정리)
+
+아래 4군데만 바꾸면 됩니다.
+
+## (A) `agentsCallback`에서 stamp 저장
+
+```cpp
+void PathValidatorNode::agentsCallback(
+  const multi_agent_msgs::msg::MultiAgentInfoArray::SharedPtr msg)
+{
+  std::lock_guard<std::mutex> lock(agents_mutex_);
+  last_agents_ = msg;
+  last_agents_stamp_ = rclcpp::Time(msg->header.stamp, this->get_clock()->get_clock_type());
+}
+```
+
+## (B) HPP에 월드좌표 기반 검사 시그니처 추가
+
+```cpp
+bool agentMaskBlockedNearWorld(double wx, double wy,
+                               unsigned char thr, int manhattan_buf) const;
+```
+
+## (C) CPP에 `agentMaskBlockedNearWorld` 구현 추가
+
+(위에 제시한 그대로)
+
+## (D) 두 군데 호출부 수정
+
+* `validateWithPoints()` 내부: 마스터 인덱스→월드좌표로 바꿔 `agentMaskBlockedNearWorld()` 호출
+* `validateWithFootprint()` 내부: `hit_mx, hit_my`→월드좌표→`agentMaskBlockedNearWorld()` 호출
+
+---
+
+# 5) 빠른 체크리스트
+
+* [ ] `agent_mask_topic`의 코스트맵 메타(해상도/원점/크기)가 글로벌과 다를 수 있습니다 → **월드좌표로 매칭**하도록 위 패치 적용.
+* [ ] `agent_cost_threshold`를 200으로 낮춰 먼저 **히트되는지 확인**, 이후 254로 조정.
+* [ ] `agents_freshness_timeout_ms`를 1000~1500ms로 잠깐 넉넉하게 주고 실시간 히트 확인.
+* [ ] 충돌 발생 시 `PathAgentCollisionInfo` 실제 값(IDs, x,y, ttc, note) 확인.
+* [ ] 지워지지 않는 큰 코스트는 **AgentLayer 합성 방식 리팩터**(내부맵 사용 + `updateWithMax()`).
+
+필요하면 AgentLayer 쪽도 “내부맵 + 클리어 + updateWithMax”로 바꾼 완전체 코드를 다시 내줄게.
