@@ -970,3 +970,258 @@ if (cost > old) {
 * `updateBounds()`에서 **현재 위치는 항상 bounds 포함**, 경로는 프레임 일치시에만 포함(위 코드블록 그대로).
 
 이 두 군데만 바꾸면, 이전과 동일한 입력으로도 다시 RViz에 다른 로봇이 **안정적으로** 보일 거예요.
+#######################################  
+#########################################  
+########################################3  
+좋아요—공유해준 메시지/플러그인/노드들을 전부 훑어보고, 시스템 전반 구조와 각 컴포넌트의 상호작용, 잠재 버그/설계 이슈, 즉시 적용 가능한 패치 제안까지 정리했어. (ROS 2 Jazzy / Nav2 / C++17 & Python 기준)
+
+# 전체 구조 한눈에 보기
+
+```
+[MultiAgentInfoArray (map 프레임)]
+   ├─ 발행: 여러분의 상위 상태 추정/통신 노드(가정)
+   │   • agents[i]: 현재 pose, twist, footprint, truncated_path(프레임=map), 상태/모드 등
+   │
+   ├─ 구독: AgentLayer (Nav2 costmap layer plugin)
+   │   • 타 에이전트 footprint(+방향성 팽창) 및 truncated_path 튜브를 costmap에 rasterize
+   │   • /agent_layer/costmap_raw (agent mask) 퍼블리시
+   │
+   ├─ 구독: PathValidatorNode
+   │   • 현재 글로벌 costmap + agent mask 대조로 경로 충돌성 검사
+   │   • MultiAgentInfoArray 기반으로 '어떤 에이전트가 이 셀을 유발하는가' 식별
+   │   • /path_agent_collision_info 퍼블리시
+   │
+   └─ 구독: FleetDecisionNode
+       • /path_agent_collision_info 받아 후보(Candidate) 산출
+       • YIELD/SLOWDOWN/STOP/RUN/REPLAN/REROUTE 상태 결정 & 펄스 토픽 발행
+```
+
+# 메시지 정의 요약
+
+* `MultiAgentInfoArray` / `MultiAgentInfo`:
+
+  * `current_pose`, `current_twist`, `footprint(PolygonStamped)`, `truncated_path(Path)`(frame 일치 요구), 다양한 운용 플래그/품질 메타 포함.
+* `AgentStatus`:
+
+  * 상위 phase enum.
+* `PathAgentCollisionInfo`:
+
+  * 경로상의 최초 충돌 지점들에 대한 “에이전트 유래” 메타(희소 리스트).
+
+# 모듈별 정밀 리뷰
+
+## 1) AgentLayer (Nav2 costmap Layer plugin)
+
+### 설계 포인트
+
+* **등방성 팽창(dilation)** 과 **전방 스미어(forward smear)** 를 분리.
+* 이동 상태(`STATUS_MOVING` or `STATUS_PATH_SEARCHING`)에만 전방 스미어 적용.
+* 현재 위치는 강하게 찍고, `truncated_path`는 **얇게(iso_extra*0.5) & 전방 스미어 미적용**으로 포착.
+* `roi_range_m_`, `freshness_timeout_ms_`, `max_poses_` 등 방어적 파라미터 존재.
+
+### 좋은 점
+
+* 프레임 일치 검사(`use_path_header_frame_`)로 좌표계 혼선 방지.
+* `publish_meta_`로 히트셀 샘플을 진단용(디버그/분석)으로 내보낼 수 있음.
+* 스레드 안전: 마지막 메시지 스냅샷을 락으로 보호한 뒤 복사해 사용.
+
+### 주의/이슈
+
+1. **RViz 형상 이상(“소시지/반원 덩어리” 효과)**
+   현재 `truncated_path`의 **모든 포즈**에서 footprint를 찍고 있어, 포즈 간 간격이 촘촘하면 길쭉하고 굵은 튜브가 생깁니다. 과도한 차단·시각적 왜곡의 원인.
+
+2. **path 프레임 검사 지점**
+   `updateBounds()`에서 `use_path_header_frame_`를 `truncated_path.header.frame_id`로 체크하지만, `updateCosts()`에서는 프레임 불일치에 대한 early return이 없음. (실제 rasterize는 pose 자체 좌표를 그대로 월드로 간주하므로, 배열 프레임이 틀리면 위치가 엉킬 수 있음)
+
+3. **전방 스미어 방향 정의**
+   `dilateFootprintDirectional()`이 **로컬 +x** 방향을 “전방”으로 가정 → pose yaw로 월드변환하므로 로봇 heading에 정합됨. 다만 폴리곤 중심 기준으로 **cx보다 x≥cx**인 꼭짓점만 밀기 때문에, **뾰족한 앞/뒤 비대칭 footprint**가 아닌 **정사각형**에서는 앞 절반 꼭짓점만 이동 → 모서리 기준으로 살짝 비틀어진 외곽선이 만들어질 수 있음(시각적으로 약간 어색할 수 있음).
+
+4. **코스트 병합 정책**
+   Max-merge로 충분히 보수적. 단, 다른 레이어와 병합시 과도한 “lethal 벽”이 생길 수도 있어, 이동 중/정지 중 코스트 단계와 forward smear 길이를 상황별로 더 분리하면 tuning이 쉬워짐.
+
+### 권장 수정 (패치 제안)
+
+* **경로 포즈 stride 적용** (거리 기반 간격 샘플링 + 포즈 수 상한):
+
+  ```cpp
+  // rasterizeAgentPath() 내 루프 교체: 거리 누적 스텝
+  const double stride_m = std::max(0.1, 0.5 * grid->getResolution()); // 파라미터화 권장
+  double acc = 0.0;
+  geometry_msgs::msg::Point last = a.truncated_path.poses.front().pose.position;
+
+  const int limit = std::min<int>(a.truncated_path.poses.size(), max_poses_);
+  for (int i = 0; i < limit; ++i) {
+    const auto & ps = a.truncated_path.poses[i].pose;
+    if (i > 0) {
+      acc += std::hypot(ps.position.x - last.x, ps.position.y - last.y);
+      if (acc < stride_m) continue;
+      acc = 0.0;
+      last = ps.position;
+    }
+    // 경로 footprint는 더 얇고 낮은 코스트로
+    constexpr double kPathDilateScale = 0.4;
+    const double path_iso = iso_extra * kPathDilateScale;
+    const unsigned char path_cost = std::min<unsigned char>(computeCost(a), 170); // moving<waiting보다 낮게도 가능
+    fillFootprintAt(a.footprint, ps, path_iso, /*forward_len=*/0.0, grid, path_cost, &meta_hits);
+  }
+  ```
+* **프레임 일치 강제**: `updateCosts()`에도 frame mismatch 시 건너뛰기.
+* **전방 스미어 파라미터화**: `forward_smear_m_moving`, `forward_smear_m_waiting=0` 처럼 두 단계로 노출.
+* **디버그 토픽**: 실제 래스터라이즈한 world bbox/stride 적용 결과를 Marker로 시각화(옵션).
+
+---
+
+## 2) PathValidatorNode (C++)
+
+### 설계 포인트
+
+* `/global_costmap/costmap_raw` + (옵션) `/agent_layer/costmap_raw`(agent mask)을 수신.
+* ROI/시야각 기반 장애물 DB 구축 → 일정 시간 지속된 셀만 “성숙” 장애물로 간주.
+* 경로 검증 모드 두 가지:
+
+  * **포인트 기반**(`validateWithPoints`) — 빠름.
+  * **footprint 기반**(`validateWithFootprint`) — 정밀.
+* **우선순위**: 충돌 셀 발견 시 **항상 에이전트 유래 여부를 먼저 판단**(`whoCoversPoint`) → 맞으면 `PathAgentCollisionInfo` 퍼블리시 & 에이전트 홀드 타이머 가동.
+* `whoCoversPoint`는
+
+  * (1) **에이전트 현재 footprint**(소확장) 포함 여부,
+  * (2) **truncated_path 튜브** 포함 여부(간격 stride/dilate)
+    순서로 검사.
+
+### 좋은 점
+
+* 에이전트 충돌이면 일반 장애물 replan을 억제하는 **홀드** 로직이 있어 진동(replanning flapping)을 완화.
+* footprint/튜브 매칭이 **프레임 일치**를 기본 전제로 둠(`MultiAgentInfoArray.header.frame_id` vs `global_frame_`)—스펙과 일치.
+
+### 주의/이슈
+
+1. **스레싱 방지(쿨다운, 홀드)**는 잘 들어가 있지만, `compare_agent_mask_`가 켜져 있을 때 **agent mask 근처** 셀을 에이전트 충돌로 오판정할 수도 있음. 다만 보조 조건으로만 쓰고, 결국 `whoCoversPoint`에 다시 의존하므로 안전.
+2. `agent_path_hit_max_poses`가 크면 연산량↑. stride를 충분히 크게 유지해야 함.
+3. `agent_cost_threshold_`와 AgentLayer의 코스트 등급이 괴리되면 false negative/positive가 생길 수 있음(튜닝 포인트).
+
+### 권장 수정/팁
+
+* `whoCoversPoint()`에서 `truncated_path.header.frame_id`가 `global_frame_`와 다를 때 **해당 에이전트 path 튜브 검사를 skip**하도록 안전장치 추가(현재는 Array header만 점검).
+* 튜브 매칭 stride/dilate를 **AgentLayer의 path stride 및 iso 스케일과 대응**시키면 일관성↑.
+* `/path_agent_collision_info`에 **우리(my_id)도 포함**되어 들어올 수 없도록(지금도 제외하지만) 방어 코드 유지.
+
+---
+
+## 3) FleetDecisionNode (Python)
+
+### 설계 포인트
+
+* 이벤트 드리븐 상태기계:
+
+  * 입력: `/path_agent_collision_info`, `/multi_agent_infos`, `/replan_flag`.
+  * 출력: 상태 스트링 `/decision_state`, 그리고 one-shot 제어 펄스 `/cmd/run|slowdown|yield|stop`, 요청 펄스 `/request_replan|reroute`.
+* 후보(Candidate) 스코어 = **충돌 심각도(severity)** × **양보 우선(yprio)**(kappa 가중).
+
+  * 심각도: 1/T, 1/d, 상대 heading, closing 속도 반영.
+  * yprio: 상대 mode(수동), right-of-way(occupancy+ID), 상대가 reroute 중인지, PATH_SEARCHING인지 등.
+* 진입 규칙: `T_eff`와 `yprio`로 SLOWDOWN/YIELD/… 판정, resume 히스테리시스와 timeout/idle-resume 탑재.
+
+### **심각한 버그 (필수 수정)**
+
+* **토픽 타입 불일치**
+  Python에서 `from replan_monitor_msgs.msg import PathAgentCollisionInfo`로 import하고 구독하지만, **퍼블리셔는 C++ 쪽에서 `multi_agent_msgs::msg::PathAgentCollisionInfo`** 를 발행하고 있어요.
+  ▶︎ **수정**:
+
+  ```py
+  # 잘못된 라인
+  # from replan_monitor_msgs.msg import PathAgentCollisionInfo
+
+  # 교체
+  from multi_agent_msgs.msg import PathAgentCollisionInfo
+  ```
+
+  이거 하나로 “충돌 이벤트가 안 들어온다/상태가 안 바뀐다” 류의 증상 대부분이 해결될 가능성이 큽니다.
+
+### 논리 이슈/개선 포인트
+
+1. **상호 대칭으로 인한 동시 YIELD / 동시 RUN 가능성**
+
+   * 이미 `id_bonus()`와 `right_of_way_score()`에서 **ID 비대칭(작은 ID 우선)** 을 주긴 하지만, 현재 가중/임계치 조합에 따라 **동시에 같은 결론**이 날 수 있음.
+   * 해결책(권장):
+
+     * **결정 타이브레이커를 명시적으로 적용**: 동일 조건일 때 `my_id < other_id`이면 RUN 우선, 반대는 YIELD 등 **하드 룰**을 추가.
+     * **미세 offset을 ID로 섞기**: `T_yield`, `Y_th`에 `±ε*(my_id-other_id)` 같은 비대칭 오프셋을 주어 동률 붕괴.
+     * **의사소통 기반 의도교환(optional)**: `/agent_intent` 같은 토픽으로 현재 의도(RUN/YIELD)를 퍼블리시하고, 상대 의도를 반영해 상충 방지.
+     * **중앙 심판/락(optional)**: 교차 구간 `area_id` 기준 “토큰(권리증)”을 선점하는 방식.
+
+2. **`right_of_way_score()`와 `id_bonus()`의 중복 효과**
+
+   * 둘 다 ID에 의한 우선권 가산이 들어감(ROW에서 `<my_id` +0.5, id_bonus에서 `my_id>other_id` +1.0). 의도보다 **ID 영향력이 과대**일 수 있어 튜닝 필요.
+
+3. **`combine_ttc()`의 대체 TTC 가중**
+
+   * v_closing < 0.05이면 `T_alt = inf`로 처리돼서, 정지/역방향 에이전트에 좀 둔감. 실제로는 lateral 접근/회전 등도 위험할 수 있으니, **lateral velocity/회전**을 섞을 여지 있음(차후 개선).
+
+4. **reroute 판정 트리거**
+
+   * `decide_with_primary()`에서 “상대가 reroute고 yprio 높음 → REROUTE” 규칙은 시스템마다 공격적일 수 있음. 실사용에서는 `REROUTE` 트리거를 좀 더 보수적으로(예: T_eff< T_yield*0.8 + yprio>Y_th) 추천.
+
+5. **프레임 일치/정합 검사**
+
+   * `build_candidates()` → `match_agent_at_point()`는 전부 map 좌표 가정. 상위 스펙에 의존하고 있지만, 방어적으로 `MultiAgentInfoArray.header.frame_id == global_frame` 미일치 시 candidates 비우는 것도 방법(안전성↑).
+
+---
+
+# “RViz 형상이 이상하다” 원인 분석 & 해결 요약
+
+* **원인**: AgentLayer가 `truncated_path`의 **모든 포즈**에 대해 footprint를 페인트 → 촘촘한 포즈라면 과도한 겹침/두꺼운 튜브. 게다가 iso 확장도 더해져 **반원/소시지**처럼 보임.
+* **해결**:
+
+  1. **거리 기반 stride**(예: 0.2~0.4 m)로 path 포즈 샘플링.
+  2. path 포즈에서는 **전방 스미어 0** & **등방 확장 스케일 0.3~0.5**로 축소.
+  3. (옵션) path 코스트는 현재 위치보다 **낮게**(예: waiting 200, moving 180라면 path는 150~170).
+  4. (옵션) `max_poses_`를 줄이거나, ROI 범위 내 포즈만 고려.
+  5. (옵션) path를 **선분 스윕**으로 rasterize(두 pose 사이 선분을 footprint로 Minkowski-sum 근사)하면 시각적으로 매끈하고 차단도 덜 과격.
+
+---
+
+# 즉시 적용 체크리스트
+
+* [ ] **FleetDecisionNode**: `PathAgentCollisionInfo` **import 패키지 교체** (반드시!)
+* [ ] **AgentLayer**: `truncated_path` stride 적용 + path 코스트/팽창 축소.
+* [ ] **AgentLayer**: `updateCosts()`에서도 프레임 불일치 시 skip.
+* [ ] **PathValidatorNode**: `whoCoversPoint()`에서 path header frame 체크 추가.
+* [ ] **동시 의사결정 방지**: FleetDecisionNode에 **명시적 타이브레이커**(ID 기반 ε-오프셋 또는 하드 룰) 추가.
+* [ ] **코스트/임계 동조화**: `agent_cost_threshold_`(PathValidator) ↔ AgentLayer의 moving/waiting/path 코스트 레벨 재튜닝.
+* [ ] **RViz 진단**: AgentLayer meta/marker로 stride 적용 전후 bbox를 시각화해 개입 효과 확인.
+
+---
+
+# 추천 파라미터 시작값(현장 튜닝 가이드)
+
+* AgentLayer:
+
+  * `dilation_m`: 0.05 ~ 0.1
+  * `forward_smear_m`: 0.15(이동) / 0.0(정지)
+  * `max_poses`: 120
+  * **추가** `path_stride_m`: 0.25
+  * **추가** `path_iso_scale`: 0.4
+  * **추가** `path_cost`: 160
+* PathValidatorNode:
+
+  * `agent_path_hit_stride_m`: 0.30
+  * `agent_path_hit_dilate_m`: 0.02 ~ 0.04
+  * `agent_cost_threshold`: AgentLayer path_cost보다 약간 낮거나 동일(예: 160)
+* FleetDecisionNode:
+
+  * `T_yield`: 2.5 (기본)
+  * `T_slow`: 6.0 (기본)
+  * `yield_priority_thresh(Y_th)`: 0.8 (기본)
+  * **추가** `tie_break_eps`: 0.1 → `T_yield' = T_yield ± eps*(my_id<other_id ? +1 : -1)`
+
+---
+
+# 마무리
+
+구조 자체는 잘 짜여있고(AgentLayer → PathValidator → FleetDecision의 파이프라인), **한 가지 큰 타입 불일치 버그**와 **AgentLayer의 path 래스터 전략**이 현재 관측된 문제의 핵심이야. 위의 간단 패치들만 반영해도:
+
+* **충돌 이벤트 흐름**이 정상화되고,
+* RViz 시각화/차단이 **과도하게 두꺼운 튜브**가 아닌, **의도한 “얇은 미리보기 튜브”**로 개선될 거야,
+* 양쪽 로봇이 **동시에 YIELD/RUN**하는 대칭 문제도 **결정 타이브레이커**로 실질적으로 사라질 것.
+
+원하면, 내가 제안한 C++/Python 패치 조각을 여러분 레포 포맷에 맞춰 **완전한 diff**로 정리해줄게.
