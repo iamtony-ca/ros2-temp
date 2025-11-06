@@ -1225,3 +1225,808 @@ if (cost > old) {
 * 양쪽 로봇이 **동시에 YIELD/RUN**하는 대칭 문제도 **결정 타이브레이커**로 실질적으로 사라질 것.
 
 원하면, 내가 제안한 C++/Python 패치 조각을 여러분 레포 포맷에 맞춰 **완전한 diff**로 정리해줄게.
+###########################  
+##############################  
+################################  
+멋져. 아래는 **AgentLayer 전 파라미터 레퍼런스 + 튜닝 가이드**(ROS 2 Jazzy / Nav2 / C++17 기준)야. 각 항목은 “무엇”, “왜”, “권장값/범위”, “주의점” 순서로 정리했어. 마지막에 **샘플 YAML**과 **상황별 프리셋**도 붙였어.
+
+---
+
+# 파라미터 레퍼런스 (설명 + 튜닝 가이드)
+
+## 기본/입출력
+
+* `enabled` (bool, default: `true`)
+
+  * **무엇**: 레이어 on/off.
+  * **권장**: 실환경 `true`. 문제 디버깅 시 일시적으로 `false`.
+
+* `topic` (string, default: `"/multi_agent_infos"`)
+
+  * **무엇**: `MultiAgentInfoArray` 구독 토픽.
+  * **주의**: PathValidatorNode, 발행 노드와 동일하게.
+
+* `self_machine_id` (int, default: `0`), `self_type_id` (string, default: `""`)
+
+  * **무엇**: **자기 로봇** 식별. AgentLayer는 “타 로봇”만 칠함.
+  * **권장**: 반드시 실제 값으로 설정(안 그러면 자기 자신도 마킹될 수 있음).
+
+* `use_path_header_frame` (bool, default: `true`)
+
+  * **무엇**: `truncated_path.header.frame_id`가 costmap 글로벌 프레임과 **일치할 때만** 반영.
+  * **권장**: `true`. 프레임 혼선 방지. 프레임 변환을 외부에서 보장할 수 없으면 `true` 유지.
+
+* `qos_reliable` (bool, default: `true`)
+
+  * **무엇**: 구독 QoS 신뢰성 모드.
+  * **권장**: 유선/신뢰 네트워크 `reliable`; 무선·패킷 드롭 환경은 `false`(best_effort)로 바꿔 드랍 복원성 확보.
+
+## ROI/신선도
+
+* `roi_range_m` (double, default: `12.0`)
+
+  * **무엇**: 자기 로봇 기준, 이 반경 내 타 로봇만 래스터.
+  * **권장**: 실내 8~15 m. 넓게 잡으면 CPU 증가 + 불필요 차단.
+  * **팁**: 글로벌 costmap 해상도·속도 범위를 고려해 “정지~1~2초 내 상호작용 거리” 정도로.
+
+* `freshness_timeout_ms` (int, default: `800`)
+
+  * **무엇**: 최신 `MultiAgentInfoArray` 타임아웃. 지나면 업데이트 스킵.
+  * **권장**: 센서/통신 주기(예: 10 Hz)에 2~3배 → 300~800 ms.
+  * **주의**: 너무 크면 stale 데이터로 “유령 로봇” 잔상.
+
+* `time_decay_sec` (double, default: `1.0`)
+
+  * **무엇**: 설계 흔적. 현재 래스터에는 직접 사용 안 함(미래 감쇠 로직용).
+  * **가이드**: 무시해도 무방. 추후 도입 시 “유효시간 내 새 데이터만 칠하기”에 사용.
+
+## 코스트(상태/모드 반영)
+
+* `lethal_cost` (uchar, default: `254`)
+
+  * **무엇**: 상한 참조. 현재 코드에서 직접 사용 X(코멘트에 “치사 덮기” 언급만).
+  * **가이드**: 현재는 의미 없음. `moving_cost/waiting_cost` 조합으로 충분.
+
+* `moving_cost` (uchar, default: `180`), `waiting_cost` (uchar, default: `200`)
+
+  * **무엇**: 타 로봇이 **이동 중**/**정지·대기**일 때 칠하는 기본 코스트.
+  * **권장**: 정지는 이동보다 **조금 더 높게**(예: 180/200, 또는 170/200).
+  * **주의**: PathValidator의 `agent_cost_threshold`와 **레벨을 맞춰야** false pos/neg 줄어듦.
+
+* `manual_cost_bias` (int, default: `30`)
+
+  * **무엇**: 상대 모드가 `"manual"`이면 코스트를 추가 가중.
+  * **권장**: 20~40. 현장 오퍼레이터가 수동 주행 시 “더 강하게 피하기”.
+
+## 형상 확장(등방성/전방 스미어)
+
+* `dilation_m` (double, default: `0.05`)
+
+  * **무엇**: **등방성**(모든 방향) 기본 여유(footprint 외연 확장).
+  * **권장**: 0.03~0.10 m. 좁은 통로면 0.03~0.05, 난잡 환경은 0.07~0.1.
+  * **주의**: 과대하면 “두꺼운 벽”처럼 보이고, 경로 차단 과격.
+
+* `sigma_k` (double, default: `2.0`)
+
+  * **무엇**: `pos_std_m`(위치 표준편차)에 대한 추가 확장 계수. 실제 확장 = `dilation_m + sigma_k * pos_std_m`.
+  * **권장**: 1.5~2.5. 센서 품질 낮거나 멀티로봇 위치 불확실 크면 2.0↑.
+  * **주의**: `pos_std_m < 0`이면 미적용.
+
+* `forward_smear_m` (double, default: `0.25`)
+
+  * **무엇**: **이동 상태**에서만 로컬 +x(heading 전방)로 추가 길이. 급접근/헤드온 완충.
+  * **권장**: 0.10~0.35 m. 속도 빠르고 제동 여유 적을수록 증가.
+  * **주의**: 정지 상태에는 코드가 자동으로 `0.0`. 전방 스미어는 **현재 위치만** 적용(경로 포즈엔 적용 안 함).
+
+## 경로 래스터·메타
+
+* `max_poses` (int, default: `40`)
+
+  * **무엇**: `truncated_path`에서 고려할 최대 포즈 수.
+  * **권장**: 40~120. 포즈가 매우 촘촘하면 stride 없이 전부 찍을 때 “두꺼운 튜브”가 될 수 있음(지금 코드가 그 상태).
+  * **팁**: **거리 기반 stride**를 코드에 도입하면 `max_poses`는 넉넉히 두어도 안전.
+
+* `publish_meta` (bool, default: `true`)
+
+  * **무엇**: 내부 메타 `AgentLayerMetaArray` 퍼블리시(디버깅/시각화용).
+  * **권장**: 개발·튜닝 동안 `true`. 운영에선 트래픽 줄이려면 `false`.
+
+* `meta_stride` (int, default: `3`)
+
+  * **무엇**: 메타 샘플링 stride. 값이 클수록 적게 발행.
+  * **권장**: 2~5.
+
+---
+
+# 파라미터 상호작용 & 주의점
+
+1. **PathValidatorNode와 코스트 정합**
+
+   * PathValidator의 `agent_cost_threshold`는 AgentLayer의 `moving_cost/waiting_cost` 이상(또는 근처)으로 맞춰야 함.
+   * 예) `moving=180, waiting=200`이면 `threshold≈180~200` 권장.
+
+2. **RViz에서 ‘두꺼운 튜브/반원’처럼 보임**
+
+   * 원인: `truncated_path` 모든 포즈에 footprint를 동일 코스트로 촘촘히 칠함.
+   * 해결: **거리 stride 도입(예: 0.25 m)** + 경로 포즈에는 **소확장(iso*0.4)**, **전방 스미어 0** + **낮은 코스트(예: 160)**.
+
+3. **프레임 일치**
+
+   * `use_path_header_frame=true`일 때 `truncated_path.header.frame_id`가 global frame과 다르면 스킵.
+   * **updateCosts()에도 동일 체크를 넣는 것**을 권장(안전성↑).
+
+4. **불확실도 반영**
+
+   * `sigma_k * pos_std_m`가 들어가므로, 멀티로봇 위치합치가 불안정할수록 외연이 커진다 → 미리 `pos_std_m` 스케일/단위 확인.
+
+---
+
+# 상황별 튜닝 레시피
+
+### A. 협소 통로가 많고 저속(0.5 m/s 이하)
+
+* `dilation_m=0.04~0.06`, `sigma_k=2.0`, `forward_smear_m=0.10~0.20`
+* `moving_cost=170~180`, `waiting_cost=200~210`, `manual_cost_bias=30`
+* `roi_range_m=8~10`, `freshness_timeout_ms=600`
+* (코드 패치 시) `path_stride_m≈0.25`, `path_cost≈160`, `path_iso_scale≈0.4`
+
+### B. 개방 공간, 중속(0.8~1.2 m/s)
+
+* `dilation_m=0.05~0.08`, `sigma_k=2.0`, `forward_smear_m=0.20~0.30`
+* `moving_cost=180`, `waiting_cost=200`, `manual_cost_bias=30`
+* `roi_range_m=12~15`, `freshness_timeout_ms=800`
+* (패치) `path_stride_m≈0.30`, `path_cost≈160~170`, `path_iso_scale≈0.4`
+
+### C. 위치 추정 품질이 들쭉날쭉
+
+* `sigma_k=2.0~2.5` 상향, `dilation_m`은 0.05 유지
+* `freshness_timeout_ms`를 500~600으로 낮춰 stale 억제
+* `forward_smear_m`은 과도 확대 금지(“벽 두꺼워짐” → 차단 과격)
+
+---
+
+# 예시 YAML (Nav2 Costmap2D 레이어 설정)
+
+```yaml
+# nav2_params.yaml (일부)
+global_costmap:
+  plugins:
+    - {name: agent_layer, type: "multi_agent_nav2::AgentLayer"}
+
+  agent_layer:
+    enabled: true
+    topic: "/multi_agent_infos"
+    self_machine_id: 2
+    self_type_id: "amr_a"
+    use_path_header_frame: true
+
+    # ROI/신선도
+    roi_range_m: 12.0
+    freshness_timeout_ms: 800
+
+    # 코스트
+    moving_cost: 180
+    waiting_cost: 200
+    manual_cost_bias: 30
+
+    # 형상 확장
+    dilation_m: 0.05
+    sigma_k: 2.0
+    forward_smear_m: 0.25
+
+    # 메타/성능
+    publish_meta: true
+    meta_stride: 3
+    max_poses: 80
+    qos_reliable: true
+```
+
+> (코드 패치로 stride/경로 코스트를 넣는다면)
+
+```yaml
+    path_stride_m: 0.25        # 신규: 경로 포즈 샘플 간격
+    path_iso_scale: 0.4        # 신규: 경로 포즈에서 등방 확장 축소율
+    path_cost: 160             # 신규: 경로 포즈 코스트(현재 위치보다 낮게)
+```
+
+---
+
+# 디버깅 체크리스트
+
+* **프레임**: `MultiAgentInfoArray.header.frame_id == costmap global frame`? `truncated_path.header.frame_id`도 같은가?
+* **자기식별**: `self_machine_id/self_type_id` 정확?
+* **메시지 신선도**: RViz에 `/multi_agent_infos` stamp 갱신 주기 확인.
+* **코스트 정합**: PathValidator `agent_cost_threshold`와 AgentLayer `moving/waiting` 레벨 매칭.
+* **시각화**: `publish_meta=true`로 메타 샘플을 RViz Marker로 찍어 경계/튜브 상태 확인.
+
+---
+
+필요하면 위 YAML을 기준으로 **개방 공간/협소 통로** 각각에 맞춘 두 개의 프로파일을 만들어서 런타임에 전환할 수 있게 해줄 수도 있어. 또, 너가 원하면 내가 제안했던 **stride/경로 코스트 옵션**을 실제 C++ 코드 diff 형태로 바로 만들어 줄게.
+##############################  
+3################################  
+##################################  
+좋아, 이번엔 **PathValidatorNode 전 파라미터 레퍼런스 + 튜닝 가이드**를 깔끔하게 정리해줄게. (ROS 2 Jazzy / Nav2 / C++17 / 다로봇 환경 기준)
+
+---
+
+# 1) 좌표/프레임
+
+* `global_frame` (str, `"map"`)
+  경로/코스트맵/에이전트 비교의 기준 프레임. 에이전트 토픽의 `header.frame_id`도 동일해야 함.
+  **가이드:** Nav2 글로벌 코스트맵 프레임과 동일하게.
+
+* `base_frame` (str, `"base_link"`)
+  TF에서 자기 위치를 얻을 때 사용.
+  **가이드:** 로봇 베이스 프레임과 정확히 일치.
+
+---
+
+# 2) 리플랜 트리거/디바운스
+
+* `cooldown_sec` (double, `1.0`)
+  리플랜 연속 트리거 쿨다운.
+  **튜닝:** 0.5~2.0s. 너무 작으면 플러딩, 너무 크면 반응 지연.
+
+* `consecutive_threshold` (int, `3`)
+  연속 “차단” 샘플 수가 임계 이상일 때 리플랜.
+  **튜닝:** 2~5. 통로 울퉁불퉁/노이즈 크면 증가.
+
+* `publish_false_pulse` (bool, `true`), `flag_pulse_ms` (int, `120`)
+  `/replan_flag`를 true로 발행 후 자동 false 펄스.
+  **가이드:** Nav2 BT 노드가 Edge-trigger라면 켜두는게 편함.
+
+---
+
+# 3) 탐색 거리/속도 기반 창
+
+* `max_speed` (double, `0.5`)
+  Lookahead(= `max(max_speed*lookahead_time_sec, min_lookahead_m)`) 계산에 사용.
+  **튜닝:** 실제 최고 속도의 0.8~1.0배.
+
+* `lookahead_time_sec` (double, `15.0`), `min_lookahead_m` (double, `2.0`)
+  전방 검사 거리 결정.
+  **튜닝:** 저속 8~12s, 중속 12~18s. 통로 짧으면 `min_lookahead_m` 2~4m.
+
+* `path_check_distance_m` (double, `6.0`)
+  실제 경로 검사 상한(위의 lookahead보다 더 보수적인 캡).
+  **튜닝:** 실 주행 환경에서 “실제로 문제되는 거리”로. 개방공간 8~12m, 협소 4~6m.
+
+---
+
+# 4) 코스트맵 임계/커널
+
+* `cost_threshold` (double, `200.0`)
+  차단으로 보는 코스트 상한(= 임계 이상이면 obstacle).
+  **중요:** **AgentLayer의 `moving_cost/waiting_cost`와 정합**. 예: 180/200이면 190~200 권장.
+
+* `ignore_unknown` (bool, `true`)
+  `NO_INFORMATION` 무시 여부.
+  **튜닝:** 실내 SLAM이면 `true`, 외부/맵 구멍 많으면 `false` 고려.
+
+* `kernel_half_size` (int, `1`)
+  `isBlockedCellKernel()`에서 (2K+1)^2 커널로 주변까지 차단 체크.
+  **튜닝:** 0~2. 통로 삐걱/노이즈 크면 1~2로 완충.
+
+---
+
+# 5) 내부 장애물 DB(성숙도)
+
+* `obstacle_persistence_sec` (double, `0.5`)
+  같은 셀을 이 시간 이상 연속 관측해야 “성숙 장애물”로 인정.
+  **튜닝:** 0.3~1.0s. 플리커링 노이즈가 많을수록 증가.
+
+* `db_update_frequency` (double, `5.0`)
+  내부 DB 스캔 주기(Hz).
+  **튜닝:** 3~10. CPU 여유 없으면 3~5Hz.
+
+* `obstacle_prune_timeout_sec` (double, `3.0`)
+  오래 안 보이면 DB에서 삭제.
+  **튜닝:** 2~5s. 느린 업데이트 환경은 늘림.
+
+* `db_stride` (int, `2`)
+  ROI 샘플링 셀 간격.
+  **튜닝:** 1(세밀)~3(가벼움). 고해상도 맵이면 2~3.
+
+* `cone_angle_deg` (double, `100.0`)
+  전방 시야 각(헤딩 중심). 원뿔 밖은 스킵.
+  **튜닝:** 좁은 통로 90~120°, 크로스/합류 많으면 120~160°.
+
+---
+
+# 6) 검증 방식(점/발자국)
+
+* `use_footprint_check` (bool, `false`)
+  경로의 각 포즈를 **로봇 footprint**로 채워 차단 확인(더 정확, 더 비쌈).
+  **튜닝:** 협소/정밀 상황에서 `true`. CPU 타이트할 때 `false`.
+
+* `footprint_step_m` (double, `0.15`)
+  Footprint 방식에서 경로 샘플 간격.
+  **튜닝:** 0.10~0.25m. 작을수록 정확↑/부하↑.
+
+* `footprint` (str, `"[]"`), `robot_radius` (double, `0.1`)
+  Nav2 footprint 형식 문자열. 유효하면 폴리곤, 아니면 원(`robot_radius`).
+  **가이드:** Nav2 costmap과 **동일 값** 사용.
+
+---
+
+# 7) 에이전트 마스크/충돌 메시지
+
+* `compare_agent_mask` (bool, `true`)
+  AgentLayer가 만든 마스크 코스트맵으로 보조 교차 판단.
+  **튜닝:** 동적 장애물 대부분이 “다른 로봇”이면 `true`가 유리.
+
+* `agent_mask_topic` (str, `"/agent_layer/costmap_raw"`)
+  에이전트 마스크 코스트맵 토픽.
+
+* `agent_cost_threshold` (double, `254.0`)
+  에이전트 마스크에서 “로봇”으로 취급할 임계.
+  **중요:** AgentLayer의 `moving_cost/waiting_cost` 이상으로.
+  예) 180/200이면 200~254.
+
+* `agent_mask_manhattan_buffer` (int, `1`)
+  맨해튼 반경 탐색(±1이면 다이아몬드 반경 1).
+  **튜닝:** 0~2. 경계 픽셀 깨짐 보정.
+
+* `publish_agent_collision` (bool, `true`), `agent_collision_topic` (str, `"/path_agent_collision_info"`)
+  교차로봇 충돌 정보를 퍼블리시(FleetDecisionNode 입력).
+
+---
+
+# 8) 에이전트 토픽/신선도/매칭
+
+* `agents_topic` (str, `"/multi_agent_infos"`)
+  에이전트 배열 입력.
+
+* `agents_freshness_timeout_ms` (int, `800`)
+  신선도 체크. 초과 시 매칭 스킵.
+  **튜닝:** 발행 주파수의 2~3배.
+
+* `agent_match_dilate_m` (double, `0.05`)
+  에이전트 footprint 소확장(포인트 포함 판정 여유).
+  **튜닝:** 0.03~0.08m.
+
+---
+
+# 9) 에이전트 경로 튜브 매칭 (truncated_path)
+
+* `agent_path_hit_enable` (bool, `true`)
+  에이전트 `truncated_path`를 얇은 튜브로 취급해 커버여부 검사.
+
+* `agent_path_hit_stride_m` (double, `0.35`)
+  경로 포즈 거리 샘플 간격.
+  **튜닝:** 0.25~0.5m. 촘촘하면 과검출/부하↑.
+
+* `agent_path_hit_dilate_m` (double, `0.02`)
+  튜브 두께(footprint 등방확장량).
+  **튜닝:** 0.02~0.05m. RViz에서 “길쭉한 벽” 느낌 나면 줄여라.
+
+* `agent_path_hit_max_poses` (int, `500` 로드 후 내부 200 사용)
+  최대 포즈 수.
+  **튜닝:** 200~600. stride가 있으니 200~300이면 충분한 경우가 많음.
+
+---
+
+# 10) 상태 연동/홀드
+
+* `agent_block_hold_sec` (double, `2.0`)
+  **에이전트 충돌 확정 후** 잠깐 리플랜 억제(Decision/Fleet과의 상호작용에서 플리커 억제).
+  **튜닝:** 1.0~3.0s.
+
+* `agent_block_max_wait_sec` (double, `8.0`)
+  (현재 코어 로직에서 직접 사용 빈도 낮음) 상한 대기 시간 컨셉.
+
+* `agents_freshness_timeout_ms`와 `agent_block_hold_sec`의 균형이 중요:
+  신선도 타임아웃이 **너무 크고**, 홀드가 길면 “유령 경로 튜브”에 오래 묶일 수 있음.
+
+---
+
+# 11) 런타임/상태
+
+* 내부 `is_robot_in_driving_state_`는 `/robot_status`가 `"DRIVING"`/`"PLANNING"`일 때에만 검사 수행.
+  **가이드:** 상태 문자열 발행 체계를 일관되게 유지(대소문자 포함).
+
+---
+
+## 상호작용 포인트 (AgentLayer와 맞물림)
+
+1. **코스트 임계 정합**
+
+   * PathValidator `cost_threshold` vs AgentLayer `moving_cost/waiting_cost` vs PathValidator `agent_cost_threshold`
+   * 예: AL(180/200) → PV(cost_threshold=190~200, agent_cost_threshold=200~254)
+
+2. **프레임 정합**
+
+   * PathValidator `global_frame` == AgentLayer / MultiAgentInfoArray `header.frame_id`.
+
+3. **튜브 과비대화 방지**
+
+   * `agent_path_hit_stride_m` 충분히 크게(≥0.25), `agent_path_hit_dilate_m` 너무 키우지 않기(0.02~0.03 우선).
+
+---
+
+# 상황별 튜닝 레시피
+
+### A) 협소 통로, 저속(~0.5 m/s)
+
+* `max_speed=0.5`, `lookahead_time_sec=10.0`, `min_lookahead_m=2.0`, `path_check_distance_m=5~6`
+* `cost_threshold=195~205`, `kernel_half_size=1~2`, `obstacle_persistence_sec=0.6~0.8`
+* `use_footprint_check=true`, `footprint_step_m=0.12~0.18`
+* `agent_path_hit_stride_m=0.30~0.40`, `agent_path_hit_dilate_m=0.02~0.03`
+
+### B) 개방 공간, 중속(0.8~1.2 m/s)
+
+* `max_speed=1.0`, `lookahead_time_sec=14~18`, `min_lookahead_m=2.0`, `path_check_distance_m=8~12`
+* `cost_threshold=190~200`, `kernel_half_size=1`, `obstacle_persistence_sec=0.4~0.6`
+* `use_footprint_check=false`(부하 줄이기)
+* `agent_path_hit_stride_m=0.35~0.50`, `agent_path_hit_dilate_m=0.02~0.04`
+
+### C) 센서 노이즈/맵 플리커 심함
+
+* `ignore_unknown=false` 고려, `kernel_half_size=2`, `obstacle_persistence_sec=0.8~1.0`
+* `db_stride=2~3`, `cone_angle_deg=120~140`
+* `consecutive_threshold=4~5` 로 과민 억제
+
+---
+
+# 예시 YAML 스니펫
+
+```yaml
+replan_monitor:
+  ros__parameters:
+    global_frame: map
+    base_frame: base_link
+
+    # Trigger
+    cooldown_sec: 1.0
+    consecutive_threshold: 3
+
+    # Lookahead
+    max_speed: 0.8
+    lookahead_time_sec: 12.0
+    min_lookahead_m: 2.0
+    path_check_distance_m: 8.0
+
+    # Cost thresholds
+    cost_threshold: 195.0
+    ignore_unknown: true
+    kernel_half_size: 1
+
+    # Obstacle DB
+    db_update_frequency: 5.0
+    obstacle_persistence_sec: 0.6
+    obstacle_prune_timeout_sec: 3.0
+    db_stride: 2
+    cone_angle_deg: 120.0
+
+    # Replan flag pulse
+    publish_false_pulse: true
+    flag_pulse_ms: 120
+
+    # Footprint check
+    use_footprint_check: false
+    footprint_step_m: 0.15
+    footprint: "[]"
+    robot_radius: 0.30
+
+    # Agent mask
+    compare_agent_mask: true
+    agent_mask_topic: /agent_layer/costmap_raw
+    agent_cost_threshold: 200.0
+    agent_mask_manhattan_buffer: 1
+
+    # Agent collisions out
+    publish_agent_collision: true
+    agent_collision_topic: /path_agent_collision_info
+
+    # Agents input
+    agents_topic: /multi_agent_infos
+    agents_freshness_timeout_ms: 800
+    agent_match_dilate_m: 0.05
+
+    # Agent hold
+    agent_block_hold_sec: 2.0
+    agent_block_max_wait_sec: 8.0
+
+    # Path-tube matching
+    agent_path_hit_enable: true
+    agent_path_hit_stride_m: 0.35
+    agent_path_hit_dilate_m: 0.02
+    agent_path_hit_max_poses: 300
+```
+
+---
+
+## 디버깅 체크리스트
+
+* **프레임:** `/multi_agent_infos.header.frame_id == global_frame`?
+* **코스트 정합:** `cost_threshold` vs AgentLayer `moving/waiting` vs `agent_cost_threshold`.
+* **신선도:** `agents_freshness_timeout_ms`와 실제 발행 주기 일치?
+* **튜브 과비대화:** stride/dilate 조합이 과한지 RViz에서 확인.
+* **홀드 로직:** 에이전트 이벤트 후 `agent_block_hold_sec` 동안 리플랜 억제되는지 로그로 검증.
+* **Footprint 모드 부하:** CPU 프로파일링으로 `use_footprint_check` 영향 확인.
+
+---
+
+원하면 네 환경(속도, 공간 제약, AgentLayer 설정)을 기준으로 **두세 개 프리셋(YAML)**을 더 구체적으로 만들어 줄게.
+##################################  
+####################################3  
+###################################  
+좋아! `fleet_decision_node`의 **전 파라미터 레퍼런스 + 튜닝 가이드**를 한 번에 정리해줄게. (다중 로봇/교차 지점, PathValidator/AgentLayer와 연동 가정)
+
+---
+
+# 1) ID / 프레임
+
+* `global_frame` (str, `"map"`)
+  내부 계산·로그 기준 프레임. `MultiAgentInfoArray.header.frame_id`와 일치해야 함.
+  **가이드:** Nav2 글로벌 코스트맵 프레임과 동일하게 유지.
+
+* `my_machine_id` (int, `1`)
+  본 로봇 ID. ID 비교(ROW/우선순위, 동점자 타이브레이커)에 사용.
+  **가이드:** 플릿 전체에서 유일 값.
+
+---
+
+# 2) TTC 결합(시간 여유 추정)
+
+* `w1_ttc` (double, `1.0`) : PathValidator가 준 **직접 TTC** 가중치
+* `w2_alt` (double, `0.8`) : 상대 속도·거리로 만든 **대체 TTC** 가중치
+* `T_min`   (double, `0.5`) : 1/T 특이점 방지용 하한(작을수록 민감)
+* `d_min`   (double, `0.2`) : 1/d 하한(근접 민감도 상한)
+
+**튜닝 팁**
+
+* 센서/추정이 안정적 → `w1_ttc`↑ (직접 TTC 신뢰).
+* 상대 속도 추정이 신뢰도 높음 → `w2_alt`↑.
+* 과민 반응이면 `T_min`, `d_min`을 **살짝 키움**(0.6~0.8 / 0.25~0.35).
+
+---
+
+# 3) 위험도(Severity) 가중치
+
+* `a1_invT` (double, `1.2`) : 1/T (가까운 충돌 시각)
+* `a2_invd` (double, `0.2`) : 1/d (가까운 거리)
+* `a3_heading` (double, `0.5`) : 상대 진행방향(정면>교차>동방향) 보너스
+* `a4_vclosing` (double, `0.3`) : 폐쇄 속도(상대 접근 속도)
+
+**튜닝 팁**
+
+* 정면 충돌 억제 강하게 → `a3_heading`↑.
+* 저속 근접에서 과민 → `a2_invd`↓.
+* 속도 추정 노이즈 크면 `a4_vclosing`↓.
+
+---
+
+# 4) 양보(Yield) 우선순위 가중치
+
+* `b1_mode` (double, `0.7`) : 상대가 `mode=="manual"`일 때 가중(사람 수동 운전 양보)
+* `b2_rowgap` (double, `0.9`) : **right_of_way_score** 차이(상대 ROW 우세)
+* `b3_reroute` (double, `0.8`) : 상대가 `reroute` 중이면 양보
+* `b4_pathsearch` (double, `0.4`) : 상대가 `STATUS_PATH_SEARCHING`이면 양보
+* `b5_occupancy` (double, `0.5`) : 상대가 영역/차선 점유 플래그면 양보
+* `b6_id` (double, `0.2`) : ID 타이브레이커(작은 ID 우선)
+* `kappa` (double, `0.6`) : 최종 `score = severity * (1 + kappa * yprio)`에서 yprio 영향도
+
+**튜닝 팁**
+
+* “수동/특수 로봇에 항상 양보” → `b1_mode`↑, `kappa`↑.
+* “우선도로/차로 규칙 강화” → `b2_rowgap`↑, `b5_occupancy`↑.
+* 교착 시 reroute 우대 → `b3_reroute`↑.
+
+---
+
+# 5) 진입 임계(Enter thresholds)
+
+* `T_slow` (double, `6.0`) : **SLOWDOWN** 진입 임계(T_eff < T_slow)
+* `T_yield` (double, `2.5`) : **YIELD** 진입 임계(T_eff < T_yield)
+* `yield_priority_thresh` (double, `0.8`) : yprio ≥ 이 값이면 **YIELD 강제**
+
+**튜닝 팁**
+
+* 너무 자주 YIELD로 떨어지면 `T_yield`↓ 혹은 `yield_priority_thresh`↑.
+* 부드러운 감속 선호 → `T_slow`를 `T_yield` 대비 충분히 크게(예: 5~8s).
+
+---
+
+# 6) 복귀 히스테리시스(Resume)
+
+* `T_resume_slow` (double, `6.5`)
+* `T_resume_yield` (double, `3.5`)
+* `T_resume_stop`  (double, `5.0`)
+  → 현재 상태(SLOW/YIELD/STOP)별 **안전 여유**(T_eff) 기준.
+* `Y_exit` (double, `0.5`) : yprio가 이 값 **미만**이어야 복귀 가능.
+* `K_slow_clean` (int, `2`), `K_yield_clean` (int, `3`), `K_stop_clean` (int, `3`)
+  → 안전 기준 연속 만족 횟수. 충족 시 RUN으로 복귀.
+
+**튜닝 팁**
+
+* 출렁임(진입↔복귀 반복) 있으면: `T_resume_*` **살짝↑** 또는 `K_*_clean` **1~2 증가**.
+* 복귀가 느리면: `T_resume_*`↓ 또는 `Y_exit`↑.
+
+---
+
+# 7) Idle/Timeout 복귀
+
+* `resume_idle_sec` (double, `1.5`)
+  최근 에이전트 이벤트가 **없었던** 시간(충돌 메시지 무소식)≥ 이면 **SLOW/YIELD**는 RUN 복귀.
+* `resume_timeout_slow` (double, `6.0`)
+* `resume_timeout_yield` (double, `10.0`)
+* `resume_timeout_stop` (double, `15.0`)
+  → 상태 유지 **하드 타임아웃**. 초과 시 RUN 강제.
+
+**튜닝 팁**
+
+* 이벤트 드롭/유실 환경이면 타임아웃을 **짧게** 가져가서 정체 방지.
+* 교차로 대기 많은 환경이면 YIELD 타임아웃을 STOP보다 **짧게** 설정해 순환 유도.
+
+---
+
+# 8) 디바운스/무시 윈도우
+
+* `agent_event_silence_sec` (double, `1.0`)
+  같은 에이전트로부터의 연속 이벤트 무시 시간(스팸 억제).
+* `replan_ignore_sec_after_agent` (double, `0.5`)
+  **에이전트 이벤트 직후** 외부 `/replan_flag`를 무시할 윈도우.
+* `run_pulse_silence_sec` (double, `0.5`)
+  `/cmd/run` 펄스 과다 발행 방지.
+
+**튜닝 팁**
+
+* PathValidator가 자주 치는 환경 → `agent_event_silence_sec` 0.8~1.2s.
+* 상위 플래너(글로벌)와 충돌 리플랜 충돌 시 → `replan_ignore_sec_after_agent` 0.3~0.8s.
+
+---
+
+# 9) 토픽(입출력)
+
+입력
+
+* `topic_collision` (str, `"/path_agent_collision_info"`) : PathValidator 충돌 후보
+* `topic_agents` (str, `"/multi_agent_infos"`) : 최신 에이전트 상태
+* `topic_replan_flag` (str, `"/replan_flag"`) : 외부 리플랜 트리거
+
+상태/요청 출력
+
+* `topic_decision_state` (str, `"/decision_state"`) : 문자열 상태(RUN/SLOWDOWN/YIELD/STOP/REPLAN/REROUTE)
+* `topic_request_replan` (str, `"/request_replan"`) : Bool 1회 펄스
+* `topic_request_reroute` (str, `"/request_reroute"`) : Bool 1회 펄스
+
+실행 커맨드(펄스)
+
+* `topic_cmd_run` (str, `"/cmd/run"`)
+* `topic_cmd_slowdown` (str, `"/cmd/slowdown"`)
+* `topic_cmd_yield` (str, `"/cmd/yield"`)
+* `topic_cmd_stop` (str, `"/cmd/stop"`)
+
+**가이드**
+
+* 상위 BT/컨트롤러가 **엣지 트리거**라면 펄스 방식이 맞음.
+* Topic QoS는 기본 keep last 10로 충분. 중요 신호는 상위에서 Latched/Transient 처리.
+
+---
+
+# 10) 내부 규칙·상호작용 요점
+
+* 의사결정 규칙(간략):
+
+  1. `T_eff < T_yield` **또는** `yprio ≥ yield_priority_thresh` → **YIELD**
+  2. `T_eff < T_slow` → **SLOWDOWN**
+  3. 상대가 reroute이고 `yprio` 높음 → **REROUTE**
+  4. 기타 → **RUN**
+* 복귀는 `_maybe_resume_on_clean()`가 **T_resume_*** + `Y_exit` + `K_*_clean`으로 히스테리시스.
+
+**AgentLayer/PathValidator와의 정합**
+
+* PathValidator가 `PathAgentCollisionInfo`를 **간헐적으로** 내보내므로, 여기서 **디바운스**와 **히스테리시스**로 안정화.
+* AgentLayer의 코스트 설정이 높아질수록 PathValidator의 이벤트 빈도↑ → 여기선 `T_slow/T_yield`를 **조금 올려** 불필요한 YIELD 진입 억제 가능.
+
+---
+
+## 상황별 튜닝 레시피
+
+### A) 협소 교차·저속(0.4~0.6 m/s) – 보수적·안전 우선
+
+* TTC 결합: `w1_ttc=1.0, w2_alt=0.8, T_min=0.6, d_min=0.25`
+* Severity: `a1=1.3, a2=0.25, a3=0.6, a4=0.25`
+* Yield: `b1=0.8, b2=1.0, b3=0.7, b4=0.4, b5=0.6, b6=0.2, kappa=0.7`
+* Enter: `T_yield=3.0, T_slow=7.0, yield_priority_thresh=0.8`
+* Resume: `T_resume_yield=4.0, T_resume_slow=7.5, Y_exit=0.5, K_yield_clean=3`
+* Idle/Timeout: `resume_idle_sec=1.5, resume_timeout_yield=10`
+
+### B) 개방 공간·중속(0.8~1.2 m/s) – 효율·흐름 우선
+
+* TTC 결합: `w1_ttc=0.9, w2_alt=1.0, T_min=0.5, d_min=0.2`
+* Severity: `a1=1.1, a2=0.15, a3=0.4, a4=0.35`
+* Yield: `b1=0.5, b2=0.7, b3=0.6, b4=0.3, b5=0.4, b6=0.2, kappa=0.5`
+* Enter: `T_yield=2.2~2.5, T_slow=5.5~6.5, yield_priority_thresh=0.9`
+* Resume: `T_resume_yield=3.0, T_resume_slow=6.5, Y_exit=0.55, K_*_clean=2`
+* Idle/Timeout: `resume_idle_sec=1.0, resume_timeout_yield=8`
+
+### C) 이벤트 스팸/노이즈 심함 – 안정성 강화
+
+* 디바운스: `agent_event_silence_sec=1.2`, `run_pulse_silence_sec=0.7`
+* 히스테리시스: `K_yield_clean=4`, `K_slow_clean=3`, `Y_exit=0.45`
+* 타임아웃: `resume_timeout_yield=9~12` (환경에 맞춰)
+
+---
+
+## 권장 YAML 스니펫 (균형형)
+
+```yaml
+fleet_decision_node:
+  ros__parameters:
+    global_frame: map
+    my_machine_id: 3
+
+    # TTC combine
+    w1_ttc: 1.0
+    w2_alt: 0.8
+    T_min: 0.6
+    d_min: 0.25
+
+    # Severity
+    a1_invT: 1.2
+    a2_invd: 0.2
+    a3_heading: 0.5
+    a4_vclosing: 0.3
+
+    # Yield priority
+    b1_mode: 0.7
+    b2_rowgap: 0.9
+    b3_reroute: 0.8
+    b4_pathsearch: 0.4
+    b5_occupancy: 0.5
+    b6_id: 0.2
+    kappa: 0.6
+
+    # Enter thresholds
+    T_slow: 6.0
+    T_yield: 2.5
+    yield_priority_thresh: 0.8
+
+    # Resume hysteresis
+    T_resume_slow: 6.5
+    T_resume_yield: 3.5
+    T_resume_stop: 5.0
+    Y_exit: 0.5
+    K_slow_clean: 2
+    K_yield_clean: 3
+    K_stop_clean: 3
+
+    # Idle/Timeout resume
+    resume_idle_sec: 1.5
+    resume_timeout_slow: 6.0
+    resume_timeout_yield: 10.0
+    resume_timeout_stop: 15.0
+
+    # Debounce / ignore windows
+    agent_event_silence_sec: 1.0
+    replan_ignore_sec_after_agent: 0.5
+    run_pulse_silence_sec: 0.5
+
+    # Topics
+    topic_collision: /path_agent_collision_info
+    topic_agents: /multi_agent_infos
+    topic_replan_flag: /replan_flag
+    topic_decision_state: /decision_state
+    topic_request_replan: /request_replan
+    topic_request_reroute: /request_reroute
+    topic_cmd_run: /cmd/run
+    topic_cmd_slowdown: /cmd/slowdown
+    topic_cmd_yield: /cmd/yield
+    topic_cmd_stop: /cmd/stop
+```
+
+---
+
+## 디버깅·검증 체크리스트
+
+* **프레임/ID:** `global_frame` 일치, `my_machine_id` 정확.
+* **충돌 이벤트 수신률:** PathValidator의 `/path_agent_collision_info`가 **지나치게 빈번**하면 이 노드에서는 **YIELD 과다** → PathValidator의 `agent_path_hit_stride/dilate` 먼저 조정.
+* **출렁임:** 상태가 자주 바뀌면 `T_resume_*`↑ `K_*_clean`↑, 혹은 `yield_priority_thresh`↑.
+* **양보 불균형:** 특정 로봇만 계속 YIELD → `b2_rowgap`, `b6_id`, `kappa` 재조정(ROW/ID 영향점).
+* **REPLAN/REROUTE 경쟁:** `replan_ignore_sec_after_agent`로 충돌 직후 외부 리플랜 억제.
+
+---
+
+원하면 너희 **AgentLayer/PathValidator 현재 세팅**을 알려줘. 그 조합에 맞춰 `T_*`, `Y_*`, `kappa`, `b*`를 더 정밀하게 **두세 가지 운영 프로파일**로 뽑아줄게 (보수형/균형형/공격형).
