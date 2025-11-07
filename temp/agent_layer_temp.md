@@ -2030,3 +2030,165 @@ fleet_decision_node:
 ---
 
 원하면 너희 **AgentLayer/PathValidator 현재 세팅**을 알려줘. 그 조합에 맞춰 `T_*`, `Y_*`, `kappa`, `b*`를 더 정밀하게 **두세 가지 운영 프로파일**로 뽑아줄게 (보수형/균형형/공격형).
+###################  
+####################  
+#####################  
+좋아, “어디를 어떻게 바꾸면 되는지” **딱 필요한 만큼** 정확히 정리해 줄게.
+핵심은 ① 에이전트 마스크 조회를 **월드좌표 변환 기반**으로 바꾸는 것, ② 히트 지점의 **이웃 셀도 함께 확인**해서 경계 누락을 줄이는 것, ③ 파라미터를 **해상도 기준**으로 재설정하는 것 — 이 3가지야.
+
+---
+
+# 1) `agentCellBlockedNear()` 교체 (가장 중요)
+
+현재는 master 인덱스를 agent_mask 인덱스로 **그냥 재사용**해서 맵 기준이 어긋나면 놓쳐요.
+아래처럼 **master(mx,my) → (wx,wy) → agent(ax,ay)** 변환을 거치도록 **함수 전체를 교체**하세요.
+
+```cpp
+// PathValidatorNode::agentCellBlockedNear() 교체 버전
+inline bool PathValidatorNode::agentCellBlockedNear(
+    unsigned int mx, unsigned int my,
+    unsigned char thr, int manhattan_buf) const
+{
+  // 1) 로컬 복사 (락 순서 교착 회피)
+  std::shared_ptr<nav2_costmap_2d::Costmap2D> master, agent;
+  {
+    std::lock_guard<std::mutex> lk(costmap_mutex_);
+    if (!costmap_) return false;
+    master = costmap_;
+  }
+  {
+    std::lock_guard<std::mutex> lk(agent_mask_mutex_);
+    if (!agent_mask_) return false;
+    agent = agent_mask_;
+  }
+
+  // 2) master index -> world
+  double wx, wy;
+  master->mapToWorld(mx, my, wx, wy);
+
+  // 3) world -> agent_mask index
+  unsigned int ax, ay;
+  if (!agent->worldToMap(wx, wy, ax, ay)) {
+    return false;
+  }
+
+  // 4) 맨해튼 버퍼 내에서 검사
+  const int sx = static_cast<int>(agent->getSizeInCellsX());
+  const int sy = static_cast<int>(agent->getSizeInCellsY());
+  const int ix = static_cast<int>(ax);
+  const int iy = static_cast<int>(ay);
+
+  for (int dx = -manhattan_buf; dx <= manhattan_buf; ++dx) {
+    for (int dy = -manhattan_buf; dy <= manhattan_buf; ++dy) {
+      if (std::abs(dx) + std::abs(dy) > manhattan_buf) continue;
+      const int x = ix + dx;
+      const int y = iy + dy;
+      if (x < 0 || y < 0 || x >= sx || y >= sy) continue;
+
+      const unsigned char a = agent->getCost(static_cast<unsigned int>(x),
+                                             static_cast<unsigned int>(y));
+      if (a >= thr) return true;
+    }
+  }
+  return false;
+}
+```
+
+* 이 수정만으로 `agent_mask_manhattan_buffer`를 **1~3** 정도의 정상값으로 내려도 잘 잡힙니다.
+* 더 이상 200 같은 **비정상 큰 버퍼**는 필요 없어요.
+
+---
+
+# 2) 히트 셀의 **이웃도 함께 검사** (경계 픽셀 보강) — 선택적이지만 추천
+
+`validateWithFootprint()`와 `validateWithPoints()`에서 `blocked_here == true`일 때,
+바로 `whoCoversPoint(wx,wy)`만 보지 말고 **주변 1셀**의 월드 좌표도 같이 확인하면 경계 누락이 크게 줄어요.
+
+아래 보강 블록을 두 곳 모두에 같은 방식으로 넣으면 됩니다.
+
+```cpp
+// blocked_here가 true인 지점에서 wx, wy를 구한 다음:
+bool agent_hit = false;
+
+// 중심점 우선
+auto hits = whoCoversPoint(wx, wy);
+if (!hits.empty()) {
+  publishAgentCollisionList(hits);
+  last_agent_block_time_ = this->now();
+  return;
+}
+
+// 이웃 1셀까지 확장 확인 (선택, 추천)
+{
+  std::shared_ptr<nav2_costmap_2d::Costmap2D> cm;
+  { std::lock_guard<std::mutex> lk(costmap_mutex_); cm = costmap_; }
+  if (cm) {
+    const int OFFS[8][2] = {{1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
+    for (auto &o : OFFS) {
+      double wxx, wyy;
+      cm->mapToWorld(static_cast<int>(hit_mx)+o[0], static_cast<int>(hit_my)+o[1], wxx, wyy);
+      auto h2 = whoCoversPoint(wxx, wyy);
+      if (!h2.empty()) {
+        publishAgentCollisionList(h2);
+        last_agent_block_time_ = this->now();
+        return;
+      }
+    }
+  }
+}
+```
+
+> 구현 위치:
+>
+> * `validateWithFootprint()`에서 `if (blocked_here) { ... }` 내부
+> * `validateWithPoints()`에서 `if (blocked_cell) { ... }` 내부
+
+---
+
+# 3) 파라미터 **정상화(해상도 기준)**
+
+큰 값(2.0 / 200)에 의존하지 않도록, 아래처럼 **맵 해상도(res)** 기준으로 잡아주세요.
+(일반적으로 res=0.05m 가정 시 권장값 예시 포함)
+
+* `agent_mask_manhattan_buffer`: **1~3**
+  (위 1)수정 반영이 전제. 해상도 5cm면 1~2로도 충분)
+* `agent_match_dilate_m`: **max(2*res, 0.12)** ⇒ res=0.05 → **0.12~0.15**
+  (footprint 포함 판정의 경계손실 방지)
+* `agent_path_hit_dilate_m`: **max(1*res, 0.05)** ⇒ res=0.05 → **0.05~0.08**
+  (튜브가 셀보다 얇지 않게)
+* `agent_path_hit_stride_m`: **0.25~0.40** (현 0.35는 OK)
+
+추가로, 의도에 따라 코스트 조정:
+
+* AgentLayer가 지금 `moving_cost=254`, `waiting_cost=254`로 **항상 치사 코스트**예요.
+  PathValidator의 `cost_threshold=254`와 같아서 민감하게 막힙니다.
+  “가까울 때만 막히게” 하려면:
+
+  * AgentLayer: `moving_cost=180~200`, `waiting_cost=150~180`
+  * PathValidator: `agent_cost_threshold`를 **moving_cost와 동일** 또는 약간 낮게
+
+---
+
+# 4) (옵션) `whoCoversPoint()` 내부의 최소 팽창 하한
+
+파라미터 실수에 대비해, 내부에서 **최소 팽창 하한**을 한 줄 넣어두면 더 안전합니다.
+해상도를 함수 안에서 모르면 보수적으로 5cm 하한만 둬도 좋아요.
+
+```cpp
+double eff_match = std::max(agent_match_dilate_m_, 0.05);        // 5cm 하한
+double eff_path  = std::max(agent_path_hit_dilate_m_, 0.05);
+
+// 이후 poly_local 확장 시 eff_match / eff_path 사용
+```
+
+---
+
+# 최종 체크리스트
+
+1. **함수 교체**: `agentCellBlockedNear()`를 월드좌표 변환 버전으로 바꾼다.
+2. **이웃 보강**: `validateWithFootprint()` / `validateWithPoints()`의 agent 확인 지점에 **이웃 1셀 검사** 블록 추가.
+3. **파라미터 정상화**: 위 권장 범위로 조정 (특히 `agent_mask_manhattan_buffer`, `agent_match_dilate_m`, `agent_path_hit_dilate_m`).
+4. (선택) **최소 팽창 하한** 한 줄 추가해 실수 방어.
+5. (선택) **AgentLayer 코스트 정책**을 의도에 맞춰 조정.
+
+이렇게만 적용하면, **작은(정상) 파라미터 값**에서도 agent 충돌이 **안정적으로 agent로 분류**되고 더 이상 200/2.0 같은 비정상값에 의존하지 않아도 됩니다.
