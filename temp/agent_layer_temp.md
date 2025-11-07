@@ -2192,3 +2192,163 @@ double eff_path  = std::max(agent_path_hit_dilate_m_, 0.05);
 5. (선택) **AgentLayer 코스트 정책**을 의도에 맞춰 조정.
 
 이렇게만 적용하면, **작은(정상) 파라미터 값**에서도 agent 충돌이 **안정적으로 agent로 분류**되고 더 이상 200/2.0 같은 비정상값에 의존하지 않아도 됩니다.
+#################  
+####################  
+#####################  
+좋아. 두 군데 모두 **해당 블록만** 바꿔 끼울 수 있게 “붙여 넣기용” 코드를 딱 줘볼게. 핵심은
+
+* 중심 셀 외에 **이웃 1셀(8방향)** 의 월드좌표도 함께 `whoCoversPoint()`에 물어보는 **보강 검사**를 넣는 것,
+* (옵션) Agent mask로 잡힌 경우에도 **같은 보강 검사**를 돌려서 경계 누락을 줄이는 것.
+
+아래 코드를 그대로 교체하면 돼.
+
+---
+
+## 1) `validateWithFootprint()` 안의 `if (blocked_here) { ... }` 교체
+
+**기존 블록 전체**를 아래로 교체하세요.
+
+```cpp
+if (blocked_here) {
+  // --- costmap 포인터를 잠깐 복사 (락 최소화) ---
+  std::shared_ptr<nav2_costmap_2d::Costmap2D> cm;
+  { std::lock_guard<std::mutex> lock(costmap_mutex_); cm = costmap_; }
+  if (!cm) return;
+
+  // --- 중심 셀(히트셀) 기준 월드좌표 ---
+  double wx, wy;
+  cm->mapToWorld(static_cast<int>(hit_mx), static_cast<int>(hit_my), wx, wy);
+
+  // --- 중심+이웃 1셀까지 에이전트 히트 검사 람다 ---
+  auto agent_hit_around = [&](double cx, double cy,
+                              unsigned int mx_c, unsigned int my_c) -> std::vector<AgentHit> {
+    // 1) 중심 먼저
+    auto hits = whoCoversPoint(cx, cy);
+    if (!hits.empty()) return hits;
+
+    // 2) 8방향 이웃
+    static const int OFFS[8][2] = {
+      { 1, 0},{-1, 0},{ 0, 1},{ 0,-1},
+      { 1, 1},{ 1,-1},{-1, 1},{-1,-1}
+    };
+    for (auto &o : OFFS) {
+      double wxx, wyy;
+      cm->mapToWorld(static_cast<int>(mx_c)+o[0], static_cast<int>(my_c)+o[1], wxx, wyy);
+      auto h2 = whoCoversPoint(wxx, wyy);
+      if (!h2.empty()) return h2;
+    }
+    return {};
+  };
+
+  // 1) 일반 코스트로 막혔을 때: 중심+이웃 검사
+  {
+    auto hits = agent_hit_around(wx, wy, hit_mx, hit_my);
+    if (!hits.empty()) {
+      publishAgentCollisionList(hits);
+      last_agent_block_time_ = this->now();
+      return;
+    }
+  }
+
+  // 2) (보조) agent mask가 있으면 동일한 보강 검사 재시도
+  if (compare_agent_mask_) {
+    const bool agent_mark = agentCellBlockedNear(
+        hit_mx, hit_my,
+        static_cast<unsigned char>(agent_cost_threshold_),
+        agent_mask_manhattan_buffer_);
+    if (agent_mark) {
+      auto hits2 = agent_hit_around(wx, wy, hit_mx, hit_my);
+      if (!hits2.empty()) {
+        publishAgentCollisionList(hits2);
+        last_agent_block_time_ = this->now();
+        return;
+      }
+    }
+  }
+
+  // 3) 여기까지 에이전트가 아니면 일반 장애물로 누적 처리
+  consecutive++;
+  if (consecutive >= consecutive_threshold_) {
+    triggerReplan("blocked (footprint) streak threshold reached");
+    return;
+  }
+} else {
+  consecutive = 0;
+}
+```
+
+---
+
+## 2) `validateWithPoints()` 안의 `if (blocked_cell) { ... }` 교체
+
+**기존 블록 전체**를 아래로 교체하세요.
+
+```cpp
+if (blocked_cell) {
+  // --- costmap 포인터 복사 ---
+  std::shared_ptr<nav2_costmap_2d::Costmap2D> cm;
+  { std::lock_guard<std::mutex> lock(costmap_mutex_); cm = costmap_; }
+  if (!cm) return;
+
+  // --- 중심 셀 월드좌표 ---
+  double wx, wy;
+  cm->mapToWorld(static_cast<int>(mx), static_cast<int>(my), wx, wy);
+
+  // --- 중심+이웃 1셀까지 에이전트 히트 검사 람다 ---
+  auto agent_hit_around = [&](double cx, double cy,
+                              unsigned int mx_c, unsigned int my_c) -> std::vector<AgentHit> {
+    // 1) 중심
+    auto hits = whoCoversPoint(cx, cy);
+    if (!hits.empty()) return hits;
+
+    // 2) 8방향 이웃
+    static const int OFFS[8][2] = {
+      { 1, 0},{-1, 0},{ 0, 1},{ 0,-1},
+      { 1, 1},{ 1,-1},{-1, 1},{-1,-1}
+    };
+    for (auto &o : OFFS) {
+      double wxx, wyy;
+      cm->mapToWorld(static_cast<int>(mx_c)+o[0], static_cast<int>(my_c)+o[1], wxx, wyy);
+      auto h2 = whoCoversPoint(wxx, wyy);
+      if (!h2.empty()) return h2;
+    }
+    return {};
+  };
+
+  // 1) 일반 코스트로 막혔을 때: 중심+이웃 검사
+  {
+    auto hits = agent_hit_around(wx, wy, mx, my);
+    if (!hits.empty()) {
+      publishAgentCollisionList(hits);
+      last_agent_block_time_ = this->now();
+      return; // 에이전트 충돌 확정
+    }
+  }
+
+  // 2) (보조) agent mask 기준으로도 보강 검사
+  if (compare_agent_mask_) {
+    const bool agent_mark = agentCellBlockedNear(
+        mx, my,
+        static_cast<unsigned char>(agent_cost_threshold_),
+        agent_mask_manhattan_buffer_);
+    if (agent_mark) {
+      auto hits2 = agent_hit_around(wx, wy, mx, my);
+      if (!hits2.empty()) {
+        publishAgentCollisionList(hits2);
+        last_agent_block_time_ = this->now();
+        return;
+      }
+    }
+  }
+
+  // 3) 에이전트 히트가 아니면 이후의 일반 장애물 로직으로 진행
+}
+```
+
+> 위 “보강 검사”는 **중심점만 보던 기존 로직** 대비, 실제 겹침 위치가 **셀 경계/꼭짓점**에 걸린 경우도 안정적으로 agent로 분류해 줍니다.
+> (참고) `agentCellBlockedNear()`는 이전 답변처럼 **월드→에이전트 맵 변환** 버전으로 교체해 두면 `agent_mask_manhattan_buffer`를 1~3의 정상값으로 낮춰도 잘 동작합니다.
+
+---
+
+필요한 수정은 여기까지예요.
+그대로 붙여 넣고 빌드하면, 작은 파라미터에서도 agent 충돌이 **일반 장애물로 오판되는 문제**가 현저히 줄어들 거예요.
