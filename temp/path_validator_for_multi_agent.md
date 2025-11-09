@@ -6851,3 +6851,166 @@ master costmap의 인덱스 `(mx, my)`에 대응하는 **월드좌표 (wx, wy)**
 | validateWithFootprint | footprint 면적 충돌 검사 (에이전트 우선)            | world↔map 혼합               | 다수                       | 샘플 수·footprint 크기 의존 | footprint_step_m_, cost/agent thresholds, consecutive_threshold 등 |
 
 필요하면 위 설명을 바탕으로 **튜닝 가이드**나 **디버깅 체크리스트**도 정리해줄게.
+###########################  
+############################  
+###########################  
+좋아. 아래에 **whoCoversPoint()**를 “코드가 실제로 하는 일” 중심으로 단계별로 풀고, 이어서 **에이전트 판정 전체 플로우**(validateWithFootprint/validateWithPoints 안에서의 의사결정 우선순위 포함)를 코드 기반으로 정리해줄게.
+
+---
+
+# whoCoversPoint(wx, wy): “이 월드 좌표를 커버하는 에이전트 찾기”
+
+**목적**
+주어진 월드 좌표 `(wx, wy)`가 **어떤 에이전트의 현재 footprint** 또는 **에이전트 truncated_path 기반 튜브**에 포함되는지 판정하고, 히트한 에이전트들의 메타데이터(기계 ID, 타입, 메모 등)를 `AgentHit` 목록으로 반환.
+
+## 입력/출력
+
+* 입력: `wx, wy` (월드 좌표)
+* 출력: `std::vector<AgentHit>`
+  (0개면 “해당 점을 커버하는 에이전트 없음”)
+
+## 내부 로직: 코드 흐름 그대로
+
+1. **동기화/신선도 체크**
+
+   * `agents_mutex_` 락을 잡고 `last_agents_` 스냅샷을 읽음. 없으면 빈 벡터 반환.
+   * `agents_freshness_timeout_ms_`보다 오래된 메시지면(=신선도 만료) 빈 벡터 반환.
+   * `last_agents_->header.frame_id`가 설정되어 있고 `global_frame_`과 **불일치**하면(프레임 불일치) 빈 벡터 반환.
+
+     > 즉, **좌표계 mismatch는 즉시 중단**.
+
+2. **모든 에이전트 순회 (`for (const auto& a : last_agents_->agents)`)**
+
+   * `a.footprint.polygon.points`가 3점 미만이면 스킵(폴리곤 성립X).
+
+3. **(1차) “현재 위치 footprint”로 커버 여부**
+
+   * 에이전트 footprint를 **소확장**(=agent_match_dilate_m_만큼 등방성 확장)
+
+     * 무게중심 `(cx, cy)` 계산
+     * 각 꼭짓점 `p`에서 중심까지 방향 벡터 `(vx, vy)` 단위화 → `p + agent_match_dilate_m_ * (vx, vy)`
+   * 에이전트 **현재 pose**(`a.current_pose.pose`)의 yaw로 로컬 폴리곤을 **월드 좌표**로 변환
+     `q = R(yaw) * p_local + t(current_pose)`
+   * `pointInPolygon(poly_world, wx, wy)`가 **true**면:
+
+     * `AgentHit hit` 구성:
+
+       * `machine_id`, `type_id`, `x=wx`, `y=wy`
+       * **TTC 추정**:
+
+         * `headingTo(a.current_pose.pose, wx, wy)`로 대상점에 대한 상대 heading 구함
+         * `speedAlong(a.current_twist, heading)` = `linear.x * cos(heading)`
+         * `v_along > 0.05`면 `dist / v_along`으로 `ttc_first` 추정, 아니면 `-1(unknown)`
+       * `note = "agent footprint overlap; TTC estimated/unknown"`
+     * `out.emplace_back(hit)` 하고 **다음 에이전트로 continue**
+
+       > 현재 footprint에 걸리면 **path 튜브 검사까지 갈 필요 없음** (최우선)
+
+4. **(2차) “truncated_path 튜브”로 커버 여부 (옵션)**
+
+   * `agent_path_hit_enable_`이 **true**면 `pathTubeCoversPoint(a, wx, wy, stride, dilate, maxposes, ...)` 호출:
+
+     * `a.truncated_path`의 poses를 **거리 누적 기반 stride**(`agent_path_hit_stride_m_`)로 **희소 샘플링**
+     * 각 샘플 pose에서 **footprint를 얇게 등방성 확장**(`agent_path_hit_dilate_m_`)
+     * 그 폴리곤을 pose yaw로 **월드 좌표로 변환**
+     * `pointInPolygon(poly_world, wx, wy)`가 **true**인 포즈 하나라도 있으면 **covered**
+   * covered면 `AgentHit` 구성(footprint와 유사하되 `ttc_first = -1`, `note = "agent truncated_path overlap"`), `out.emplace_back(hit)`.
+
+5. **반환**
+
+   * 모든 에이전트를 검사한 후 `out` 반환.
+   * 비어있으면 “에이전트가 점을 덮지 않음”.
+
+## 설계 포인트 / 파라미터 영향
+
+* **우선순위**: “현재 footprint” 히트가 **path 튜브**보다 **우선** (코드상 continue;로 바로 다음 에이전트로 넘어감).
+* `agent_match_dilate_m_`: 현재 footprint를 **약간 부풀려서** 검출 민감도를 높임(오검 vs 미검 트레이드오프).
+* `agent_path_hit_*`: 튜브 폭(dilate), 샘플 간격(stride), 최대 포즈 수(max_poses)로 **탐지 밀도/속도** 제어.
+* 프레임/신선도 체크가 **초전**에 걸리므로, 메시지 stale/프레임 mismatch면 무조건 “미검”.
+
+---
+
+# “Agent 판정” 전체 플로우 (validate 계열에서의 의사결정 우선순위)
+
+에이전트 판정은 **경로 검증 루프**(points 또는 footprint 기반) 중 “차단 징후”가 관측될 때마다 **가장 먼저** 시도됩니다. 두 validate 함수의 구조는 거의 동일하며, 차이는 **차단을 감지하는 방법**뿐입니다.
+
+아래는 **validateWithFootprint**를 예로 든 전체 의사결정. (validateWithPoints도 `isBlockedCellKernel()`로 차단 감지하는 점만 다르고, 이후 로직은 동일)
+
+## 0) 사전조건
+
+* 로봇 상태가 `DRIVING` 또는 `PLANNING`인지 확인(아니면 return)
+* replan 억제 홀드: 최근 `last_agent_block_time_` 이후 `agent_block_hold_sec_` 이내면 **검사 자체를 return** (불필요한 재플래그 방지)
+
+## 1) 경로를 샘플링
+
+* `footprint_step_m_` 간격으로 `samples`를 생성
+* 검사 거리 상한 `max_check_dist` 내에서만 전진
+
+## 2) 각 샘플 pose에서 **차단 감지**
+
+* **원형 footprint 모드**: `r_cells = ceil(robot_radius_m_ / resolution)`인 **원형 디스크** 안의 셀들에 대해 `masterCellBlocked()`를 검사
+* **다각형 footprint 모드**: footprint를 월드 좌표 폴리곤으로 만들고, **그 폴리곤 내부 래스터 셀**만 `masterCellBlocked()` 검사
+* 하나라도 threshold 이상이면 `blocked_here = true` 및 `(hit_mx, hit_my)` 저장
+
+## 3) 차단 발생 시: **Agent 우선 판정**
+
+* `(hit_mx, hit_my)`를 월드 `(wx, wy)`로 변환
+* **우선** `whoCoversPoint(wx, wy)`를 호출하기 전에, 구현에서는 **‘중심+8방향 1셀 이웃’**까지 확대해서 체크하는 람다 `agent_hit_around()`를 사용:
+
+  * 중심 `(wx, wy)`에 대해 `whoCoversPoint()` → **hit면 즉시** `publishAgentCollisionList(hits); last_agent_block_time_=now; return;`
+  * hit이 없으면 `(hit_mx, hit_my)`의 8-neighborhood 각각을 월드 좌표로 바꿔 `whoCoversPoint()` 반복
+    → **어느 한 곳이라도 hit**면 동일하게 publish+return
+  * 이 확장은 **rasterization/샘플링 경계 오차**를 줄이려는 장치
+
+> 즉, **실제 에이전트 판정의 1순위는 언제나 whoCoversPoint**이며, 단일 점 오차를 줄이려고 **이웃까지 검사**해주는 형태.
+
+## 4) (보조) agent mask 근거로 재시도
+
+* `compare_agent_mask_ == true` 이고 `agentCellBlockedNear(hit_mx, hit_my, agent_cost_threshold_, agent_mask_manhattan_buffer_)`가 **true**면
+  → 다시 `agent_hit_around()`로 `whoCoversPoint()` 재시도
+  → hit면 publish+return
+* **의미**: master costmap 상의 고코스트가 “agent layer”의 표식과 **정합**될 때, 위치 오차로 놓친 케이스를 **한 번 더 잡아내기** 위한 보조 근거
+
+## 5) 에이전트가 아니면 → **일반 장애물 누적**
+
+* 위 단계들에서 에이전트로 확정되지 않았다면, 이 차단은 **일반 장애물**로 간주
+* `consecutive++`; 만약 `consecutive >= consecutive_threshold_` 이면 `triggerReplan("blocked (footprint) streak threshold reached")` 하고 return
+* 막힘이 해소되면 `consecutive = 0`으로 리셋
+
+## 6) 종료 조건
+
+* 루프를 다 돌아도 replan 트리거 없이 끝나면 함수 종료(=경로상 안전 또는 아직 성숙치 않은 장애물)
+
+---
+
+# 왜 “whoCoversPoint() 우선”이 중요한가?
+
+* **agentCellBlockedNear()는 서로 다른 좌표계/해상도의 costmap 간의 근방 표식 존재 여부**만 확인합니다.
+  → “이 셀 주변에 agent layer가 있다”는 **약한 신호**.
+* 반면 **whoCoversPoint()는 실제 에이전트의 기하(footprint) 또는 미래 궤적(tube)의 “정밀 공간 포함 관계”**를 확인합니다.
+  → “에이전트의 형상/경로가 이 점을 실제로 덮는다”는 **강한 신호**.
+* 따라서, **오검/미검 트레이드오프** 관점에서 whoCoversPoint() 결과를 **최우선**으로, agentCellBlockedNear()는 **보조 증거**로 쓰는 것이 맞습니다. (코드가 그렇게 되어 있음)
+
+---
+
+# 성능/튜닝 포인트
+
+* **민감도 조정**
+
+  * `agent_match_dilate_m_`: 현재 footprint의 **소확장** 폭. 너무 크면 오검↑, 너무 작으면 미검↑.
+  * `agent_path_hit_dilate_m_`: 튜브 폭. 교차 판단의 관대함/보수성 조절.
+  * `agent_path_hit_stride_m_`: 튜브 샘플 간격. 작을수록 정확하지만 비용↑.
+  * `agent_mask_manhattan_buffer_`: 보조 근거 반경. 너무 크면 agent 아닌데도 agent로 오해할 수 있음.
+
+* **경계/좌표계**
+
+  * whoCoversPoint()는 오직 **월드 좌표 기반**으로 폴리곤 포함을 판정하므로, `last_agents_` 프레임이 `global_frame_`과 달라지면 **전체 skip**됩니다. 프레임 정합을 반드시 보장하세요.
+  * agentCellBlockedNear()가 master↔agent_mask의 **origin/resolution mismatch**를 월드 좌표 경유로 해결하는 점이 장점.
+
+* **지연/갱신**
+
+  * `agents_freshness_timeout_ms_`에 의해 낡은 MultiAgent 메시지는 무시. 실제 환경에서 에이전트가 빠르게 움직이면 너무 짧게 잡을 경우 **간헐적 미검**이 발생할 수 있음.
+
+---
+
+필요하면 위 흐름을 **시퀀스 다이어그램**이나 **flow chart** 형태로도 정리해줄게.
