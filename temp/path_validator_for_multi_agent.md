@@ -6620,3 +6620,234 @@ void PathValidatorNode::triggerReplan(const std::string & reason)
 ---
 
 이 문서는 구현 코드의 현재 로직을 바탕으로 작성되었습니다. 특정 운영 환경(센서 update rate, costmap resolution, agent density, corridor width)에 따라 파라미터 최적점은 달라질 수 있으며, 위 **튜닝 팁**을 기준으로 점진 조정하시길 권장합니다.
+####################  
+####################  
+#####################  
+좋아, 아래 5개 함수의 **의도 → 입력/출력 → 내부 단계 → 파라미터 영향 → 복잡도/주의점** 순서로, 실제 코드 흐름을 그대로 풀어서 설명할게. (기술 용어는 그대로 둠)
+
+---
+
+# isBlockedCellKernel(mx, my)
+
+**역할**
+단일 셀 `(mx, my)` **주변 커널(±K)** 안에 `cost_threshold_` 이상(=장애물로 간주)인 master costmap 셀이 하나라도 있으면 **true**를 반환. 즉, **보수적인 근방 차단 판정**.
+
+**입력 / 출력**
+
+* 입력: `mx, my` (master costmap index)
+* 출력: bool (커널 내 차단 존재 여부)
+
+**내부 로직 (코드 그대로 단계화)**
+
+1. `costmap_mutex_` 락 → `costmap_` 존재 확인. 없으면 false.
+2. `K = kernel_half_size_`.
+3. `x = mx + dx`, `y = my + dy`를 `dx, dy ∈ [-K, K]`로 이중 루프.
+4. 맵 경계 밖이면 continue.
+5. `c = costmap_->getCost(x,y)` 취득.
+
+   * `ignore_unknown_ == true`이고 `c == NO_INFORMATION`이면 continue.
+   * `c >= cost_threshold_`이면 **즉시 true**.
+6. 루프가 끝나면 false.
+
+**파라미터 영향**
+
+* `kernel_half_size_`: 커널 반경. 클수록 보수적(=false negative↓, false positive↑).
+* `cost_threshold_`: 차단 민감도. 낮출수록 차단 판정↑.
+* `ignore_unknown_`: Unknown 셀 무시 여부.
+
+**복잡도 / 주의점**
+
+* 시간복잡도: `O((2K+1)^2)` per query.
+* 경계 체크 필수(코드에 있음).
+* **용도**: points 검증에서 “점 하나”가 아닌 “근방 패치”로 판단하여 미세한 스파이크/오차를 흡수.
+
+---
+
+# masterCellBlocked(mx, my, thr)
+
+**역할**
+master costmap의 **단일 셀**이 주어진 임계치 `thr` 이상인지 **즉시 판정**.
+
+**입력 / 출력**
+
+* 입력: `mx, my`, `thr` (보통 `static_cast<unsigned char>(cost_threshold_)`)
+* 출력: bool
+
+**내부 로직**
+
+1. `costmap_mutex_` 락 → 존재 확인.
+2. `c = costmap_->getCost(mx, my)`.
+3. `ignore_unknown_`이고 `c == NO_INFORMATION`이면 false.
+4. `c >= thr`면 true, 아니면 false.
+
+**파라미터 영향**
+
+* `thr`가 `cost_threshold_`에 해당.
+* `ignore_unknown_`의 처리 동일.
+
+**복잡도 / 주의점**
+
+* `O(1)`
+* **validateWithFootprint**에서 폴리곤 내부의 **각 래스터 셀을 빠르게 검사**할 때 핵심.
+
+---
+
+# pointInPolygon(poly, x, y)
+
+**역할**
+**Ray casting** 방식으로 `(x,y)` 점이 다각형 `poly` 내부에 있는지 체크. 내부면 true.
+
+**입력 / 출력**
+
+* 입력: `poly`(월드 좌표의 polygon vertex들), `x, y`
+* 출력: bool
+
+**내부 로직**
+
+1. `inside=false`, `n = poly.size()`.
+2. 인덱스 `(i, j)`를 `(0..n-1, n-1)`로 돌면서 각 edge `(xi, yi)→(xj, yj)`에 대해:
+
+   * y-수직 교차 조건: `((yi > y) != (yj > y))`
+   * 교차 x좌표 계산:
+     `x_cross = (xj - xi)*(y - yi)/(yj - yi + ε) + xi`  (코드에선 `max(1e-12, yj-yi)`로 분모 보호)
+   * `x < x_cross`면 `inside = !inside` 토글.
+3. 루프 종료 후 `inside` 반환.
+
+**파라미터 영향**
+
+* 없음. 다만 입력 `poly`는 **월드 좌표계**여야 정확.
+
+**복잡도 / 주의점**
+
+* 시간복잡도: `O(n)` (n=vertex 수)
+* **수평/수직 edge의 특이 케이스**를 `1e-12`로 나눗셈 보호.
+* **validateWithFootprint**에서 **footprint polygon 내부 raster cell**인지 필터링하는 데 사용.
+
+---
+
+# agentCellBlockedNear(mx, my, thr, manhattan_buf)
+
+**역할**
+master costmap의 인덱스 `(mx, my)`에 대응하는 **월드좌표 (wx, wy)**를 **agent_mask**의 index `(ax, ay)`로 변환한 뒤, 그 **맨해튼 반경** `manhattan_buf` 안에서 `thr` 이상인 agent mask 셀이 있는지 확인.
+→ **서로 다른 costmap(해상도/원점 다름) 사이 좌표 정합**을 올바르게 처리.
+
+**입력 / 출력**
+
+* 입력: master index `(mx, my)`, `thr`, `manhattan_buf`
+* 출력: bool (근방 agent mark 존재 여부)
+
+**내부 로직**
+
+1. **교착 회피 패턴**:
+
+   * `costmap_mutex_`로 `costmap_`을 로컬 복사(`master`)
+   * `agent_mask_mutex_`로 `agent_mask_` 로컬 복사(`agent`)
+     (락 해제 후 진행)
+2. `master->mapToWorld(mx, my, wx, wy)`로 **master index → world**.
+3. `agent->worldToMap(wx, wy, ax, ay)`로 **world → agent_mask index**. 실패 시 false.
+4. `ix = ax, iy = ay` 기준으로 `|dx|+|dy| ≤ manhattan_buf`인 **맨해튼 이웃**을 모두 검사:
+
+   * 경계 밖 skip
+   * `a = agent->getCost(x, y)`
+     `a >= thr` 발견 즉시 true.
+5. 끝까지 없으면 false.
+
+**파라미터 영향**
+
+* `manhattan_buf`: 근방 허용 크기. 클수록 agent 간주 확률↑ (과대 시 오검↑).
+* `thr`: `agent_cost_threshold_` 적용이 일반적.
+
+**복잡도 / 주의점**
+
+* 시간복잡도: `O(manhattan_buf^2)` 정도(정확히는 다이아몬드 영역의 셀 수)
+* **좌표계 정합이 핵심**: master↔agent mask가 다른 해상도/원점이어도 **월드 좌표를 경유**하므로 정확.
+* 이 함수는 **보조 증거**로 쓰이고, 실제 에이전트 판정은 `whoCoversPoint()`가 최우선.
+
+---
+
+# validateWithFootprint(gpath)
+
+**역할**
+경로를 **footprint(원형 radius 또는 다각형)** 기준으로 따라가며 **면적 충돌**을 판정. **에이전트 히트가 우선**이며, 그렇지 않은 경우 **일반 장애물**로 누적하여 replan 트리거.
+
+**입력 / 출력**
+
+* 입력: `gpath` (global frame으로 변환된 Path의 PoseStamped 벡터)
+* 출력: 없음(내부에서 필요 시 publish/return)
+
+**핵심 아이디어**
+
+* 경로를 `footprint_step_m_` 간격으로 **샘플링**.
+* 각 샘플 pose에 대해 **footprint가 커버하는 래스터 셀** 중 `masterCellBlocked()`가 하나라도 있으면 “막힘”.
+* 막힘이면 **에이전트 먼저 확인**(중심+8-이웃 `whoCoversPoint()`), 필요 시 `agentCellBlockedNear()` 보강.
+* 에이전트면 충돌 정보 publish 후 종료, 아니면 일반 장애물 연속 카운트.
+* 연속 카운트가 `consecutive_threshold_` 도달 시 replan 트리거.
+
+**내부 로직 (코드 단계화)**
+
+1. `costmap_` 로컬 복사 및 존재 확인, 현재 pose(TF) 확보.
+2. 검사 거리 한계 계산:
+   `max_check_dist = min( max(min_lookahead_m_, max_speed_*lookahead_time_sec_), path_check_distance_m_ )`.
+3. **샘플링**: 누적 거리 `acc`로 `footprint_step_m_` 간격이 될 때마다 `samples`에 push. 첫 pose 포함.
+4. `master_thr = cost_threshold_`, `agent_thr = agent_cost_threshold_`.
+5. `consecutive=0`.
+6. `samples` 순회:
+
+   * **원형 사용(use_radius_)**이면:
+
+     * `cx,cy = worldToMap(ps.position)` 실패 시 `consecutive=0; continue`
+     * `r_cells = ceil(robot_radius_m_ / resolution)`
+     * 디스크 내부 `(dx,dy)`에 대해 index `mx=cx+dx, my=cy+dy`:
+
+       * 경계 체크
+       * `masterCellBlocked(umx, umy, master_thr)`이면 `blocked_here=true; hit_mx,hit_my` 저장
+   * **다각형 footprint**이면:
+
+     * pose yaw로 footprint를 **월드 좌표로 회전/평행이동** → `poly_world`
+     * `poly_world`의 bounding box를 `worldToMapEnforceBounds`로 래스터 범위 `(min_i..max_i, min_j..max_j)` 결정
+     * 그 범위 셀들을 순회:
+
+       * `mapToWorld(i, j, wx, wy)`
+       * `pointInPolygon(poly_world, wx, wy)`가 **내부**인 셀만 `masterCellBlocked()` 검사
+       * 차단 셀 발견 시 `blocked_here=true; hit_mx,hit_my` 저장
+   * **막힘이면**(blocked_here):
+
+     1. `cm = costmap_` 로컬 복사, `mapToWorld(hit_mx,hit_my)`로 `(wx,wy)`
+     2. **에이전트 우선 검사**:
+
+        * 람다 `agent_hit_around(cx,cy,mx,my)`로 **중심 + 8-이웃** 각각에 대해 `whoCoversPoint()` 호출
+        * 결과가 비어있지 않으면 `publishAgentCollisionList()` 하고 `last_agent_block_time_` 갱신 후 **return**
+     3. **보조(agent mask)**:
+
+        * `compare_agent_mask_`가 true이고 `agentCellBlockedNear(hit_mx, hit_my, agent_thr, agent_mask_manhattan_buffer_)`가 true면, 다시 `agent_hit_around()` 시도 → hit이면 publish+return
+     4. **일반 장애물 누적**: `consecutive++`; `consecutive >= consecutive_threshold_`면 `triggerReplan()` 하고 return
+   * **안 막히면**: `consecutive = 0` 리셋
+7. 루프 종료 시 추가 동작 없음.
+
+**파라미터 영향**
+
+* `use_radius_`, `robot_radius_m_`: 원형/다각형 경로.
+* `footprint_step_m_`: 샘플 간격(작을수록 촘촘).
+* `cost_threshold_`, `agent_cost_threshold_`, `agent_mask_manhattan_buffer_`.
+* `consecutive_threshold_`, `path_check_distance_m_`, `min_lookahead_m_`, `lookahead_time_sec_`, `max_speed_`.
+
+**복잡도 / 주의점**
+
+* 원형: `O(#samples * r_cells^2)`
+* 다각형: `O(#samples * bbox_cells)` (bbox 안에서 polygon test까지 수행)
+* **중요**: 폴리곤은 **월드 좌표**에서 point-in-polygon → 라스터 접근 순서가 올바름.
+* **에이전트 우선**: 일반 장애물로 잘못 카운트되는 문제를 줄이기 위한 핵심 설계.
+
+---
+
+## 빠른 요약 표
+
+| 함수                    | 핵심 목적                                   | 좌표계                        | 락                        | 시간복잡도(개략)            | 주요 파라미터                                                           |
+| --------------------- | --------------------------------------- | -------------------------- | ------------------------ | -------------------- | ----------------------------------------------------------------- |
+| isBlockedCellKernel   | 커널(±K) 내 고비용 셀 존재                       | map index                  | costmap                  | O(K²)                | kernel_half_size_, cost_threshold_, ignore_unknown_               |
+| masterCellBlocked     | 단일 셀 고비용 여부                             | map index                  | costmap                  | O(1)                 | thr(=cost_threshold_)                                             |
+| pointInPolygon        | 점의 폴리곤 내부 여부                            | world                      | 없음                       | O(n)                 | (없음)                                                              |
+| agentCellBlockedNear  | master셀 대응 agent_mask 근방의 agent mark 여부 | master idx→world→agent idx | costmap+agent_mask(로컬복사) | O(buf²)              | agent_cost_threshold_, agent_mask_manhattan_buffer                |
+| validateWithFootprint | footprint 면적 충돌 검사 (에이전트 우선)            | world↔map 혼합               | 다수                       | 샘플 수·footprint 크기 의존 | footprint_step_m_, cost/agent thresholds, consecutive_threshold 등 |
+
+필요하면 위 설명을 바탕으로 **튜닝 가이드**나 **디버깅 체크리스트**도 정리해줄게.
