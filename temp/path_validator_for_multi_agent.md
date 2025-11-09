@@ -6246,3 +6246,377 @@ void PathValidatorNode::triggerReplan(const std::string & reason)
 * `agent_layer`에서 경로 코스트가 강해서 과차단되면, layer 쪽 `path_cost`를 약하게 조정(예: 140~160)하거나 `path_dilation_m` 줄이기
 
 필요하면 `whoCoversPoint()`에 **TTC 근사(경로 기반)** 도 추가해줄 수 있어. 지금은 footprint TTC만 추정하고 경로 튜브는 `-1`로 뒀어(안전한 기본).
+##################  
+#####################  
+#####################  
+# PathValidatorNode 소프트웨어 문서 (기술 해설)
+
+본 문서는 `replan_monitor::PathValidatorNode`의 **의도(intent)**, **데이터 흐름(data flow)**, **동작 로직(algorithms)**, **쓰레딩/락 모델(threading & locks)**, 및 **각 메서드별 상세 설명**을 제공합니다. 코드의 모든 함수는 ROS2(Node, Publisher/Subscriber/Timer), Nav2(Costmap2D, Footprint), TF2, 그리고 사용자 정의 메시지(`multi_agent_msgs`)를 사용합니다. 영어 기술 용어는 그대로 유지합니다.
+
+---
+
+## 1) 역할 개요 (Overview)
+
+`PathValidatorNode`는 주행 중인 로봇의 **현재 계획 경로(nav_msgs/Path)** 상에 **충돌 위험**이 있는지 온라인으로 판정합니다. 충돌 요인은 크게 두 가지:
+
+1. **일반 장애물(Master costmap)**: `/global_costmap/costmap_raw`에서 수신한 costmap 상 `cost_threshold` 이상인 셀.
+2. **에이전트(Agent)**: 다른 로봇/사람 등 외부 동적 객체.
+
+   * **footprint overlap**(현재 pose 기준 footprint의 dilatation)
+   * **truncated_path tube overlap**(경로 포즈마다 얇게 확장한 footprint 튜브)
+
+검출 결과가 **에이전트 유발**이면 상세 정보를 `/path_agent_collision_info`로 publish하고, 일반 장애물이 일정 횟수(consecutive) 이상 연속되면 `/replan_flag`를 토글해 **리플랜(replan)**을 유도합니다. 또한, 에이전트 충돌 알림 이후 일정 시간은 replan을 막는 **hold(Agent block hold)**를 둡니다.
+
+---
+
+## 2) ROS I/O 및 주요 파라미터
+
+### 구독(Subscriptions)
+
+* `"/global_costmap/costmap_raw"`: `nav2_msgs::msg::Costmap`
+* `agent_mask_topic` (기본: `"/agent_layer/costmap_raw"`): `nav2_msgs::msg::Costmap`
+  (에이전트 레이어 costmap, 보조 판정에 사용)
+* `"/multi_agent_infos"`: `multi_agent_msgs::msg::MultiAgentInfoArray`
+* `"/robot_status"`: `std_msgs::msg::String` (예: `"DRIVING"`, `"PLANNING"`)
+* `"/plan_pruned"`: `nav_msgs::msg::Path` (검증 대상 경로)
+
+### 퍼블리시(Publishers)
+
+* `"/replan_flag"`: `std_msgs::msg::Bool` (리플랜 트리거)
+* `"/path_agent_collision_info"`: `multi_agent_msgs::msg::PathAgentCollisionInfo` (에이전트 충돌 상세)
+
+### 타이머(Timers)
+
+* `obstacle_db_update_timer_`: 가시 영역(ROI) 내 **고비용 셀**을 데이터베이스에 누적 & pruning
+
+### 주요 파라미터(발췌)
+
+* `cost_threshold`: 일반 장애물로 간주할 cost 기준(기본 254)
+* `agent_cost_threshold`: 에이전트 mask에서 “agent mark”로 인정할 cost 기준
+* `agent_mask_manhattan_buffer`: agent mask 근방 맨해튼 거리 버퍼(보조 판정)
+* `agent_match_dilate_m`: footprint overlap 판정 시 footprint를 등방성으로 확장
+* `agent_path_hit_*`: truncated_path 튜브 관련 stride/dilate/max poses
+* `consecutive_threshold`: 일반 장애물 연속 임계치(도달 시 replan)
+* `obstacle_persistence_sec`: **장애물 성숙도(persistence)** 요구 시간(빨리 사라지는 노이즈 억제)
+* `agent_block_hold_sec`: 에이전트 충돌 알림 후 replan 억제(hold) 시간
+
+---
+
+## 3) 쓰레딩 & 락 모델 (Threading & Locking)
+
+* **costmap** 접근: `costmap_mutex_`
+* **agent_mask** 접근: `agent_mask_mutex_`
+* **agents (MultiAgentInfoArray)** 접근: `agents_mutex_`
+* **obstacle_db** 접근: `obstacle_db_mutex_`
+
+콜백은 ROS의 multi-threaded executor에서 병행 호출 가능하므로, 모든 공유 상태는 mutex로 보호됩니다. **락 순서 교착(deadlock) 방지**를 위해, 일부 함수(`agentCellBlockedNear`)는 **로컬 shared_ptr 복사 후** 락 해제 상태로 좌표 변환을 수행합니다.
+
+---
+
+## 4) 데이터 구조
+
+* `ObstacleInfo{ first_seen, last_seen }`: ROI 스캔 시 보이는 고비용 셀의 “성숙도 판단”에 사용
+* `CostmapSignature`: costmap 메타데이터 서명 (size, resolution, origin) 변화 감지
+* `AgentHit{ machine_id, type_id, x, y, ttc_first, note }`: 에이전트 충돌 보고용
+
+---
+
+## 5) 동작 흐름 (High-level Flow)
+
+1. **Input 수신**
+
+   * 최신 master costmap / agent mask / agents / robot status / path 수신 및 저장.
+2. **주기적 DB 업데이트**
+
+   * `updateObstacleDatabase()`가 ROI 내 고비용 셀을 스캔하여 `obstacle_db_`에 누적(성숙도 관리).
+3. **경로 검증 요청**
+
+   * `validatePathCallback()`에서 path를 global로 변환 후 **footprint 기반** 또는 **points 기반** 검사로 분기.
+4. **충돌 판정 우선순위**
+
+   * 셀/footprint가 막힘이면 먼저 **whoCoversPoint**로 **에이전트 유발 여부**를 검사(+ 이웃 8방향 보강).
+   * 에이전트로 확정되면 충돌 리스트 publish & hold 시간 시작.
+   * 아니라면 일반 장애물로 카운트(성숙도 조건 충족 시).
+   * **연속 임계치** 도달 시 replan publish(단, hold 중이면 suppress).
+5. **출력**
+
+   * `/path_agent_collision_info` 또는 `/replan_flag` 발행.
+
+---
+
+## 6) 메서드 상세 (by file order)
+
+### 생성자 `PathValidatorNode::PathValidatorNode()`
+
+* **역할**: 파라미터 declare & load, 콜백/타이머/퍼블리셔 초기화, TF buffer 준비.
+* **입력/출력**: 없음 (Node 초기화)
+* **부작용**: ROS 엔티티 생성, 로그 출력.
+* **주의**: 파라미터 `footprint`가 유효하지 않으면 `use_radius_ = true`로 fallback.
+
+---
+
+### `void costmapCallback(const nav2_msgs::msg::Costmap::SharedPtr msg)`
+
+* **역할**: master costmap 최신화. 메타가 바뀌면 새 그리드 할당, `obstacle_db_` 초기화.
+* **입력**: Nav2 Costmap 메시지
+* **출력/상태**: `costmap_` 갱신, `last_costmap_sig_` 갱신
+* **락**: `costmap_mutex_` 사용
+* **주의**: 데이터 길이 검증, mismatch 시 warn 후 return.
+
+---
+
+### `void agentMaskCallback(const nav2_msgs::msg::Costmap::SharedPtr msg)`
+
+* **역할**: 에이전트 레이어 costmap(agent mask) 최신화.
+* **입력**: Nav2 Costmap 메시지
+* **출력/상태**: `agent_mask_`, `last_agent_sig_` 갱신
+* **락**: `agent_mask_mutex_`
+
+---
+
+### `void agentsCallback(const multi_agent_msgs::msg::MultiAgentInfoArray::SharedPtr msg)`
+
+* **역할**: 최신 MultiAgent 정보 보관.
+* **입력**: `MultiAgentInfoArray`
+* **출력/상태**: `last_agents_`, `last_agents_stamp_`
+* **락**: `agents_mutex_`
+
+---
+
+### `void robotStatusCallback(const std_msgs::msg::String::SharedPtr msg)`
+
+* **역할**: 로봇 상태 문자열 기반 주행/계획 여부 플래그 설정.
+* **입력**: `"DRIVING"` 또는 `"PLANNING"` 등
+* **출력/상태**: `is_robot_in_driving_state_` (atomic)
+
+---
+
+### `void validatePathCallback(const nav_msgs::msg::Path::SharedPtr msg)`
+
+* **역할**: 경로 유효성 검사 dispatcher.
+* **입력**: 검증 대상 path
+* **동작**:
+
+  1. 주행 상태가 아니면 return.
+  2. costmap 존재 확인.
+  3. path를 **global frame**으로 변환.
+  4. **agent block hold** 시간 내면 suppress.
+  5. `use_footprint_check_`에 따라 `validateWithFootprint()` 또는 `validateWithPoints()` 호출.
+* **출력**: 내부적으로 agent collision publish 또는 replan publish가 발생할 수 있음.
+
+---
+
+### `void updateObstacleDatabase()`
+
+* **역할**: ROI 내 `cost_threshold` 이상의 master costmap 셀을 **가시 영역 & 시야 각도** 제한으로 스캔하여 `obstacle_db_` 갱신. 오래된 항목은 prune.
+* **입력**: 없음(내부에서 TF로 현재 pose 획득)
+* **출력/상태**: `obstacle_db_` (first_seen / last_seen 관리)
+* **락**: `costmap_mutex_`, `obstacle_db_mutex_`
+* **알고리즘**:
+
+  * `lookahead = max(min_lookahead_m_, max_speed_ * lookahead_time_sec_)`
+  * ROI = 현재 위치 주변 정사각 + 전방 시야(cone) + stride 스캔
+  * `visible` set에 고비용 셀 key 삽입 → DB에 병합
+  * `obstacle_prune_timeout_sec_` 초 이상 안 보이면 삭제
+
+---
+
+### `bool getCurrentPoseFromTF(geometry_msgs::msg::Pose & pose_out) const`
+
+* **역할**: `base_frame_` → `global_frame_` TF 조회로 현재 pose.
+* **성공/실패**: TF 예외시 warn throttle, false 반환.
+
+---
+
+### `bool transformToGlobal(const geometry_msgs::msg::PoseStamped & in, geometry_msgs::msg::PoseStamped & out) const`
+
+* **역할**: 입력 pose를 global frame으로 변환. 이미 global이거나 빈 frame이면 그대로.
+* **실패 시**: TF 예외 로그 및 false.
+
+---
+
+### `void transformPathToGlobal(const nav_msgs::msg::Path & in, std::vector<geometry_msgs::msg::PoseStamped> & out) const`
+
+* **역할**: path 내 모든 pose를 global frame으로 변환하여 벡터에 저장.
+* **주의**: 변환 실패 pose는 skip.
+
+---
+
+### `inline uint64_t packKey(unsigned int mx, unsigned int my) const`
+
+* **역할**: 2D index를 64-bit key로 pack (DB map key).
+
+---
+
+### `bool isBlockedCellKernel(unsigned int mx, unsigned int my) const`
+
+* **역할**: master costmap에서 `(mx,my)` 주변 **kernel(±K)** 윈도우 내 `cost_threshold` 이상 존재 여부.
+* **락**: `costmap_mutex_`
+* **용도**: points 기반 검사에서 근접 커널로 보수적으로 “막힘” 판정.
+
+---
+
+### `inline bool masterCellBlocked(unsigned int mx, unsigned int my, unsigned char thr) const`
+
+* **역할**: master costmap 단일 셀에서 `thr` 이상인지 즉시 판정.
+* **락**: `costmap_mutex_`
+
+---
+
+### `inline bool agentCellBlockedNear(unsigned int mx, unsigned int my, unsigned char thr, int manhattan_buf) const`
+
+* **역할**: **좌표계를 정합**하여 master `(mx,my)`의 **월드 좌표를 agent_mask index로 변환** 후, 맨해튼 버퍼 내에서 `thr` 이상 존재 여부 확인(보조 판정).
+* **중요 포인트**:
+
+  * **교착 회피**: `costmap_`과 `agent_mask_`를 각각 잠깐씩 락 잡아 **로컬 shared_ptr**로 복사 후 락 해제.
+  * `master->mapToWorld()` → `agent->worldToMap()` 순서로 index 변환.
+* **반환**: agent mask가 agent로 마킹했는지 **근방에서** 확인.
+
+---
+
+### `void validateWithPoints(const std::vector<geometry_msgs::msg::PoseStamped> & gpath)`
+
+* **역할**: path를 **points**(pose 위치) 단위로 샘플링 없이 그대로 순회, 각 점이 **막힘**인지 판정.
+* **알고리즘**:
+
+  1. **거리 제한**: `max_check_dist = min(max_speed * lookahead_time, path_check_distance_m_)` 이내만 검사.
+  2. 각 path point를 map index로 변환 실패 시 streak reset.
+  3. `isBlockedCellKernel()`로 근방 커널 검사.
+  4. **막힘이면**:
+
+     * 중심 셀 및 **8-이웃 셀** 월드좌표로 **whoCoversPoint()** 호출 → **에이전트 히트 우선** 판정.
+     * 필요 시 `agentCellBlockedNear()`로 agent mask 보조 확인 후 재검사.
+     * **에이전트면**: `publishAgentCollisionList()` & `last_agent_block_time_` 갱신 → return.
+     * **아니면**: 일반 장애물로 간주. 단, `updateObstacleDatabase()`에서 누적된 `obstacle_db_`의 `first_seen` 기준으로 **성숙도(obstacle_persistence_sec_)** 충족 시에만 streak 카운트.
+  5. `consecutive_threshold_` 도달 시 `triggerReplan()` 호출.
+* **출력**: 필요 시 agent collision publish 또는 replan publish.
+* **주의**: agent 우선 판정으로 **오분류(일반 장애물로 잘못 카운트)**를 줄임.
+
+---
+
+### `static bool pointInPolygon(const std::vector<geometry_msgs::msg::Point> & poly, double x, double y)`
+
+* **역할**: Ray-casting으로 점 포함 여부.
+* **용도**: footprint/world polygon 내부 포함 판정.
+
+---
+
+### `void validateWithFootprint(const std::vector<geometry_msgs::msg::PoseStamped> & gpath)`
+
+* **역할**: path를 **footprint**(원형 또는 다각형)로 샘플링하면서 **면적 충돌**을 판정.
+* **알고리즘**:
+
+  1. 경로를 `footprint_step_m_` 간격으로 샘플링(총 검사 거리 `max_check_dist` 제한).
+  2. **원형(radius)**: 샘플 pose의 원형 footprint를 raster-space로 변환하여 원 디스크 내부 셀 중 `masterCellBlocked()` 여부 확인.
+  3. **다각형(footprint_)**: pose의 yaw로 **월드 폴리곤** 변환 → bounding box 래스터 스캔 → `pointInPolygon()`로 내부인 셀만 `masterCellBlocked()` 검사.
+  4. **막힘이면** points 방식과 동일하게 **에이전트 우선 판정**(중심+8-이웃 `whoCoversPoint()`), 필요 시 agent mask 보조, 아니면 일반 장애물 streak 카운트.
+  5. `consecutive_threshold_` 도달 시 replan 트리거.
+* **장점**: 차량 체적 반영으로 false negative 감소.
+* **주의**: 폴리곤 방식은 계산량이 커 샘플링 간격과 kernel 크기 조율 권장.
+
+---
+
+### `static double headingTo(const geometry_msgs::msg::Pose & pose, double wx, double wy)`
+
+* **역할**: pose yaw 대비 (pose→(wx,wy)) 방위각 차이(−π~π).
+* **용도**: `speedAlong()`과 결합하여 상대 점으로의 진행 성분 추정.
+
+---
+
+### `static double speedAlong(const geometry_msgs::msg::Twist & tw, double heading_rad)`
+
+* **역할**: 선속도 `tw.linear.x`와 heading 각도의 cos를 곱해 **목표점 방향 성분 속도** 산출.
+* **용도**: 에이전트의 **TTC(first)** 추정(단순 선형 모델).
+
+---
+
+### `static bool pathTubeCoversPoint(const multi_agent_msgs::msg::MultiAgentInfo & a, double wx, double wy, double stride_m, double dilate_m, int max_poses, double frame_yaw, const std::string & global_frame)`
+
+* **역할**: 에이전트 `truncated_path`의 각 pose에서 **얇게 확장된 footprint**(isotropic dilation `dilate_m`)를 월드로 투영하고 **stride_m** 간격으로 샘플링하여 `(wx, wy)` 포함 여부 확인.
+* **반환**: 포함 시 true (즉, **경로 튜브와 겹침**)
+* **주의**: TTC는 추정하지 않음(정적 오버랩만).
+
+---
+
+### `std::vector<AgentHit> whoCoversPoint(double wx, double wy) const`
+
+* **역할**: `(wx, wy)`를 **커버하는 에이전트**를 탐색하여 리스트로 반환.
+* **순서**:
+
+  1. 최신 `last_agents_` freshness 검사 및 frame 일치 확인.
+  2. 각 agent에 대해:
+
+     * **현재 footprint(소확장: `agent_match_dilate_m_`)** 월드 변환 → `pointInPolygon()` → 포함 시 `AgentHit` 구성.
+
+       * 진행 성분 속도(`speedAlong`)가 유의미하면 `TTC = dist / v_along`(>0.05 m/s), 아니면 -1.
+     * (미포함 & `agent_path_hit_enable_`)이면 **경로 튜브 검사**(`pathTubeCoversPoint`) → 포함 시 `AgentHit`(TTC -1)
+* **반환**: 0개 이상 `AgentHit`(중복 가능).
+* **주의**: 결과를 사용해 **에이전트 충돌 우선 판정**을 수행.
+
+---
+
+### `void publishAgentCollisionList(const std::vector<AgentHit> & hits)`
+
+* **역할**: `PathAgentCollisionInfo`에 충돌 목록을 채워 publish.
+* **입력**: AgentHit 벡터 (비어있으면 return)
+* **출력**: 토픽 publish (frame은 `global_frame_`)
+* **주의**: `publish_agent_collision_`이 false면 무시.
+
+---
+
+### `void triggerReplan(const std::string & reason)`
+
+* **역할**: replan을 트리거하는 `/replan_flag` publish.
+* **로직**:
+
+  * **에이전트 hold** 시간 내면 **suppress**.
+  * **cooldown_sec_** 내 중복 트리거 방지.
+  * `publish_false_pulse_`이면 짧은 타이머로 false를 재발행(펄스 형태).
+* **출력**: 로그 및 Bool publish.
+
+---
+
+## 7) 검증 로직의 핵심 포인트 (Design Intent)
+
+* **에이전트-우선 판정**: 막힘 감지 시 **항상 먼저 에이전트 히트**를 검사(중심+8-이웃).
+  → 실제로 agent 유발 충돌인데 일반 장애물로 오분류되는 문제 감소.
+* **좌표계 정합**: `agentCellBlockedNear()`에서 **master↔agent_mask index 변환**을 월드좌표 경유로 수행.
+  → 서로 origin/resolution이 달라도 올바른 근방 탐색 보장.
+* **성숙도(obstacle_persistence)**: 일반 장애물은 **일정 시간 지속될 때에만** 유효 카운트.
+  → 센서 노이즈/스파이크 억제.
+* **hold & cooldown**: replan 난발 방지, agent 알림 이후 잠깐 replan 억제.
+
+---
+
+## 8) 파라미터 튜닝 팁 (Tuning Notes)
+
+* `cost_threshold`(254): LETHAL(254)만 막힘으로. 민감도 높이려면 200~254 조정.
+* `kernel_half_size`(2): points 검사의 보수성. 늘릴수록 false positive↑.
+* `consecutive_threshold`(2~3): 리플랜 트리거 민감도.
+* `obstacle_persistence_sec`(≥1.0): 낮추면 반응 빠르나 노이즈↑.
+* `agent_match_dilate_m`(0.05~0.15): footprint overlap 관대함. 커지면 agent hit↑.
+* `agent_path_hit_dilate_m`(0.03~0.06): 튜브 두께. 과도하면 과차단.
+* `agent_mask_manhattan_buffer`(2~5): agent_mask 근방 허용 거리. 과대 설정은 오검↑.
+* `agent_block_hold_sec`(2.0~): 에이전트 감지 후 리플랜 억제 길이.
+
+---
+
+## 9) 에지 케이스 & 주의사항
+
+* **프레임 불일치**: `whoCoversPoint()`는 `last_agents_->header.frame_id`가 `global_frame_`과 다르면 early return. (agent source에서 frame 일치 보장 필요)
+* **경계 인덱스**: 이웃(±1) 검사 시 map 경계 밖 접근을 피하기 위한 index bound 체크가 권장됩니다.
+* **비정상 path**: path가 비어있거나 모두 동일점이면 샘플링/검사가 skip될 수 있음.
+* **TF 실패**: TF timeout 시 검사 skip → 주행 상태라도 결과가 없을 수 있음.
+
+---
+
+## 10) 통합(Integration) 체크리스트
+
+* 글로벌 프레임(`global_frame_`)과 costmap/agent_mask/agents 메시지의 frame 일치.
+* `agent_layer`의 raster가 실제 agent footprint/경로를 반영하도록 설정 (`dilation`, `forward smear`는 layer 쪽 정책).
+* `/robot_status` 발행이 주행 상태를 정확히 반영.
+* replan 소비 측(Planner/BT)이 `/replan_flag` Bool 펄스를 적절히 처리.
+
+---
+
+이 문서는 구현 코드의 현재 로직을 바탕으로 작성되었습니다. 특정 운영 환경(센서 update rate, costmap resolution, agent density, corridor width)에 따라 파라미터 최적점은 달라질 수 있으며, 위 **튜닝 팁**을 기준으로 점진 조정하시길 권장합니다.
