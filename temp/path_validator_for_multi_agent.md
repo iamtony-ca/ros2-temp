@@ -7014,3 +7014,180 @@ master costmap의 인덱스 `(mx, my)`에 대응하는 **월드좌표 (wx, wy)**
 ---
 
 필요하면 위 흐름을 **시퀀스 다이어그램**이나 **flow chart** 형태로도 정리해줄게.
+#########################  
+##########################  
+###########################  
+좋은 포인트야. 요약하면:
+
+* **“마스크만으로 에이전트 판정이 가능한가?” → 가능은 함.**
+  `agent_layer/costmap_raw`가 **현재 pose + truncated_path**를 footprint(+ dilate)로 채워서 **254** 같은 강한 cost로 찍고 있다면, **존재 판정(=여기 에이전트가 있다)** 자체는 `agent_mask`만으로 충분해.
+
+* **그런데, path_validator_node가 지금 하는 “에이전트 판정”은 단순 존재 판정이 아니라 “귀속 + TTC 산출”까지 포함**돼.
+  즉, *어느* 에이전트가 덮었는지(`machine_id`, `type_id`)와 **TTC**를 만들어서 `/path_agent_collision_info`로 내보내려면, **현재 구조에선 기하학적 매칭(whoCoversPoint)** 이 필요했어. 왜냐면 **agent_mask만으로는 ID/TTC 정보가 없기 때문**이야.
+
+아래에 근거/배경과 선택지를 정리해줄게.
+
+---
+
+## 왜 현재 코드는 whoCoversPoint()를 최우선으로 쓰는가?
+
+1. **agent_mask는 “존재”만 알려줌**
+
+   * 네 코드의 `AgentLayer::updateCosts()`는 master_grid에 코스트를 찍을 뿐이야.
+   * `AgentLayerMeta`도 퍼블리시하지만, **지금 구현에선** `machine_id=0`, `phase=0` 등 **빈 값**으로 보내고 있지? (의도적으로 경량화/샘플링만)
+   * 따라서 **어느 에이전트인지**를 알 수 없고, 당연히 **TTC**도 계산할 재료가 없어.
+
+2. **whoCoversPoint()는 MultiAgentInfoArray를 직접 읽어 기하학적으로 “귀속”을 판정**
+
+   * (a) 현재 footprint(조금 dilate)로 포함 여부 확인
+   * (b) 옵션으로 truncated_path 튜브 포함 여부 확인
+   * 포함되면 **machine_id/type_id**를 붙이고, 현재 속도/heading으로 **TTC**를 추정해서 `PathAgentCollisionInfo`에 넣어줘.
+   * 이게 지금 **ID/TTC를 채우는 유일한 경로**야.
+
+3. **agentCellBlockedNear()는 보조**
+
+   * master 코스트에 막힘이 보이면, **이게 에이전트 때문일 “가능성”**을 agent_mask에서 근방 표식(맨해튼 버퍼)로 확인하는 **힌트**로만 써.
+   * 하지만 **최종 판정/귀속**은 whoCoversPoint()가 함.
+
+---
+
+## “마스크만으로” 판정하고 싶다면 생기는 빈칸
+
+* **ID가 없음** → `PathAgentCollisionInfo.machine_id/type_id`를 채울 수 없음.
+* **TTC가 없음** → `current_twist`/heading 같은 동역학 정보를 agent_mask에서 얻을 수 없으니까.
+* 결국 지금 구조를 유지한 채로 whoCoversPoint()를 제거하면, `/path_agent_collision_info`가 **빈/부정확한 정보**가 돼.
+
+---
+
+## 가능한 설계 선택지 (장단점 포함)
+
+### A) **Mask-only Gate (가장 단순)**
+
+* 로직: `blocked_cell` 발견 → `agentCellBlockedNear()`만 보고 **에이전트 충돌로 확정** → **ID/TTC 없이** 간단한 메시지(또는 ID를 0/unknown 처리)로 publish → 리플랜/홀드 수행.
+* 장점: 구현 간단, 계산 가벼움.
+* 단점: **ID/TTC 유실**. 다운스트림(모니터링/로깅/휴리스틱)이 빈약해짐. 여러 에이전트가 겹치는 상황에서 설명력 저하.
+
+### B) **Mask + 근접 귀속(Heuristic)**
+
+* 로직: `agentCellBlockedNear()`가 true면, **가까운 에이전트 한 놈**을 `MultiAgentInfoArray`에서 **거리 최솟값**으로 간이 매칭 → 그 에이전트의 `machine_id/type_id` 채움, **TTC는 근사치**(현 위치에서의 heading/speed 기준) 계산.
+  (즉, whoCoversPoint() 대신 **근접 귀속**만 수행)
+* 장점: whoCoversPoint()보다 가볍고, **ID/TTC는 유지**.
+* 단점: **정밀도↓** (실제 footprint/튜브가 아닌데도 근접하면 오귀속 가능). 특히 밀집/교차 상황에서 취약.
+
+### C) **Mask + Meta(권장: 구조 개선)**
+
+* **AgentLayer가 “메타를 셀 단위로 귀속해서” 같이 보내주도록 확장**:
+
+  * `AgentLayer::rasterizeAgentPath()`에서 셀을 set할 때 **그 셀을 찍은 에이전트의 `machine_id/type_id`**도 함께 기록.
+  * 퍼블리시 방식:
+
+    * (1) 지금 있는 `AgentLayerMetaArray`에 **실제 기입**: 현재는 0으로 채우지만, 여기서 **진짜 machine_id/phase/mode …** 를 넣어주기.
+
+      * 단, 모든 셀을 퍼블리시하면 트래픽이 커지니 **stride**(메타 샘플링)와 ROI를 잘 조절.
+    * (2) 더 나은 방법: **별도 grid 메시지**(예: `nav2_msgs::msg::Costmap`와 동일 geometry, payload는 `uint16` machine_id map) 를 퍼블리시. type_id는 별도 사전(dict)로 보조.
+* **PathValidatorNode 쪽 변경**:
+
+  * `agent_layer_meta`(또는 “ID grid”)를 구독해서, `(mx,my)` → `(machine_id,type_id)` **룩업 테이블**을 만들어 둠.
+  * 이제 `blocked_cell` 발견 시 **whoCoversPoint 없이**도 즉시 ID를 뽑아 `/path_agent_collision_info` 채움.
+  * **TTC**는 `MultiAgentInfoArray`에서 해당 `machine_id`의 `current_pose/current_twist`를 읽어 계산 (지금과 동일한 식).
+* 장점: **가장 정확하고 빠름**(룩업), PathValidator에서의 기하학 연산 제거, agent_mask의 판정보다 **귀속 품질 대폭↑**.
+* 단점: AgentLayer/메시지 포맷 변경(작업량), 퍼블리시 데이터양 관리 필요.
+
+### D) **현 구조 유지(기하학 우선) + “마스크는 필터” (지금과 유사)**
+
+* 현재처럼 **whoCoversPoint() 최우선**, `agentCellBlockedNear()`는 **보조**.
+* 장점: **정밀도 최상**(footprint/튜브 포함 판정).
+* 단점: 계산비용(폴리곤 포함 반복)과 약간의 복잡성.
+
+---
+
+## “그럼 지금 코드에서 매핑은 어떻게 하고 있나?”
+
+* **ID 매핑**: `whoCoversPoint()`가 `last_agents_`(= `/multi_agent_infos`)의 각 에이전트에 대해
+
+  * “현재 footprint(소확장)” 포함? → **그 에이전트 hit**
+  * 아니면 “truncated_path 튜브” 포함? → **그 에이전트 hit**
+  * → hit이면 `machine_id/type_id`를 **직접 채움**
+* **TTC 계산**: 같은 함수 내에서
+
+  * `headingTo(current_pose, wx, wy)`와 `speedAlong(current_twist, heading)`로 **목표점에 대한 진행 성분 속도**를 구해 `dist / v_along`으로 근사.
+  * 경로 튜브로 잡힌 경우는 포즈별 속도 관계가 모호하여 **-1**로 둠.
+
+즉, **귀속/ID/TTC는 전부 whoCoversPoint()가 MultiAgentInfo와의 기하학적 조인을 통해 만든다**가 핵심.
+
+---
+
+## 실전 제안
+
+* **진짜로 “마스크만으로” 가고 싶다면** → **C안**을 강추:
+
+  1. `AgentLayer::fillFootprintAt()`에서 set한 `(i,j)` 셀에 **machine_id/type_id**를 연결해서 저장.
+
+     * 지금은 `meta_hits`에 `(mx,my)`만 모아 `AgentLayerMetaArray`로 “샘플”만 보내고 있음.
+     * 여기에 **해당 셀을 찍은 agent의 정보**를 채워 넣어.
+  2. PathValidatorNode에 `agent_layer_meta` 구독 추가 → `(mx,my) -> (id,type)` 해시맵 유지.
+  3. `validateWith*()`에서 `blocked_cell` 시
+
+     * `agentCellBlockedNear()`로 **mask 존재** 확인
+     * **룩업으로 ID/type 회수** → `/path_agent_collision_info` 채우기
+     * **TTC는 MultiAgentInfoArray에서 해당 ID의 pose/twist로 계산** (지금 함수 재사용)
+
+* **작게만 바꾸고 싶다면**(빠른 타협):
+
+  * whoCoversPoint()는 유지하되, **순서를 바꿔 마스크 먼저 검사**:
+
+    * `blocked_cell` → `agentCellBlockedNear()`가 **false**면 **바로 일반 장애물 경로**
+    * `true`일 때만 whoCoversPoint() 수행(현재도 거의 이렇게 하고 있지만, “중심+이웃 whoCoversPoint 먼저” 블록을 **주석 해제**했으면 그 순서를 **mask 먼저**로 옮겨 최적화)
+  * 이렇게 하면 **기하 연산을 “mask로 좁혀진 후보에서만” 수행**하므로 비용이 줄고, ID/TTC 품질은 유지돼.
+
+---
+
+## 작은 코드 가이드 (타협안: “mask 먼저”)
+
+`validateWithFootprint()`/`validateWithPoints()`의 blocked_here 블록 안에서:
+
+```cpp
+// 1) 먼저 agent_mask로 빠르게 후보 필터링
+bool agent_mark = false;
+if (compare_agent_mask_) {
+  agent_mark = agentCellBlockedNear(hit_mx, hit_my,
+              static_cast<unsigned char>(agent_cost_threshold_),
+              agent_mask_manhattan_buffer_);
+}
+
+if (!agent_mark) {
+  // 마스크에 없으니 일반 장애물 누적
+  consecutive++;
+  if (consecutive >= consecutive_threshold_) {
+    triggerReplan("blocked (footprint) streak threshold reached");
+    return;
+  }
+  continue;
+}
+
+// 2) 마스크에 있으면 정밀 매칭 (ID/TTC 회수)
+auto hits = agent_hit_around(wx, wy, hit_mx, hit_my); // 내부가 whoCoversPoint() 호출
+if (!hits.empty()) {
+  publishAgentCollisionList(hits);
+  last_agent_block_time_ = this->now();
+  return;
+}
+
+// 마스크가 있는데 whoCoversPoint 미히트 → 경계/프레임/타이밍 오차.
+// 보수적으로 일반 장애물로 처리하거나, 버퍼를 키워 한 번 더 재시도.
+```
+
+* 이 구조면 **마스크에 걸리지 않으면** whoCoversPoint() 자체를 안 돌리고,
+* **마스크에 걸린 셀만** 정밀 판정을 해서 **ID/TTC 정확도**를 보존.
+
+---
+
+## 결론
+
+* 네 말처럼, **agent_mask가 “경로까지 반영된 footprint 튜브”를 lethal로 올바르게 칠하고 있다면 “존재 판정”은 mask만으로 충분**해.
+* 하지만 **ID/TTC까지 필요한 현재 아키텍처**에서는 **mask만으론 정보가 부족**해서
+
+  * **(권장)** AgentLayer가 **셀-메타(=ID/type/phase/속도 등)** 를 함께 퍼블리시하도록 확장하고 PathValidator가 룩업하는 구조(C안),
+  * **혹은** 지금처럼 **whoCoversPoint()로 기하 매칭**해서 ID/TTC를 붙이는 구조(D안),
+  * **어느 하나**를 선택해야 해.
+* **빨리 단순화**하려면 “마스크로 후보 필터 → 후보에만 whoCoversPoint”로 바꾸는 타협안을 적용해도 체감비용은 꽤 줄어들 거야.
