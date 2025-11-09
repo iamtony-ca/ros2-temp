@@ -7191,3 +7191,165 @@ if (!hits.empty()) {
   * **혹은** 지금처럼 **whoCoversPoint()로 기하 매칭**해서 ID/TTC를 붙이는 구조(D안),
   * **어느 하나**를 선택해야 해.
 * **빨리 단순화**하려면 “마스크로 후보 필터 → 후보에만 whoCoversPoint”로 바꾸는 타협안을 적용해도 체감비용은 꽤 줄어들 거야.
+
+##############################  
+################################  
+##################################  
+좋은 질문! 요점은 **`agentCellBlockedNear()`는 “여기 셀 주변에 에이전트 마스크가 있나?”만 빠르게 알려주는 힌트(booster)이고**, **최종 에이전트 판정(귀속/ID/TTC 산출)은 반드시 `whoCoversPoint()`가 한다**는 거예요. 코드 흐름 기준으로 깔끔히 정리해볼게요.
+
+---
+
+# 1) 각 함수의 역할
+
+## `whoCoversPoint(wx, wy)`
+
+* 입력: **월드 좌표 한 점**.
+* 동작:
+
+  1. `/multi_agent_infos`의 각 에이전트에 대해
+     (a) **현재 footprint(소확장)**로 point-in-polygon 검사 → 포함되면 **HIT**
+     (b) (옵션) **truncated_path 튜브** 포함 검사 → 포함되면 **HIT**
+  2. **HIT이면** 그 에이전트의 `machine_id`, `type_id`를 채우고,
+     현재 pose/속도(`current_pose/current_twist`)로 **TTC**(v‖ 성분으로 dist/v 계산)까지 산출.
+* 핵심: **귀속(어느 에이전트인지) + TTC 산출**이 가능한 **유일한** 경로.
+
+## `agentCellBlockedNear(mx, my, thr, manhattan_buf)`
+
+* 입력: **마스터 costmap 셀 좌표**(mx,my).
+* 동작:
+
+  1. 마스터 grid의 (mx,my)를 **world 좌표 → agent_mask grid 좌표**로 변환.
+  2. **맨해튼 거리 ≤ `manhattan_buf`** 이웃에 대해 agent_mask cost ≥ `thr`가 있으면 **true**.
+* 핵심: **“이 근방이 에이전트 마스크로 칠해졌는지”만** 알려주는 **존재 힌트**.
+
+  * **어느 에이전트인지 알 수 없음**(ID 없음).
+  * **TTC 계산 불가**(속도/방향 정보 없음).
+
+---
+
+# 2) 두 함수가 만나는 지점 (코드 흐름)
+
+두 경로(포인트 검사/footprint 검사) 모두 **“막힌 셀”**을 발견하면 동일한 패턴을 탑니다.
+
+### A. `validateWithPoints()` 내부 (요약)
+
+1. `blocked_cell = isBlockedCellKernel(mx, my)`로 **마스터 costmap**에서 막힘 감지.
+2. 막혔다면:
+
+   * (a) **기하 우선 시도**:
+
+     ```cpp
+     auto hits = agent_hit_around(wx, wy, mx, my); // 내부에서 whoCoversPoint() 호출
+     if (!hits.empty()) { publishAgentCollisionList(hits); ... return; }
+     ```
+
+     → 중심 + 8이웃까지 **whoCoversPoint()**로 **정밀 귀속** 시도.
+   * (b) **보조(힌트) 시도**:
+
+     ```cpp
+     if (compare_agent_mask_) {
+       bool mark = agentCellBlockedNear(mx, my, agent_thr, agent_mask_manhattan_buffer_);
+       if (mark) {
+         auto hits2 = agent_hit_around(wx, wy, mx, my); // 다시 whoCoversPoint()
+         if (!hits2.empty()) { publish...; return; }
+       }
+     }
+     ```
+
+     → **마스크에 찍혀 있으면** 한 번 더 귀속 재시도(경계/정렬 오차 보완).
+   * (c) 그래도 에이전트 귀속 실패 → **일반 장애물 누적 처리**(streak/threshold로 replan).
+
+### B. `validateWithFootprint()` 내부 (요약)
+
+* 구조가 동일합니다. 차이는 **“막힌 셀”을 찾는 전 단계**에서 로봇 footprint를 월드 폴리곤으로 rasterize해 교차 검사를 한다는 점뿐이고,
+* **막힘 이후의 흐름은 위와 동일**:
+
+  1. **기하 우선** (whoCoversPoint)
+  2. **마스크 힌트**(true일 때 **다시** whoCoversPoint)
+  3. 실패 시 일반 장애물 카운팅
+
+---
+
+# 3) “보조(힌트)”라는 말의 정확한 의미
+
+* **결정권이 없다**: `agentCellBlockedNear()` 결과가 **true라도** 그 자체로 “에이전트 충돌 확정”을 하지 않음.
+  반드시 **whoCoversPoint()의 HIT**가 있어야 **에이전트로 판정/귀속/발행**.
+* **용도는 두 가지**:
+
+  1. **후보 축소 / 재시도 트리거**: 연속 격자/프레임 정렬 오차로 `whoCoversPoint()`가 중심 포인트에서 놓쳤을 때,
+     **마스크가 근방에 있으면** “여긴 에이전트 가능성이 높다” → **이웃 포함 재시도**를 하게 만드는 스위치.
+  2. **연산 최적화 게이트(선택)**: 구현을 바꾸면
+
+     * “마스크가 false면 아예 whoCoversPoint()를 안 돌린다” 식으로 **게이트**로도 쓰기 좋음(후술).
+
+---
+
+# 4) 왜 이렇게 나눴나? (설계 의도)
+
+* **마스크는 ‘존재 신호’만 제공** → 빠르고 보수적. 하지만 **ID/TTC 없음**.
+* **whoCoversPoint는 ‘정밀 귀속’ + TTC 제공** → 계산 더 듦. 하지만 **결과 품질**(ID/TTC/설명력)이 높음.
+* 그래서 “**마스크는 힌트**, **기하는 확정**” 구조로 **정확도와 비용을 절충**한 것.
+
+---
+
+# 5) 파라미터 튜닝 포인트
+
+* `agent_mask_manhattan_buffer`
+
+  * **픽셀 단위** 맨해튼 버퍼. agent_layer의 dilation/forward smear, 해상도 차이, TF 타이밍 오차를 흡수.
+  * 너무 작으면 힌트가 자주 실패, 너무 크면 불필요한 재시도(=기하 연산) 증가.
+* `agent_cost_threshold`
+
+  * agent_mask에서 **에이전트로 간주할 최소 코스트**. lethal=254를 쓰면 명확.
+  * layer가 여러 개면 **합성 코스트가 올라가는 경우**도 있으니 주의.
+
+---
+
+# 6) 추천 가능한 흐름 최적화 (원 코드와의 차이만)
+
+현 코드는 “기하 우선 → 마스크 보조” 순서지만, **비용을 더 줄이고 싶다면**:
+
+```cpp
+// [제안] 마스크 먼저 확인 → 후보가 아니면 바로 '일반 장애물' 처리
+bool agent_mark = compare_agent_mask_ &&
+                  agentCellBlockedNear(hit_mx, hit_my, agent_thr, agent_mask_manhattan_buffer_);
+
+if (!agent_mark) {
+  // 마스크에 없으니 일반 장애물로 누적
+  consecutive++;
+  if (consecutive >= consecutive_threshold_) { triggerReplan(...); return; }
+  continue;
+}
+
+// 마스크에 있는 셀만 정밀 귀속(=whoCoversPoint) 실행
+auto hits = agent_hit_around(wx, wy, hit_mx, hit_my); // 내부 whoCoversPoint()
+if (!hits.empty()) { publishAgentCollisionList(hits); last_agent_block_time_ = now; return; }
+// 여전히 미귀속 → 경계/프레임 오차. 보수적으로 일반 장애물 처리 or 버퍼 키워 1회 재시도.
+```
+
+* 효과: **whoCoversPoint() 호출 빈도↓**, 전체 비용↓
+* 전제: **agent_layer가 truncated_path까지 충분히 칠**하고 있을 것.
+
+---
+
+# 7) 간단한 시나리오로 이해하기
+
+* **정적 장애물**(벽/파렛트):
+
+  * master는 막힘, **agent_mask는 비어 있음** → `agentCellBlockedNear=false` → **일반 장애물**로 누적.
+* **진짜 에이전트**(다른 로봇):
+
+  * master는 막힘, **agent_mask=true** → whoCoversPoint() **HIT** → **ID/TTC 포함** 충돌 메시지 발행.
+* **경계/정렬 오차**(셀/프레임 차):
+
+  * master 막힘, agent_mask true인데 중심점에 대해 **즉시 HIT가 안 날 수 있음**
+    → **이웃 8방향** 재시도 + 마스크 힌트로 한 번 더 whoCoversPoint() → 보정.
+
+---
+
+# 8) 한 줄 정의
+
+* **`agentCellBlockedNear()` = “여기 주변, 에이전트 ‘있을 확률 높음’”이라는 **빠른 신호** (ID/TTC 없음).
+* **`whoCoversPoint()` = “정말 에이전트고, 그중 **누구**이며 **TTC**는 얼마인지”까지 **확정**하는 판정기**.
+
+이렇게 이해하면 코드가 훨씬 깔끔하게 들어올 거예요.
