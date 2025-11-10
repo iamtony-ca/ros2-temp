@@ -531,3 +531,210 @@ score = severity * (1 + kappa * yprio)
 * **외부 replan이 자주 씹힘**: `replan_ignore_sec_after_agent`↓
 
 궁금한 파라미터 조합(예: 창고 좁은 회랑/4-way 교차)별 프리셋도 만들어 드릴 수 있어요.
+###########################  
+#############################  
+############################  
+좋아, 이 `fleet_decision_node.py`가 “상태(state)가 결정될 때까지” 실제로 어떤 순서와 기준으로 판단하는지를, **이벤트 흐름 기준**으로 정리해볼게. (용어는 영어 그대로, 설명은 한국어)
+
+---
+
+# 전체 흐름 개요
+
+노드는 크게 **세 가지 입력 이벤트**로 움직여:
+
+1. `/path_agent_collision_info` (agent 충돌 이벤트) → `on_collision`
+2. `/replan_flag` (외부에서 리플랜 요청) → `on_replan_flag`
+3. 주기 타이머(0.2s) → `on_timer` (resume/timeout)
+
+그리고 상태 변경은 항상 `_set_state_and_emit(state, reason)`를 통해 일어나며, 그 내부에서 **상태 토픽과 1회성 명령 펄스**를 발행해.
+
+---
+
+# 1) Replan 플래그 이벤트 흐름 (`on_replan_flag`)
+
+* 입력: `Bool(data=True)`가 오면 처리.
+* 직전 agent 이벤트 이후 `replan_ignore_sec_after_agent`(기본 0.5s) 안이면 **무시** (agent 이벤트 여파로 플러딩되는 리플랜을 억제).
+* 아니면 **즉시 `REPLAN` 상태로 전환**:
+  `self._set_state_and_emit("REPLAN", reason="external replan_flag")`
+  → `_emit_state_pulse`가 `topic_request_replan`에 `true` 펄스를 내보냄.
+* 주의: 소스 코드에서 과거엔 `pub_req_replan.publish()`를 따로 한번 더 쐈지만, **현재 주석 처리**되어 중복 발행 안 함.
+
+**결과:** 외부 신호 한 방에 상태는 `REPLAN`으로 바뀌고, replan 요청 펄스가 1회 발행됨.
+
+---
+
+# 2) Agent 충돌 이벤트 흐름 (`on_collision`)
+
+이게 핵심. 상태 결정 대부분이 여기서 일어난다.
+
+## 2-1) 충돌 후보 생성 (`build_candidates`)
+
+* 메시지의 각 충돌 지점 `(px, py)`/ `ttc_first` / `note` / (가능하면) `machine_id`를 바탕으로 **Candidate**를 만든다.
+* 에이전트 매칭:
+
+  * 1순위는 **ID 매칭**(msg.machine_id[i] → `agents_by_id[mid]`).
+    (일관성 체크에서 너무 멀면 폴백)
+  * 실패 시 **폴백**으로 **nearest agent** 매칭(`match_agent_at_point`).
+* 각 후보에 대해 다음을 계산:
+
+  * `T_eff`: `combine_ttc()`로 direct TTC(`ttc_first`)와 surrogate TTC(거리/closing velocity 기반)를 **가중 평균**.
+  * `severity`:
+
+    ```
+    severity = a1*(1/max(T_eff,T_min)) 
+             + a2*(1/max(d_me,d_min))
+             + a3*heading_bonus(rel_heading) 
+             + a4*v_closing
+    ```
+
+    (가까울수록/정면에 가까울수록/closing 크면 위험↑)
+  * `yprio`(yield priority):
+    상대의 mode(수동/자동), right-of-way 차이(`right_of_way_score`), 상대가 `reroute`/`path_searching`인지, occupancy, id조건 등을 선형 결합.
+  * 최종 `score = severity * (1 + kappa * yprio)`.
+
+> 포인트: **severity**가 물리적 위험도, **yprio**가 “양보 필요성(사회적 규칙/작업상태)” 가중, `kappa`는 그 가중의 영향력.
+
+## 2-2) Per-agent 디바운스
+
+* 동일 `(machine_id, type_id)`에 대해 **최근 처리 시간**을 기억.
+* `agent_event_silence_sec`(기본 1.0s) 안에 또 들어온 후보는 **무시**해서 채터링을 줄인다.
+
+## 2-3) Primary 후보 선택
+
+* 남은 후보 중 `score`가 **가장 큰** 것을 `primary`로 선택.
+* 해당 agent의 최근 처리 시간을 갱신.
+
+## 2-4) 상태 결정 1차 규칙 (`decide_with_primary`)
+
+입력: `primary` 후보와, 그 agent가 현재 `reroute` 중인지 여부.
+
+간단 룰:
+
+1. `T_eff < T_yield` **또는** `yprio >= Y_th` → **`YIELD`**
+2. 그 외 `T_eff < T_slow` → **`SLOWDOWN`**
+3. 상대가 `reroute` 중이고 `yprio`도 높음 → **`REROUTE`**
+4. 그 외 → **`RUN`**
+
+(기본 파라미터: `T_yield=2.5`, `T_slow=6.0`, `Y_th=0.8`)
+
+## 2-5) Resume 히스테리시스 검사 (`_maybe_resume_on_clean`)
+
+* 현재 상태가 `SLOWDOWN`/`YIELD`/`STOP`일 때만 동작.
+* **safe 판정**:
+
+  * `primary`가 **없으면** 안전.
+  * `primary`가 있으면, 상태별 **재개 임계**를 만족해야 안전:
+
+    * SLOWDOWN: `T_eff >= T_resume_slow`(6.5) **and** `yprio < Y_exit`(0.5)
+    * YIELD:    `T_eff >= T_resume_yield`(3.5) **and** `yprio < Y_exit`
+    * STOP:     `T_eff >= T_resume_stop`(5.0) **and** `yprio < Y_exit`
+* 안전이면 해당 상태별 **clean counter**(K-연속) 증가:
+
+  * SLOWDOWN: `K_slow_clean`(2)회 연속 안전 → `RUN`
+  * YIELD:    `K_yield_clean`(3)회 → `RUN`
+  * STOP:     `K_stop_clean`(3)회 → `RUN`
+* 안전 실패면 해당 상태의 카운터는 **리셋**.
+
+> 포인트: **들어올 때 임계(T_slow/T_yield)**와 **나갈 때 임계(T_resume_*)**를 다르게 해서 **히스테리시스**로 상태 깜빡임을 방지.
+
+## 2-6) 상태 적용
+
+* 위 resume 검사에서 `RUN`으로 복귀했다면 종료.
+* 아니면 **2-4의 결정 결과**(`RUN`/`SLOWDOWN`/`YIELD`/`REROUTE`)로
+  `_set_state_and_emit(decision, reason=...)` 수행 → 실제 명령 펄스 발행.
+
+---
+
+# 3) 주기 타이머(`on_timer`)에 의한 자동 복귀
+
+이벤트가 없을 때도 **과도한 정지/양보 지속**을 방지하는 보호장치:
+
+* **Idle resume** (SLOWDOWN/YIELD일 때만):
+  `last_agent_event_any` 이후 충돌 이벤트가 `resume_idle_sec`(1.5s) 동안 없으면 **`RUN` 복귀**.
+* **Hard timeout resume** (SLOWDOWN/YIELD/STOP 공통):
+  현재 상태로 머문 시간이 각각
+
+  * SLOWDOWN: `resume_timeout_slow`(6s)
+  * YIELD:    `resume_timeout_yield`(10s)
+  * STOP:     `resume_timeout_stop`(15s)
+    를 넘으면 무조건 **`RUN` 복귀**.
+
+---
+
+# 상태 전환 시 실제 출력 (`_emit_state_pulse`)
+
+`_set_state_and_emit()` → 내부에서 `_emit_state_pulse(state)` 호출:
+
+* 항상 `topic_decision_state`에 현재 state를 문자열로 publish.
+* 그리고 **해당 state에 맞는 1회성 펄스**를 발행:
+
+  * `RUN`  → `topic_cmd_run`
+
+    * 단, `run_pulse_silence_sec`(0.5s) 내 과발행 **디바운스**.
+  * `SLOWDOWN` → `topic_cmd_slowdown`
+  * `YIELD` → `topic_cmd_yield`
+  * `STOP` → `topic_cmd_stop`
+  * `REPLAN` → `topic_request_replan`
+  * `REROUTE` → `topic_request_reroute`
+
+---
+
+# 의사코드 형태로 한 번에 보기
+
+```text
+on_collision(msg):
+  last_agent_event_any = now
+  C_all = build_candidates(msg)                     # 물리 + 정책 스코어 만들기
+  if C_all empty: return _maybe_resume_on_clean(None)
+
+  C = debounce_per_agent(C_all, agent_event_silence_sec)
+  if C empty: return _maybe_resume_on_clean(None)
+
+  primary = argmax(C, by=score)
+  remember_last_time(primary.agent)
+
+  decision = decide_with_primary(primary, _agent_is_reroute(primary.agent))
+
+  if _maybe_resume_on_clean(primary):
+      return
+
+  _set_state_and_emit(decision, reason=...)
+
+
+on_replan_flag(true):
+  if (now - last_agent_event_any) < replan_ignore_sec_after_agent:
+      ignore
+  else:
+      _set_state_and_emit("REPLAN", reason="external replan_flag")
+
+
+on_timer():
+  if state in {SLOWDOWN, YIELD} and idle(no collision for resume_idle_sec):
+      _set_state_and_emit("RUN", reason="idle resume")
+      return
+
+  if state == SLOWDOWN and dt_state >= resume_timeout_slow: RUN
+  if state == YIELD   and dt_state >= resume_timeout_yield: RUN
+  if state == STOP    and dt_state >= resume_timeout_stop:  RUN
+```
+
+---
+
+# 실무 튜닝 포인트 (짧게 요약)
+
+* **들어오는 임계**: `T_yield`, `T_slow`, `Y_th`
+  (과민하면 빈번히 YIELD/SLOWDOWN으로 들어감)
+* **나가는 임계**: `T_resume_*`, `Y_exit`, `K_*_clean`
+  (너무 크면 잘 안 풀림, 너무 작으면 깜빡임)
+* **스코어링**: `a1..a4`, `b1..b6`, `kappa`
+
+  * 충돌 물리 위험은 `a*` 위주 (속도/거리/정면성)
+  * 양보 우선순위는 `b*`/`kappa`로 영향력 조정
+* **폴백 안정성**: `match_agent_at_point`는 예외 케이스용.
+  `dist` 일관성 임계(10m)는 환경에 맞게 2~4m로 낮추는 걸 권장.
+* **디바운스/보호**:
+  `agent_event_silence_sec`, `run_pulse_silence_sec`, `replan_ignore_sec_after_agent`는 채터링 억제에 중요.
+
+---
+
+이렇게 보면, 이 노드는 **이벤트 드리븐 + 히스테리시스 + 타임아웃 보호**의 조합으로 상태를 고른다고 이해하면 딱 맞아. 원하는 구간(예: YIELD 진입을 더 보수적으로/더 공격적으로)만 골라 수치 조정하면 전체 행동을 꽤 예측 가능하게 다듬을 수 있어.
