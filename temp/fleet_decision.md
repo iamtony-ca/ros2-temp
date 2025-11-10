@@ -336,3 +336,198 @@
 ---
 
 필요하면 위 문서를 README 형태(표/도표 포함)로 재구성해 드릴게요. 또한 실제 로그 예시를 넣어 상태 전이 케이스 스터디도 추가할 수 있습니다.
+####################  
+######################  
+####################  
+좋은 질문들이에요. 코드 기준으로 핵심만 ‘정확히’ 풀어볼게요. (영문 용어는 그대로 유지)
+
+# [path_validator_node]
+
+## 0) “튜브(tube) shape”가 뭐고, 왜 그런 말을 쓰나?
+
+* 의미: **상대 로봇의 truncated_path를 따라** 그 로봇의 **footprint(다각형)** 를 **얇게 확장(dilate)** 하며 **연속적으로 배치**했을 때 생기는 **연속적인 충돌 영역**을 말해요.
+
+  * `whoCoversPoint()`/`pathTubeCoversPoint()`에서 path의 각 pose에 footprint를 소확장해서 월드로 변환하고, 그 **연속된 폴리곤 띠**가 마치 **관(tube)** 처럼 경로를 감싸므로 “tube”라고 부릅니다.
+* 왜 필요?
+
+  * 상대 로봇의 **현재 위치뿐 아니라 곧 지나갈 경로**까지 **선점 영역**으로 다루고, 우리 경로가 이 **관형 영역**과 교차하면 **미리** agent 충돌로 간주해 리플랜/양보 결정을 내리기 위함입니다.
+* 이 개념은 `agent_layer`에서도 비슷하게 쓰여요. agent의 현재 pose와 truncated_path에 footprint를 찍어 **cost 254**로 칠해 **관 같은** 차단帯를 만들어 `agent_mask`를 구성하는 방식이죠.
+
+---
+
+# [fleet_decision_node]
+
+## 1) `on_replan_flag()`에서 두 번 publish 되는가?
+
+코드:
+
+```py
+self._set_state_and_emit("REPLAN", reason="external replan_flag")
+self.pub_req_replan.publish(Bool(data=True))
+```
+
+* `_set_state_and_emit("REPLAN")` → 내부에서 `_emit_state_pulse()` 호출 → **`/request_replan`** 에 **한 번** publish.
+* 그 다음 줄에서 **같은 `/request_replan`** 에 **한 번 더** publish.
+* 즉, **`/request_replan`이 두 번** 나갑니다. (질문에 쓴 /replan_flag 토픽과는 **다른 토픽**이에요. 입력은 `/replan_flag`, 출력은 `/request_replan`.)
+* 개선: 아래 둘 중 하나만 남기면 됩니다.
+
+  1. `_set_state_and_emit("REPLAN")`만 호출하고 **직접 publish 삭제**
+  2. 상태 전환 없이 **직접 publish만** 수행
+
+---
+
+## 2) `right_of_way_score`, `self.kappa`, direct TTC vs surrogate TTC
+
+* **right_of_way_score(agent, my_id)**
+
+  * **간단한 우선통행(ROW) 대용치**. `agent.occupancy`면 +1.0, ID가 나보다 작으면 +0.5, 아니면 -0.2를 더해 **상대가 양보받을 근거**를 만듭니다.
+  * `yprio`(yield priority)에 들어가 **누가 더 양보해야 하는지**에 기여.
+* **kappa**
+
+  * 최종 점수: `score = severity * (1 + kappa * yprio)` 에서 **yprio를 얼마나 증폭**할지 조절하는 **gain**.
+  * 크면 **양보 우선권의 영향이 커짐**(행동이 더 사회적/보수적), 작으면 **순수 위험도(severity) 위주**.
+* **direct TTC vs surrogate TTC**
+
+  * **direct TTC**: 상류 노드(예: path_validator)가 직접 계산해 `PathAgentCollisionInfo.ttc_first`로 준 **직접 추정 시간**. 신뢰도 높을 때가 많음.
+  * **surrogate TTC**: direct가 없거나 신뢰 낮을 때, **상대 현재 pose→충돌점** 방향의 **closing speed**로 `거리/closing_speed`를 만든 **대체치**. 속도가 낮으면 `inf` 취급하고 신뢰도 낮게 가중.
+
+---
+
+## 3) `match_agent_at_point()`는 뭐고 왜 하나?
+
+* **무엇:** 충돌 리포트 포인트 `(px,py)`와 **가장 가까운 agent**를 찾아 **상대 heading과 closing 속도**를 추정합니다.
+* **왜:** `severity`와 `yprio` 계산에 필요한 **상대적 상황(정면/교차/동행, closing 정도)** 를 얻기 위함. direct TTC가 없을 때는 **surrogate TTC** 계산의 핵심 입력(거리, 진행방향 대비 성분 속도)이 됩니다.
+
+---
+
+## 4) 모든 파라미터 설명 + 튜닝 가이드
+
+### (A) ID/프레임/내 정보
+
+* `global_frame`: 메시지 일관 프레임 이름. 보통 `"map"`.
+* `my_machine_id`: 내 agent ID. ROW/ID 우선 등 계산에 사용.
+
+### (B) TTC 결합 관련
+
+* `w1_ttc`: direct TTC 가중.
+* `w2_alt`: surrogate TTC 가중.
+* `T_min`: `1/max(T_eff, T_min)`에서 **폭주 방지** 하한(너무 작은 시간 역수 폭증 방지).
+* `d_min`: 거리 항 역수의 하한.
+  **튜닝:**
+* direct TTC 품질이 좋으면 `w1_ttc`↑, 나쁘면 `w2_alt`↑.
+* 오탐으로 과민하면 `T_min`↑, `d_min`↑.
+
+### (C) Severity 가중
+
+* `a1_invT`: **시간 역수(긴박도)** 가중. 급박할수록 ↑.
+* `a2_invd`: **거리 역수** 가중. 가까울수록 ↑.
+* `a3_heading`: **상대 heading** 가중(정면>교차>동행).
+* `a4_vclosing`: **closing 속도** 가중. 다가오는 속도 빠를수록 ↑.
+  **튜닝:**
+* 보수적으로 느끼려면 `a1/a2/a3/a4`를 높여 **severity**를 키움.
+* 동선 충돌(교차)에서 과민하면 `a3_heading`↓.
+* 정지 대상에 과민하면 `a4_vclosing`↓.
+
+### (D) Yield Priority (yprio)
+
+* `b1_mode`: **manual 모드** 가중(수동 조작 우선).
+* `b2_rowgap`: **ROW 차이(상대-나)** 가중.
+* `b3_reroute`: 상대가 **reroute 중**이면 가점.
+* `b4_pathsearch`: 상대가 **PATH_SEARCHING**이면 가점.
+* `b5_occupancy`: 상대가 **occupancy**(점유)면 가점.
+* `b6_id`: `id_bonus` 가중(간단한 우선순위 룰).
+* `kappa`: `severity`에 yprio를 섞는 **증폭 계수**.
+  **튜닝:**
+* **사회적 양보**를 강화: `kappa`↑, `b2/b3/b4/b5`↑.
+* **위험 위주**: `kappa`↓, `b*` 전반↓.
+
+### (E) 진입 임계(상태 전환)
+
+* `T_slow`: `T_eff < T_slow`면 최소 SLOWDOWN.
+* `T_yield`: `T_eff < T_yield`이거나 `yprio >= Y_th`면 YIELD.
+* `yield_priority_thresh`(= `Y_th`): **양보 우선권이 큰 상황** 판정 임계.
+  **튜닝:**
+* 자주 느려지면 `T_slow`↓. 너무 늦게 양보하면 `T_yield`↑ 또는 `Y_th`↓.
+
+### (F) 복귀 Hysteresis (exit & K-연속)
+
+* `T_resume_slow`, `T_resume_yield`, `T_resume_stop`: 각 상태에서 **안전 복귀**를 위한 `T_eff` 임계(들어갈 때보다 **더 널널**한 값 권장).
+* `Y_exit`: 복귀 시 **yprio 상한**(양보 우선권 높으면 복귀 지연).
+* `K_slow_clean`, `K_yield_clean`, `K_stop_clean`: **K-연속** clean 체크 횟수.
+  **튜닝:**
+* 플리커가 심하면 `K_*_clean`↑, 또는 `T_resume_*`↑, `Y_exit`↓.
+
+### (G) Idle/Timeout resume
+
+* `resume_idle_sec`: 최근 충돌 이벤트가 **없을 때** SLOWDOWN/YIELD 상태를 **자동 복귀**.
+* `resume_timeout_slow/yield/stop`: 상태가 너무 오래 지속되면 **강제 복귀**.
+  **튜닝:**
+* 정체를 피하려면 `resume_idle_sec`↓, `resume_timeout_*`↓.
+* 성급 복귀가 위험하면 반대로 ↑.
+
+### (H) Debounce / Ignore
+
+* `agent_event_silence_sec`: **같은 agent** 연속 이벤트 무시 시간.
+* `replan_ignore_sec_after_agent`: agent 이벤트 직후 **외부 replan_flag** 무시 시간.
+* `run_pulse_silence_sec`: `/cmd/run` 펄스 **디바운스**(빈번한 RUN 펄스 방지).
+  **튜닝:**
+* 이벤트가 너무 잦으면 `agent_event_silence_sec`↑.
+* 외부 replan이 중요한 시스템이면 `replan_ignore_sec_after_agent`↓.
+
+### (I) Topics
+
+* 입력: `topic_collision`, `topic_agents`, `topic_replan_flag`
+* 출력: `topic_decision_state`, `topic_request_replan`, `topic_request_reroute`, `topic_cmd_*`
+
+---
+
+## 5) “cost function” 형태의 계산은 뭔가, 왜 그렇게 하나?
+
+### a) Severity (위험도 세기)
+
+```
+severity = a1*(1/max(T_eff, T_min))
+         + a2*(1/max(d_me,  d_min))
+         + a3*heading_bonus(rel_heading_deg)
+         + a4*v_closing
+```
+
+* **해석:**
+
+  * **시간이 짧다**, **가깝다**, **정면/교차다**, **다가오는 속도가 크다** → 위험도 ↑
+* **왜:** 인간 직관과 유사한 **다요소 위험 평가**를 **선형 조합**으로 단순화.
+* **장점:** 각 항목의 민감도를 `a*`로 **독립 튜닝** 가능, 해석 쉬움.
+
+### b) Yield Priority (누가 더 양보?)
+
+```
+yprio = b1*mode_bonus(manual)
+      + b2*(ROW(other) - ROW(me))
+      + b3*1[r eroute]
+      + b4*1[PATH_SEARCHING]
+      + b5*1[occupancy]
+      + b6*id_bonus
+```
+
+* **해석:** 상대가 수동/경로탐색/점유 중이거나 reroute이면 **양보받아야 할 이유**가 큼.
+* **왜:** 교차로 암묵 규칙, 운용 정책을 **간단 신호**로 반영.
+
+### c) 최종 Score
+
+```
+score = severity * (1 + kappa * yprio)
+```
+
+* **해석:** 위험이 큰 상황에서 **양보 우선권이 큰 상대**가 등장하면 **점수가 더 커져** 그 상대를 **우선 처리**.
+* **왜:** 단순한 곱셈 구조로 **정책(사회성)**과 **물리적 위험**을 동시에 반영하면서, `kappa`로 비중을 한 번에 조절할 수 있음.
+
+---
+
+### 빠른 체크리스트 (현장 튜닝)
+
+* **너무 자주 YIELD**: `T_yield`↓ 또는 `Y_th`↑, `kappa/b*`↓
+* **정면 충돌에 둔감**: `a3_heading`↑, `a1_invT`↑
+* **느리게 복귀**: `T_resume_*`↓, `K_*_clean`↓, `Y_exit`↑
+* **외부 replan이 자주 씹힘**: `replan_ignore_sec_after_agent`↓
+
+궁금한 파라미터 조합(예: 창고 좁은 회랑/4-way 교차)별 프리셋도 만들어 드릴 수 있어요.
