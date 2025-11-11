@@ -738,3 +738,157 @@ on_timer():
 ---
 
 이렇게 보면, 이 노드는 **이벤트 드리븐 + 히스테리시스 + 타임아웃 보호**의 조합으로 상태를 고른다고 이해하면 딱 맞아. 원하는 구간(예: YIELD 진입을 더 보수적으로/더 공격적으로)만 골라 수치 조정하면 전체 행동을 꽤 예측 가능하게 다듬을 수 있어.
+##################  
+###################  
+#####################  
+좋아, `decide_with_primary()`를 “코드 그대로” 뜯어서 설명해볼게. 결론부터 말하면 **하나의 대표 충돌 후보(primary)**에 대해 **즉시 전이할 이벤트 상태**를 간단 규칙으로 고르는 함수야.
+
+```python
+def decide_with_primary(self, c: Candidate, primary_is_reroute: bool) -> str:
+    # 1) 매우 위험(T_eff<T_yield or yprio>=Y_th) → YIELD
+    # 2) 중간(T_eff<T_slow) → SLOWDOWN
+    # 3) 상대가 reroute 상태고 yprio가 매우 크면 → REROUTE(내가 크게 양보)
+    # 4) 그 외 → RUN
+    if c.T_eff < self.T_yield or c.yprio >= self.Y_th:
+        return "YIELD"
+    if c.T_eff < self.T_slow:
+        return "SLOWDOWN"
+    if primary_is_reroute and c.yprio >= (self.Y_th - 0.2):
+        return "REROUTE"
+    return "RUN"
+```
+
+---
+
+# 1) 입력과 리턴
+
+* **입력**
+
+  * `c: Candidate`
+    충돌 후보 하나의 요약치. 주요 필드:
+
+    * `c.T_eff`: **유효 TTC(Time-To-Collision)**. direct TTC와 surrogate TTC를 가중 결합해서 만든 “충돌까지 남은 시간” 추정치(초). **작을수록 위험**.
+    * `c.yprio`: **yield priority 스칼라**. “상대에게 양보할 이유” 크기. **클수록 상대에게 양보해야 함**.
+    * `c.score`: 상위 선택용 총점(여기 함수 내부에서는 사용하지 않음).
+    * (그 외 `machine_id`, `px,py`, `severity`, `note` 등은 이 함수에서 직접 사용하지 않음.)
+  * `primary_is_reroute: bool`
+    이 primary agent가 **reroute 상태 플래그**를 들고 있는지(= 상대가 자체적으로 길을 바꾸려고 애쓰는 중인지) 표시.
+
+* **리턴**: 전환할 이벤트 상태 문자열 중 하나
+
+  * `"YIELD"`, `"SLOWDOWN"`, `"REROUTE"`, `"RUN"`
+
+> 주의: 여기서는 `"STOP"`을 직접 반환하지 않는다. 완전 정지는 상위 정책/다른 로직에서만 일어남.
+
+---
+
+# 2) 사용되는 파라미터/변수 의미
+
+* `self.T_yield`
+  **YIELD 진입을 유발하는 시간 임계**. `c.T_eff < T_yield`면 **매우 급박**으로 보고 바로 YIELD.
+* `self.Y_th` (= `yield_priority_thresh`)
+  **양보 우선권(yprio) 임계**. `c.yprio >= Y_th`이면 시간 여건과 무관하게 **양보 필요**로 판정 → YIELD.
+* `self.T_slow`
+  **SLOWDOWN 진입 임계**. `T_eff`가 이 값보다 작지만 YIELD 조건(위 두 가지)에 해당하지 않으면 **속도만 낮추는 완화**로 결정.
+* `(self.Y_th - 0.2)`
+  REROUTE 조건에서 쓰는 **완화된 yprio 임계**. reroute 중인 상대에게는 **조금 더 쉽게 큰 양보(REROUTE)**를 선택하도록 **여유 0.2**를 준 것.
+* `primary_is_reroute`
+  상대가 reroute 중이면 “내가 크게 양보해서 먼저 가게 해 주는” REROUTE 결정을 열어 줌.
+
+---
+
+# 3) 의사결정 흐름(우선순위)
+
+1. **YIELD 최우선**
+
+   * 트리거 A: `c.T_eff < T_yield`
+     → 충돌까지 남은 시간이 **아주 짧다** → 급정적/강한 양보 필요 → **"YIELD"**.
+   * 트리거 B: `c.yprio >= Y_th`
+     → 상대의 **양보 우선권**이 크다(수동/점유/경로탐색/ROW 차이 등) → **"YIELD"**.
+   * 두 조건 중 하나라도 참이면 바로 반환하고 종료.
+
+2. **SLOWDOWN 다음**
+
+   * `c.T_eff < T_slow`
+     → **위험은 있으나** YIELD급은 아님 → **"SLOWDOWN"**.
+     (속도만 내려도 위험 완화가 가능하다고 보는 구간)
+
+3. **REROUTE 특례**
+
+   * `primary_is_reroute and c.yprio >= (Y_th - 0.2)`
+     → 상대가 이미 reroute 중이고, **양보 우선권이 거의 YIELD 임계급**이면
+     **내가 크게 양보(REROUTE)**해서 길을 열어주는 정책적 선택.
+
+     * 시간(T_eff)이 급박하지 않아도 **“사회성/운용 정책”**을 반영.
+
+4. **그 외는 RUN**
+
+   * 위험도와 양보 우선권이 모두 낮으면 **"RUN"**.
+
+> **판정의 특징**
+>
+> * **시간 기반(YIELD/SLOWDOWN)**이 **유도 우선**,
+> * 그 다음 **정책 기반(REROUTE)**,
+> * 마지막으로 **RUN**.
+
+---
+
+# 4) 경계조건(<= vs <)과 미묘함
+
+* 코드가 **모두 `<`** 비교를 사용.
+
+  * 예: `T_eff == T_yield`인 경우 **YIELD로 가지 않고** 다음 조건으로 넘어간다.
+  * **바싹 붙은 케이스에서의 민감도**는 이 부등식 선택에 크게 좌우된다.
+  * 더 보수적으로 하려면 `<=`로 바꾸거나 **임계값에 소량의 버퍼**(±0.1~0.3)를 둔다.
+
+---
+
+# 5) 왜 이런 순서/규칙인가?
+
+* **안전 최우선:** **아주 급박한 시간 조건** 또는 **사회적 양보가 분명한 상황**은 **무조건 YIELD**로 빨리 개입.
+* **연속성 유지:** 덜 급박하면 **SLOWDOWN**으로 완화해 **불필요한 완전 양보/정체 방지**.
+* **정책적 배려:** 상대가 **reroute 중**이면, **조금만 우선권이 커도** 내가 크게 양보해서 **교행 비효율을 줄임**.
+* **기본 동작:** 위가 아니면 **RUN**으로 생산성 유지.
+
+---
+
+# 6) 튜닝 가이드(실전 팁)
+
+* **YIELD가 과도**하다 →
+  `T_yield ↓` 또는 `Y_th ↑`. (reroute 특례가 자주 뜨면 `0.2` 버퍼를 `0.1`로 줄이거나 없애기)
+* **SLOWDOWN만 계속 이어져 답답** →
+  `T_slow ↓`(덜 민감), 또는 상위 resume 히스테리시스(`T_resume_*`, `K_*_clean`)를 완화.
+* **reroute 상대에게 과양보** →
+  REROUTE 조건의 `(Y_th - 0.2)`에서 **0.2를 줄이거나 제거**.
+* **정면/교차 급박 상황인데 늦게 반응** →
+  upstream에서 `T_eff`가 너무 느슨할 수 있으니 **severity/TTC 가중(w1_ttc/w2_alt, a3_heading 등)**을 재조정.
+
+---
+
+# 7) 예시로 감 잡기
+
+* **Case A:** `T_eff=1.8s`, `yprio=0.3`, `primary_is_reroute=False`
+
+  * `1.8 < T_yield(2.5)` → **YIELD**
+* **Case B:** `T_eff=3.0s`, `yprio=0.85`, `Y_th=0.8`
+
+  * `yprio >= Y_th` → **YIELD**
+* **Case C:** `T_eff=4.5s`, `yprio=0.5`, `T_slow=6.0`
+
+  * `T_eff < T_slow` → **SLOWDOWN**
+* **Case D:** `T_eff=7.0s`, `yprio=0.65`, `primary_is_reroute=True`, `Y_th=0.8`
+
+  * `yprio >= 0.6 (=Y_th-0.2)` → **REROUTE**
+* **Case E:** `T_eff=8.0s`, `yprio=0.2`, reroute 아님
+
+  * 위 조건 없음 → **RUN**
+
+---
+
+# 8) 이 함수의 ‘역할 범위’
+
+* **즉시 상태 전환 “제안”**만 담당.
+* **복귀 조건(히스테리시스, idle/timeout resume)** 은 `on_timer()`와 `_maybe_resume_on_clean()`이 따로 관리.
+* 실제 퍼블리시(펄스)는 상위에서 `_set_state_and_emit()`가 처리.
+
+필요하면 `STOP`도 여기서 결정하도록 분기(예: `T_eff < T_stop`)를 추가할 수 있는데, 그러면 **resume 임계(`T_resume_stop`)와 clean K 값**도 같이 손봐야 해.
