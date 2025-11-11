@@ -271,3 +271,117 @@
 ---
 
 필요하면 위 문서를 README/설계 문서 형식으로 재배치해 드릴게요. 파라미터 테이블이나 기본 추천값 표도 추가할 수 있습니다.
+#################  
+#######################  
+#########################  
+요점부터 딱 정리할게.
+
+## 결론: “폴리곤만” 쓰는 게 아니라 **폴리곤 + Pose**를 함께 씁니다
+
+* 두 파일 모두에서 **footprint는 “로컬좌표 폴리곤(shape)”**이고, 이를 **에이전트의 Pose(현재 위치/자세 또는 path의 각 pose)**로 **월드좌표에 배치**해서 사용합니다.
+* 그래서 **폴리곤 모양만** 있으면 안 되고, **해당 시점의 pose**가 항상 필요합니다. (다행히 pose는 `/multi_agent_infos`의 `current_pose`와 `truncated_path`에 존재)
+
+---
+
+## 파일별로 어떻게 쓰는지
+
+### agent_layer.cpp
+
+* `rasterizeAgentPath()`
+
+  * 입력으로 `a.footprint`(폴리곤) **+** `a.current_pose.pose`(Pose)를 받아서
+  * `fillFootprintAt()`에서 **로컬 폴리곤 → 월드 변환**(pose의 yaw/position 반영) 후 래스터라이즈합니다.
+  * (옵션) `truncated_path`의 **각 pose에도 동일 폴리곤을 얇게 적용**(현재 코드는 루프가 활성화되어 있어 path 포즈에도 찍음).
+* `fillFootprintAt()`
+
+  * **폴리곤 모양만**으로는 쓰지 않고, **pose의 orientation(=yaw)과 position**으로 회전/이동해서 **월드 폴리곤**을 만든 뒤 costmap을 채웁니다.
+  * 또한 **로컬 +x 를 “전방”으로 보고 forward smear**를 적용합니다. 즉, 폴리곤의 로컬 프레임 정의(전방이 +x)가 전제입니다.
+
+### path_validator_node.cpp
+
+* 자기 로봇 체크(`validateWithFootprint`)
+
+  * 파라미터의 `footprint`(모양)와 **경로 샘플 pose**를 조합해서 **매 샘플 pose에서 폴리곤을 월드로 변환**해 충돌을 검사합니다.
+* 에이전트 매칭(`whoCoversPoint`, `pathTubeCoversPoint`)
+
+  * **상대 에이전트**에 대해 `a.footprint`(폴리곤)과
+
+    * `a.current_pose.pose`(현재 위치) 또는
+    * `a.truncated_path.poses[i].pose`(경로상의 포즈)
+      를 사용해서 월드 폴리곤을 만들고, 포인트가 내부인지(point-in-polygon) 검사합니다.
+  * 즉 여기서도 **항상 폴리곤+pose** 세트가 필요합니다.
+
+---
+
+## 그래서 YAML로 대체하려면 어떻게?
+
+지금 상황(토픽에 footprint가 비어 있음)에서는 **폴리곤 모양만 YAML로 주입**하면 충분합니다. **Pose는 여전히 `/multi_agent_infos`에서 가져다 쓰면** 돼요.
+
+### 권장 스키마(예시)
+
+```yaml
+# agent_layer.yaml
+multi_agent_nav2:
+  AgentLayer:
+    agent_footprints:
+      - match: {type_id: "amr_a"}     # 또는 {machine_id: 12}
+        polygon: [[0.30, 0.20], [0.30, -0.20], [-0.30, -0.20], [-0.30, 0.20]]
+      - match: {type_id: "amr_b"}
+        polygon: [[0.35, 0.25], [0.35, -0.25], [-0.35, -0.25], [-0.35, 0.25]]
+
+# path_validator_node.yaml
+replan_monitor:
+  PathValidatorNode:
+    agent_footprints:
+      - match: {type_id: "amr_a"}
+        polygon: [[0.30, 0.20], [0.30, -0.20], [-0.30, -0.20], [-0.30, 0.20]]
+      - match: {type_id: "amr_b"}
+        polygon: [[0.35, 0.25], [0.35, -0.25], [-0.35, -0.25], [-0.35, 0.25]]
+```
+
+### 코드 변경 포인트(최소 변경 가이드)
+
+1. **공통 헬퍼 추가**(각 노드에 동일 컨셉):
+
+   * 파라미터에서 `type_id`/`machine_id`별 **폴리곤 테이블**을 읽어 `std::unordered_map<std::string, std::vector<Point32>>` (type_id 키 기준 권장)로 보관.
+   * `getFootprintForAgent(const MultiAgentInfo& a)`:
+
+     * 우선순위: `machine_id` 매치 > `type_id` 매치 > 기본(default) 폴리곤(옵션).
+     * 반환은 `geometry_msgs::msg::PolygonStamped`(로컬 프레임) 형태.
+
+2. **agent_layer.cpp**
+
+   * `rasterizeAgentPath()` 시작부에서:
+
+     * 기존의 `a.footprint` 대신:
+
+       * **만약 `a.footprint.polygon.points`가 비어있으면** `getFootprintForAgent(a)`로 대체.
+       * 그 결과를 `fillFootprintAt()`에 넘김.
+   * 나머지는 그대로 (pose는 `a.current_pose.pose`/`truncated_path`에서 가져다 사용).
+
+3. **path_validator_node.cpp**
+
+   * `whoCoversPoint()`와 `pathTubeCoversPoint()` 내부:
+
+     * `const auto & fp = a.footprint.polygon.points;` 부분을
+
+       * **비어있을 경우** `getFootprintForAgent(a)`로 fallback.
+     * 이후 로직은 동일(해당 pose로 월드 변환 후 point-in-polygon).
+
+> 이렇게 하면 **폴리곤 모양만 파라미터화**하고, **pose는 기존 메시지 그대로** 사용하는 방식이라 **수정량이 작고 리스크가 낮습니다.**
+
+---
+
+## 작은 주의사항
+
+* **로컬 프레임 규약**: forward smear(+x)를 쓰므로 **폴리곤은 +x가 전방**이 되게 정의하세요.
+* **프레임 일치**: `/multi_agent_infos`의 `current_pose`/`truncated_path`는 이미 글로벌 프레임(예: `map`)으로 가정해 쓰고 있어요(`use_path_header_frame_` 체크). YAML 폴리곤은 **로컬(기체 좌표)**로만 주면 됩니다—pose가 월드 변환을 담당합니다.
+* **type_id vs machine_id**: 운영 편의를 위해 **type_id 기준** 매핑을 기본으로 하고, 특수한 기체만 machine_id override를 두는 패턴이 좋습니다.
+* **PathValidator의 자기 로봇 footprint**는 지금처럼 `footprint` 파라미터 문자열을 계속 사용하면 됩니다(이미 폴리곤+경로 pose로 검사).
+
+---
+
+## 한 줄 답
+
+* 네, **둘 다** 사용합니다. footprint는 **“모양(폴리곤)”**이고, 충돌/래스터라이즈/매칭 시에는 **반드시 pose**(현재 또는 path상 pose)와 **합쳐서** 월드에 배치해 쓰고 있어요.
+* footprint가 토픽에 없을 땐 **폴리곤 모양만 YAML로 주입**하고, **pose는 기존 메시지에서 계속** 쓰도록 **fallback 헬퍼만 추가**하면 됩니다.
