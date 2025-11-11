@@ -2681,3 +2681,343 @@ if (blocked_cell) {
 
 그래서 질문 그대로 표현하면:
 **“맞다 — 처음엔 `whoCoversPoint()`만 하고, 실패하면 `agentCellBlockedNear()`로 힌트를 본 뒤, 힌트가 있을 때만 `whoCoversPoint()`를 다시 한다.”**
+########################  
+###########################  
+##########################  
+알겠습니다. `agent_layer`와 동일한 로직을 `path_validator_node`에 적용하여, 토픽 대신 YAML에서 footprint를 읽어오도록 수정해 보겠습니다.
+
+`path_validator_node`는 `agent_layer`와 달리 **일반 ROS 2 노드**이므로 `name_ + "."` 접두사를 사용할 필요가 없습니다. 이 점을 반영하여 코드를 수정합니다.
+
+-----
+
+### 1\. `path_validator_node.hpp` 변경 사항
+
+`agent_layer`와 마찬가지로, `std::map`을 include하고, footprint/radius 데이터를 저장할 struct와 map, 그리고 헬퍼 함수 2개를 `private:` 섹션에 선언합니다.
+
+```cpp
+/* ****************************************
+ * [BEFORE] path_validator_node.hpp - includes
+ * ****************************************
+ */
+#include <chrono>
+#include <algorithm>
+
+#include "rclcpp/rclcpp.hpp"
+```
+
+```cpp
+/* ****************************************
+ * [AFTER] path_validator_node.hpp - includes
+ * ****************************************
+ */
+#include <chrono>
+#include <algorithm>
+
+// [NEW] Added for std::map
+#include <map>
+
+#include "rclcpp/rclcpp.hpp"
+```
+
+-----
+
+```cpp
+/* ****************************************
+ * [BEFORE] path_validator_node.hpp - private members
+ * ****************************************
+ */
+  // === Agent 충돌 식별 ===
+  struct AgentHit {
+    uint16_t machine_id{0};
+// ...
+    std::string note;
+  };
+
+  // wx, wy를 커버하는 agent의 footprint 또는 truncated_path 튜브를 찾아 리턴
+  std::vector<AgentHit> whoCoversPoint(double wx, double wy) const;
+```
+
+```cpp
+/* ****************************************
+ * [AFTER] path_validator_node.hpp - private members
+ * ****************************************
+ */
+  // === Agent 충돌 식별 ===
+  struct AgentHit {
+    uint16_t machine_id{0};
+// ...
+    std::string note;
+  };
+
+  // [NEW] Map to store footprint data from YAML
+  struct AgentFootprintData
+  {
+    // existing code uses Point32, so we store Point32
+    std::vector<geometry_msgs::msg::Point32> points;
+    double radius{0.0};
+    bool use_radius{true};
+  };
+  // Map from machine_id to its footprint/radius data
+  std::map<uint16_t, AgentFootprintData> agent_footprints_;
+
+  // [NEW] Helper to get footprint for a given agent
+  std::vector<geometry_msgs::msg::Point32> 
+  getFootprintForAgent(const multi_agent_msgs::msg::MultiAgentInfo & a) const;
+
+  // [NEW] Helper to convert nav2_costmap_2d::makeFootprint... results
+  static std::vector<geometry_msgs::msg::Point32> toPoint32(
+      const std::vector<geometry_msgs::msg::Point>& points);
+
+
+  // wx, wy를 커버하는 agent의 footprint 또는 truncated_path 튜브를 찾아 리턴
+  std::vector<AgentHit> whoCoversPoint(double wx, double wy) const;
+```
+
+-----
+
+### 2\. `path_validator_node.cpp` 변경 사항
+
+#### Includes 추가
+
+`onInitialize`가 아닌 `PathValidatorNode` 생성자에서 `makeFootprint...` 헬퍼를 사용하기 위해 `#include <nav2_costmap_2d/footprint.hpp>`를 추가합니다.
+
+```cpp
+/* ****************************************
+ * [BEFORE] path_validator_node.cpp - includes
+ * ****************************************
+ */
+#include "replan_monitor/path_validator_node.hpp"
+using std::placeholders::_1;
+
+namespace replan_monitor
+{
+```
+
+```cpp
+/* ****************************************
+ * [AFTER] path_validator_node.cpp - includes
+ * ****************************************
+ */
+#include "replan_monitor/path_validator_node.hpp"
+
+// [NEW] For makeFootprintFromString and makeFootprintFromRadius
+#include <nav2_costmap_2d/footprint.hpp>
+
+using std::placeholders::_1;
+
+namespace replan_monitor
+{
+```
+
+#### 헬퍼 함수 구현 추가
+
+`.hpp`에서 선언한 헬퍼 함수 2개의 구현을 `.cpp` 파일 상단 (namespace 내부)에 추가합니다.
+
+```cpp
+/* ****************************************
+ * [BEFORE] path_validator_node.cpp - namespace start
+ * ****************************************
+ */
+namespace replan_monitor
+{
+
+PathValidatorNode::PathValidatorNode()
+: Node("path_validator_node")
+{
+```
+
+```cpp
+/* ****************************************
+ * [AFTER] path_validator_node.cpp - namespace start
+ * ****************************************
+ */
+namespace replan_monitor
+{
+
+// [NEW] Implementation of static helper (from agent_layer)
+std::vector<geometry_msgs::msg::Point32> PathValidatorNode::toPoint32(
+    const std::vector<geometry_msgs::msg::Point>& points)
+{
+    std::vector<geometry_msgs::msg::Point32> points32;
+    points32.reserve(points.size());
+    for (const auto& p : points) {
+        geometry_msgs::msg::Point32 p32;
+        p32.x = static_cast<float>(p.x);
+        p32.y = static_cast<float>(p.y);
+        p32.z = 0.0f;
+        points32.push_back(p32);
+    }
+    return points32;
+}
+
+// [NEW] Implementation of helper to get footprint from loaded map
+std::vector<geometry_msgs::msg::Point32> 
+PathValidatorNode::getFootprintForAgent(const multi_agent_msgs::msg::MultiAgentInfo & a) const
+{
+    auto it = agent_footprints_.find(a.machine_id);
+    if (it == agent_footprints_.end()) {
+        RCLCPP_WARN_ONCE(get_logger(), 
+          "No footprint data found in YAML for machine_id %u. Cannot check agent collision.",
+          a.machine_id);
+        return {}; // Return empty vector
+    }
+
+    const auto& data = it->second;
+
+    if (data.use_radius) {
+        std::vector<geometry_msgs::msg::Point> points = 
+            nav2_costmap_2d::makeFootprintFromRadius(data.radius);
+        return toPoint32(points);
+    } else {
+        return data.points; // Return pre-loaded Point32 vector
+    }
+}
+
+
+PathValidatorNode::PathValidatorNode()
+: Node("path_validator_node")
+{
+```
+
+#### `PathValidatorNode()` 생성자 수정
+
+`agent_footprints_` 맵을 채우는 YAML 파라미터 로딩 로직을 추가합니다. (`this->get_parameter(...)` 호출이 끝나는 부분)
+
+```cpp
+/* ****************************************
+ * [BEFORE] path_validator_node.cpp - Constructor end
+ * ****************************************
+ */
+  agent_path_hit_enable_      = this->get_parameter("agent_path_hit_enable").as_bool();
+  agent_path_hit_stride_m_    = this->get_parameter("agent_path_hit_stride_m").as_double();
+  agent_path_hit_dilate_m_    = this->get_parameter("agent_path_hit_dilate_m").as_double();
+  agent_path_hit_max_poses_   = this->get_parameter("agent_path_hit_max_poses").as_int();
+
+  // ===== TF =====
+  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+```
+
+```cpp
+/* ****************************************
+ * [AFTER] path_validator_node.cpp - Constructor end
+ * ****************************************
+ */
+  agent_path_hit_enable_      = this->get_parameter("agent_path_hit_enable").as_bool();
+  agent_path_hit_stride_m_    = this->get_parameter("agent_path_hit_stride_m").as_double();
+  agent_path_hit_dilate_m_    = this->get_parameter("agent_path_hit_dilate_m").as_double();
+  agent_path_hit_max_poses_   = this->get_parameter("agent_path_hit_max_poses").as_int();
+
+  // [NEW] Add declaration for the robot list
+  this->declare_parameter<std::vector<std::string>>("robot_ids", std::vector<std::string>({}));
+
+  // [NEW] Loop 1: Declare all sub-parameters for each robot_id
+  // (We get robot_ids first to declare, this is a bit redundant but safe)
+  std::vector<std::string> robot_ids_to_declare;
+  try {
+    robot_ids_to_declare = this->get_parameter("robot_ids").as_string_array();
+  } catch (...) {
+    RCLCPP_WARN(get_logger(), "No 'robot_ids' list found in YAML, will not load any agent footprints.");
+  }
+  
+  for (const auto & id_str : robot_ids_to_declare) {
+    // This is a regular node, no 'name_' prefix.
+    this->declare_parameter(id_str + ".machine_id", rclcpp::ParameterValue(0));
+    this->declare_parameter(id_str + ".robot_radius", rclcpp::ParameterValue(0.0));
+    this->declare_parameter(id_str + ".footprint", rclcpp::ParameterValue(std::string("[]")));
+  }
+
+  // [NEW] Loop 2: Get parameters and populate the map
+  agent_footprints_.clear();
+  std::vector<std::string> robot_ids;
+  this->get_parameter("robot_ids", robot_ids); // Get the list again (now that it's declared)
+  
+  for (const auto & id_str : robot_ids) {
+    
+    int machine_id_int = 0;
+    this->get_parameter(id_str + ".machine_id", machine_id_int);
+    if (machine_id_int == 0) continue; 
+
+    uint16_t machine_id = static_cast<uint16_t>(machine_id_int);
+    
+    AgentFootprintData data;
+    std::string footprint_str;
+    this->get_parameter(id_str + ".footprint", footprint_str);
+    this->get_parameter(id_str + ".robot_radius", data.radius);
+
+    std::vector<geometry_msgs::msg::Point> footprint_points;
+    if (nav2_costmap_2d::makeFootprintFromString(footprint_str, footprint_points) &&
+        footprint_points.size() >= 3)
+    {
+      data.points = toPoint32(footprint_points); // Convert Point to Point32
+      data.use_radius = false;
+    } else {
+      data.use_radius = true;
+    }
+
+    agent_footprints_[machine_id] = data;
+    
+    RCLCPP_INFO(get_logger(), 
+      "Loaded footprint for machine_id %u: use_radius=%s, points=%zu",
+      machine_id, (data.use_radius ? "true" : "false"), data.points.size());
+  }
+
+  // ===== TF =====
+  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+```
+
+#### `pathTubeCoversPoint()` 수정
+
+`a.footprint`를 사용하는 대신 `getFootprintForAgent(a)` 헬퍼를 호출하도록 변경합니다.
+
+```cpp
+/* ****************************************
+ * [BEFORE] path_validator_node.cpp - pathTubeCoversPoint()
+ * ****************************************
+ */
+    // footprint를 얇게 등방성 확장한 로컬 폴리곤
+    const auto & fp = a.footprint.polygon.points;
+    if (fp.size() < 3) continue;
+
+    // 로컬 dilate
+```
+
+```cpp
+/* ****************************************
+ * [AFTER] path_validator_node.cpp - pathTubeCoversPoint()
+ * ****************************************
+ */
+    // [CHANGED] footprint를 얇게 등방성 확장한 로컬 폴리곤
+    const auto fp = getFootprintForAgent(a);
+    if (fp.size() < 3) continue;
+
+    // 로컬 dilate
+```
+
+#### `whoCoversPoint()` 수정
+
+`a.footprint`를 사용하는 대신 `getFootprintForAgent(a)` 헬퍼를 호출하도록 변경합니다.
+
+```cpp
+/* ****************************************
+ * [BEFORE] path_validator_node.cpp - whoCoversPoint()
+ * ****************************************
+ */
+  for (const auto & a : last_agents_->agents) {
+    const auto & fp = a.footprint.polygon.points;
+    if (fp.size() < 3) continue;
+
+    // 1) 현재 위치 footprint(소확장) 커버?
+```
+
+```cpp
+/* ****************************************
+ * [AFTER] path_validator_node.cpp - whoCoversPoint()
+ * ****************************************
+ */
+  for (const auto & a : last_agents_->agents) {
+    // [CHANGED] Get footprint from YAML map
+    const auto fp = getFootprintForAgent(a);
+    if (fp.size() < 3) continue;
+
+    // 1) 현재 위치 footprint(소확장) 커버?
+```
