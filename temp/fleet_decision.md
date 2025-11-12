@@ -1137,3 +1137,179 @@ def decide_with_primary(self, c: Candidate, primary_is_reroute: bool) -> str:
 * [ ] 이 기간엔 `decide_with_primary()`의 `T_*` 문턱을 10~30% 상향해서 보수적으로 운용.
 
 필요하면, 네 표(policy) 스냅샷을 주면 `assign_roles_and_action()` 안을 딱 맞춰서 구체 코드로 펼쳐줄게.
+#########################  
+##########################  
+########################  
+좋아 Seri, “질문만”이라고 했으니 지금 당장 바꿔야 할 최소 변경 포인트와 이유만 깔끔히 정리해줄게. 핵심은 두 가지:
+
+* (1) **동시 중복 행동 방지(탈중앙 mutual exclusion)** 를, 점수 선택은 유지하면서 “최종 행동”만 표의 policy에 맞춰 강제하기
+* (2) **ttc_first / current_twist가 더미일 때 임시 운용** (severity/TT C 영향 제거·완화)
+
+---
+
+# 1) 서로 독립적으로 결정하면서 “같은 행동을 동시에” 하지 않게 만드는 법
+
+네 제약(상호 공유 없음)을 지키면서 할 수 있는 건 **관측 가능한 공통 정보**(= 이미 쓰고 있는 `/multi_agent_infos`의 `machine_id`, `status.phase`, `reroute`, `occupancy` 등)만으로 **결과 동기화**를 유도하는 거야. 구현은 “점수로 primary 후보를 고르는 건 그대로” 두고, **최종 행동을 내리기 직전에 ‘정책 게이트’** 를 한 번 더 통과시키는 방식으로 가면 돼.
+
+### A. 충돌 집합에서의 “로컬 리더 선출” + 행동 게이트
+
+* 입력: `on_collision()`의 `PathAgentCollisionInfo`에는 충돌 포인트별 `machine_id[]`가 있어. 여긴 “이번 이벤트에 얽힌 상대 집합”의 근사치로 쓸 수 있어.
+* 규칙: **결정적으로 1대만 “무거운 행동(예: REPLAN/REROUTE/STOP)”** 을 하도록, **로컬 리더**를 **결정적 규칙**으로 뽑아. (예: `min(machine_id)` 또는 “양보권 낮은 쪽” 등)
+* 게이트: 내가 리더가 아니면 **무거운 행동을 YIELD/SLOWDOWN으로 다운시프트**.
+
+> 이렇게 하면 통신 없이도 두 로봇이 동시에 “둘 다 REPLAN” 하는 걸 크게 줄일 수 있어.
+
+**코드 스케치 (변경점만):**
+
+```python
+# 1) 충돌 이벤트에서 '현재 충돌에 얽힌 상대 집합'을 뽑는다.
+def _conflict_group_ids(self, msg: PathAgentCollisionInfo) -> List[int]:
+    ids = []
+    for i in range(len(msg.machine_id)):
+        mid = int(msg.machine_id[i])
+        if mid and mid != self.my_id:
+            ids.append(mid)
+    return sorted(set(ids))
+
+# 2) 결정적 리더 선출 규칙 (예: 가장 작은 ID가 리더)
+def _elect_leader(self, group_ids: List[int]) -> Optional[int]:
+    if not group_ids:
+        return None
+    return min(group_ids)
+
+# 3) 최종 행동 매핑 전 게이트
+def _policy_gate(self, desired: str, primary: Candidate, group_ids: List[int]) -> str:
+    leader = self._elect_leader(group_ids)
+
+    # 관측 기반 상호배제: 리더만 heavy action 허용
+    heavy = {"REPLAN", "REROUTE", "STOP"}
+    if desired in heavy and leader is not None and leader != self.my_id:
+        # 난 리더가 아니니까 heavy 금지 → 완화 동작으로 다운시프트
+        # 표(policy)가 있다면 여기서 표에 맞춰 매핑
+        return "YIELD" if desired in {"REPLAN", "REROUTE"} else "SLOWDOWN"
+
+    # 보조: 상대가 이미 PATH_SEARCHING(=replan 중) / reroute 중이면
+    # 난 한 단계 낮춘다(중복 방지).
+    agents = self._agents_by_id()
+    someone_busy = any(
+        (a.machine_id in group_ids) and
+        (a.status.phase == AgentStatus.STATUS_PATH_SEARCHING or a.reroute)
+        for a in agents.values()
+    )
+    if someone_busy and desired in heavy:
+        return "YIELD"
+
+    return desired
+```
+
+`on_collision()` 끝부분만 살짝 바꿔:
+
+```python
+group_ids = self._conflict_group_ids(msg)
+decision_raw = self.decide_with_primary(primary, primary_is_reroute=self._agent_is_reroute(primary.machine_id))
+decision = self._policy_gate(decision_raw, primary, group_ids)
+
+# resume 히스테리시스는 그대로
+if self._maybe_resume_on_clean(primary):
+    return
+
+self._set_state_and_emit(decision,
+    reason=f"agent(mid={primary.machine_id}) score={primary.score:.2f} T={primary.T_eff:.2f} Y={primary.yprio:.2f}")
+```
+
+### B. 정책 표(behavior table)를 반영하는 “최종 행동 매퍼”
+
+점수(=primary 선택)는 그대로 두고, **최종 행동 결정만 표에 맞춰 매핑 함수**를 둬. 예시:
+
+```python
+def _map_policy(self, c: Candidate, primary_is_reroute: bool) -> str:
+    # 예시 테이블:
+    # - yprio >= Y_th 강한 양보 -> YIELD
+    # - reroute 상대 + yprio 높음 -> REROUTE
+    # - 그 외는 상향/하향 조건자에 따라 SLOWDOWN/RUN ...
+    if c.yprio >= self.Y_th:
+        return "YIELD"
+    if primary_is_reroute and c.yprio >= (self.Y_th - 0.2):
+        return "REROUTE"
+    # TTC/거리 없이 yprio만 쓸 수도 있고(임시 운용 시), 기존과 혼합 가능
+    if math.isfinite(c.T_eff) and c.T_eff < self.T_slow:
+        return "SLOWDOWN"
+    return "RUN"
+```
+
+그리고 `decide_with_primary()`를 얇은 래퍼로 바꿔도 좋아:
+
+```python
+def decide_with_primary(self, c: Candidate, primary_is_reroute: bool) -> str:
+    return self._map_policy(c, primary_is_reroute)
+```
+
+> 이렇게 “선택(점수)”과 “행동결정(표)”을 분리하면, 표를 교체해도 스코어링은 계속 재사용 가능해.
+
+### C. 추가로 권장하는 **백오프/디바운스**
+
+* **Heavy action 지연 랜덤 지터**: REPLAN/REROUTE를 하려면 0~0.3s 랜덤 지연을 두고, 그 사이에 상대가 PATH_SEARCHING으로 들어가면 내 쪽은 YIELD로 다운시프트. (실전에서 같은 타임스탬프 간섭을 더 줄여줌)
+* **Heavy action rate-limit**: 이미 코드에 `resume_timeout_*`/`cooldown`이 있어. Heavy에 별도 `heavy_cooldown_sec`를 둬서 한 번 heavy 했으면 잠깐은 다시 heavy 금지.
+
+---
+
+# 2) ttc_first / current_twist가 더미일 때의 임시 운용
+
+질문 요지: “이 값들이 default라 신뢰 못 하니 **severity 영향 제거**하고 싶다.”
+현 코드에서 이 값들은 주로 **`combine_ttc`(T_eff)**, **`v_closing`**, 그리고 **severity** 계산에 들어가. 하지만 **최종 행동은 `decide_with_primary()`에서 `T_eff`와 `yprio`로** 내려. 즉, **score만 바꿔도 행동에 `T_eff`가 여전히 끼어들 수 있어.**
+
+그래서 선택지는 둘 중 하나야:
+
+### A. **선택(정렬)만 yprio 기반으로** 바꾸기 (가장 간단/안전)
+
+* **primary 선정 키**를 `score` 대신 **`yprio`**로 바꾸거나, `score = (eps + self.kappa*yprio)`로 대체.
+* `decide_with_primary()`는 **T_eff를 보지 않게**(혹은 `T_eff=inf`로 간주) 변경 → 임시 정책에선 **표만으로** 결정.
+
+**변경 예시:**
+
+```python
+# build_candidates()에서 임시로 severity 고정/무시
+sev = 1.0  # 임시 상수 (또는 0.0)
+score = (1e-3) + self.kappa * yprio  # yprio만 반영한 정렬 점수
+
+# on_collision()에서 primary 선정도 score로 두되 사실상 yprio 순서
+primary = max(cands, key=lambda c: c.score)
+
+# decide_with_primary(): T_eff 조건 제거(임시)
+def decide_with_primary(self, c: Candidate, primary_is_reroute: bool) -> str:
+    # T_eff가 신뢰 불가하니 yprio 중심 정책 테이블만 사용
+    return self._map_policy(c, primary_is_reroute)
+```
+
+> 장점: 더미 데이터가 결과를 왜곡하지 않음.
+> 단점: TTC 정보가 복구되기 전까지는 시간적 위험도를 반영 못 함.
+
+### B. **T_eff를 ‘무해화’** 하는 파라미터 세팅
+
+* `combine_ttc()`에서 `w1_ttc=0`, `w2_alt=0`로 두면 `T_eff=inf`가 되도록 만들 수 있어.
+* 또는 `T_min`/`d_min`을 크게 해서 severity 항이 거의 0이 되게 할 수도 있어.
+* 이 경우 **기존 decide_with_primary**를 그대로 둬도 `T_eff` 조건( `< T_slow`, `< T_yield`)이 사실상 작동하지 않음 → yprio만으로 표가 동작.
+
+> 임시 플래그를 한 번에 제어하고 싶다면 `use_severity_in_score(bool)` 같은 파라미터를 추가하고, `build_candidates()` 안에서 분기해도 좋아.
+
+---
+
+## 빠른 체크포인트
+
+* **동일 Heavy 액션 방지**:
+
+  * [x] 로컬 리더 선출(`_conflict_group_ids` + `_elect_leader`)
+  * [x] Heavy gate(`_policy_gate`)로 다운시프트
+  * [x] 상대 PATH_SEARCHING / reroute 관측 시 Heavy 억제
+  * [ ] (선택) 랜덤 지터 + Heavy rate-limit
+
+* **더미 TTC/속도 임시 운용**:
+
+  * [x] score에서 severity 제거(상수) + `score ≈ yprio`
+  * [x] decide에서 T_eff 무시(또는 `w1_ttc=w2_alt=0`로 무해화)
+  * [x] 정책 표로만 행동 매핑
+
+---
+
+원하면, 네가 말한 “표(policy)”를 그대로 코드화한 `_map_policy()` 버전을 내가 만들어줄 수도 있어(조건문 or 룩업 테이블). 지금은 구조만 잡아놨고, 나중에 표를 넘겨주면 그 룰 그대로 넣어줄게.
+
