@@ -892,3 +892,248 @@ def decide_with_primary(self, c: Candidate, primary_is_reroute: bool) -> str:
 * 실제 퍼블리시(펄스)는 상위에서 `_set_state_and_emit()`가 처리.
 
 필요하면 `STOP`도 여기서 결정하도록 분기(예: `T_eff < T_stop`)를 추가할 수 있는데, 그러면 **resume 임계(`T_resume_stop`)와 clean K 값**도 같이 손봐야 해.
+################  
+###################  
+###################  
+좋은 질문이야, Seri. 핵심은 두 가지:
+
+1. “점수(Score) 계산은 그대로” 두고도, 최종 행동은 표에 맞게 **충돌 쌍(나 vs 상대)** 단위로 **역할(role) 배정** + **동시행동 방지(arbitration)**가 되게 만드는 것
+2. `current_twist`, `ttc_first`가 믿기 어렵다면 **Severity/TTC 의존도를 임시로 낮추거나 끌 수 있는 토글**과 합리적인 **Fallback**을 넣는 것
+
+아래는 네 현재 코드에 **최소 침습(minimal invasive)** 으로 넣는 방법이야.
+
+---
+
+# 1) “동일 상황에서 서로 같은 행동 금지” — 점수는 유지, 최종행동은 표에 맞추기
+
+## 아이디어
+
+* 여전히 `build_candidates()`로 각 후보마다 `severity`, `yprio`, `score`를 만든다.
+* 단, **최종 행동 결정 직전**에 “나와 Primary 상대(=score 최고) 사이”에 대해 **역할(role)을 정하는 매핑 함수**와 **경합 해결(arbitration)**을 추가한다.
+* 역할은 표(policy)에 맞게 “Leader / Follower”, “Pass / Yield”, “Replan / Hold” 등으로 매핑하고, **둘이 같은 행동을 택하지 않도록** 한다.
+
+## 변경 포인트(개념)
+
+* `decide_with_primary()` 호출 직전에:
+
+  1. **충돌 키(conflict key)** 생성: `(min(my_id, other_id), max(my_id, other_id))` + 충돌 지점 격자셀 등
+  2. **역할 배정**: `role = assign_roles(me, other, yprio, right_of_way, mode, policy_table)`
+
+     * 예: ROW 높은 쪽 = “Pass/Run”, 낮은 쪽 = “Yield/Slowdown”
+     * 동순위면 `machine_id` 또는 `type_id` 사전 우선 규칙, 그 다음 **작은 랜덤 지터**(고정 seed=pair)로 깨기
+  3. **행동 합의(arbitration)**: 아주 얇은 Pub/Sub 1개로 “내가 이 conflict에 대해 이 행동을 ‘Claim’하겠다” 알리고, 1~2틱(예: 100~200ms) 안에 상대 Claim을 관찰. 충돌 시 deterministic 룰(점수>yprio>id)로 한쪽만 확정, 다른 쪽은 대체 행동으로 다운그레이드.
+
+## 코드 스케치
+
+### A) 메시지/퍼블리셔(아주 얇게)
+
+```python
+# __init__ 안
+from std_msgs.msg import String
+self.pub_claim = self.create_publisher(String, "/decision_claims", 10)
+self.sub_claim = self.create_subscription(String, "/decision_claims", self.on_claim, 20)
+
+# 런타임 캐시
+self.claims: Dict[str, Tuple[int, str, float, float, float]] = {}  
+# conflict_id -> (machine_id, action, score, yprio, stamp_sec)
+```
+
+```python
+def conflict_id_for(self, my_id: int, other_id: int, px: float, py: float) -> str:
+    a, b = (my_id, other_id) if my_id < other_id else (other_id, my_id)
+    # 거칠게 셀 단위로 스냅 (같은 지점 충돌을 동일 키로)
+    gx = round(px, 1); gy = round(py, 1)
+    return f"{a}-{b}@{gx:.1f},{gy:.1f}"
+```
+
+```python
+def on_claim(self, msg: String):
+    # 포맷: "conflict_id|mid|action|score|yprio|ts"
+    try:
+        cid, mid, act, sc, yp, ts = msg.data.split("|")
+        self.claims[cid] = (int(mid), act, float(sc), float(yp), float(ts))
+    except Exception:
+        return
+```
+
+### B) 역할 배정 + 행동 매핑 (표 기반)
+
+```python
+def assign_roles_and_action(self, me_id: int, other_id: int, c: Candidate) -> str:
+    """
+    점수/ROW/우선권을 표(policy)에 맞게 최종 행동으로 매핑.
+    - 예) ROW 높은 쪽 RUN/Pass, 낮은 쪽 YIELD/Slowdown
+    - reroute 상대면 난 RUN 또는 SLOWDOWN (표에 맞게)
+    """
+    # 예시 규칙(네 표에 맞춰 바꿔도 됨)
+    # 기준: yprio (상대가 더 우선) / reroute / right_of_way 비교
+    other_more_priority = (c.yprio >= self.Y_th)  # 혹은 row 비교 등
+    if other_more_priority:
+        # 난 양보측
+        if c.T_eff < self.T_yield: 
+            return "YIELD"
+        elif c.T_eff < self.T_slow:
+            return "SLOWDOWN"
+        else:
+            return "SLOWDOWN"  # 표가 원하면 RUN 대신 SLOWDOWN 고정
+    else:
+        # 난 우선측
+        if c.T_eff < self.T_yield:
+            return "YIELD"  # 너무 위험하면 둘 다 멈출 수 있게
+        return "RUN"
+```
+
+### C) 경합(동시행동) 방지
+
+```python
+def arbitrate(self, cid: str, my_action: str, my_score: float, my_yprio: float, other_id: int) -> str:
+    # 1) 내 claim 송신
+    ts = self.get_clock().now().nanoseconds * 1e-9
+    line = f"{cid}|{self.my_id}|{my_action}|{my_score:.3f}|{my_yprio:.3f}|{ts:.3f}"
+    self.pub_claim.publish(String(data=line))
+
+    # 2) 짧은 대기 (예: 0.1s) 동안 상대 claim 관찰
+    wait_until = ts + 0.12
+    while (self.get_clock().now().nanoseconds * 1e-9) < wait_until:
+        rclpy.spin_once(self, timeout_sec=0.02)
+
+    tup = self.claims.get(cid, None)
+    if tup and tup[0] != self.my_id:
+        other_mid, other_act, other_sc, other_y, other_ts = tup
+        # 충돌 행동이면 tie-break
+        if other_act == my_action:
+            # 우선: score, 다음 yprio, 다음 machine_id 작은 쪽 우선 등
+            mine_better = (my_score > other_sc) or \
+                          (abs(my_score - other_sc) < 1e-3 and my_yprio > other_y) or \
+                          (abs(my_score - other_sc) < 1e-3 and abs(my_yprio - other_y) < 1e-3 and self.my_id < other_mid)
+            if not mine_better:
+                # 난 행동 다운그레이드
+                if my_action == "REPLAN": return "YIELD"
+                if my_action == "YIELD":  return "SLOWDOWN"
+                if my_action == "SLOWDOWN": return "RUN"
+        # 행동이 달라도 표에서 금지 조합이면(예: REPLAN/REPLAN) 한쪽 다운그레이드
+        if my_action == "REPLAN" and other_act == "REPLAN":
+            # 동일하면 한쪽만 REPLAN, 나머지는 YIELD
+            if self.my_id < other_mid: return "REPLAN"
+            else: return "YIELD"
+    return my_action
+```
+
+### D) 흐름에 끼우는 위치
+
+`on_collision()`에서 primary 뽑은 다음:
+
+```python
+primary = max(cands, key=lambda c: c.score)
+cid = self.conflict_id_for(self.my_id, primary.machine_id, primary.px, primary.py)
+
+# 1) 역할 기반 1차 행동
+action0 = self.assign_roles_and_action(self.my_id, primary.machine_id, primary)
+
+# 2) 경합 방지
+action = self.arbitrate(cid, action0, primary.score, primary.yprio, primary.machine_id)
+
+# 3) 상태 전환
+self._set_state_and_emit(action, reason=f"cid={cid} score={primary.score:.2f} T={primary.T_eff:.2f} Y={primary.yprio:.2f}")
+```
+
+> 이렇게 하면 **동일 충돌에 대해 양쪽이 동시에 같은 행동을 고르더라도** 짧은 합의 단계에서 **한 쪽만 확정**되고 다른 한 쪽은 **표가 요구하는 보조 행동**으로 자동 다운그레이드돼. 표(policy) 룰은 `assign_roles_and_action()` 안에만 반영하면 되니 유지보수도 쉬워.
+
+---
+
+# 2) `current_twist`/`ttc_first`가 신뢰 안 될 때 — Severity/TTC 임시 제거(또는 축소)
+
+현재 코드에서 이 값들이 쓰이는 곳:
+
+* `combine_ttc()` : `T_eff` 계산 시 `ttc_first`(직접 TTC)와 **대체 TTC(surrogate)**에 `agent.current_twist.linear.x`가 필요.
+* `build_candidates()` : `severity` 안에 `1/T_eff`, `1/d`, `heading_bonus`, `v_closing`이 포함.
+* 최종 의사결정은 `decide_with_primary()`에서 `T_eff`와 `yprio`만 사용.
+
+## 문제
+
+* 기본/더미 값이면 `T_eff → inf`가 잘 나오고, 그럼 `T_yield/T_slow` 비교에서 거의 항상 **RUN**이 되어버림.
+* `severity`를 0으로 빼도 `score=sev*(1+kappa*yprio)`가 0이 되어 **모두 같은 점수**로 엮일 수 있음.
+
+## 안전한 임시 대응(토글 + Fallback)
+
+### A) 파라미터 토글 추가
+
+```python
+# __init__
+self.declare_parameter("use_severity", True)
+self.declare_parameter("use_ttc_inputs", True)  # ttc_first, current_twist 사용 여부
+self.use_severity = bool(self.get_parameter("use_severity").value)
+self.use_ttc_inputs = bool(self.get_parameter("use_ttc_inputs").value)
+```
+
+### B) combine_ttc Fallback
+
+```python
+def combine_ttc(self, ttc_direct: float, px: float, py: float, agent: MultiAgentInfo) -> float:
+    if not self.use_ttc_inputs:
+        # TTC를 신뢰하지 않을 때: 거리 기반 완전 대체 (v_nom으로 가정)
+        ax, ay = agent.current_pose.pose.position.x, agent.current_pose.pose.position.y
+        d = math.hypot(px - ax, py - ay)
+        v_nom = 0.3  # 임시 상수 (param으로 뺄 수 있음)
+        return float("inf") if v_nom < 1e-3 else max(d / v_nom, 0.0)
+
+    # 기존 로직 유지
+    ...
+```
+
+### C) severity 제거(또는 축소)
+
+```python
+# build_candidates 내부
+if self.use_severity:
+    sev = self.a1 * (1.0 / max(T_eff, self.T_min)) + \
+          self.a2 * (1.0 / max(d_me, self.d_min)) + \
+          self.a3 * heading_bonus(rel_heading_deg) + \
+          self.a4 * v_closing
+else:
+    # 완전 제거 대신 아주 작은 상수 부여(순위 동률 방지)
+    sev = 1e-3
+```
+
+### D) score 대체식 (severity 배제 시)
+
+```python
+if self.use_severity:
+    score = sev * (1.0 + self.kappa * yprio)
+else:
+    # yprio만으로 소팅: sev 영향 배제
+    # 필요하면 d_me 역수 등 소량 가중치를 더해 tie-breaking
+    score = (1.0 + self.kappa * yprio)
+```
+
+### E) decide_with_primary도 TTC 미사용 시 보정
+
+`use_ttc_inputs=False`일 때는 `T_eff`가 거리/상수속도 기반이라 과소/과대평가가 가능하니, **스레시홀드도 살짝 상향**하거나 **거리 기반 추가 게이트**를 넣는 게 안정적이야.
+
+```python
+def decide_with_primary(self, c: Candidate, primary_is_reroute: bool) -> str:
+    T_y = self.T_yield if self.use_ttc_inputs else (self.T_yield * 1.3)
+    T_s = self.T_slow  if self.use_ttc_inputs else (self.T_slow  * 1.3)
+
+    if c.T_eff < T_y or c.yprio >= self.Y_th:
+        return "YIELD"
+    if c.T_eff < T_s:
+        return "SLOWDOWN"
+    if primary_is_reroute and c.yprio >= (self.Y_th - 0.2):
+        return "REROUTE"
+    return "RUN"
+```
+
+> 이렇게 하면 `ttc_first`/`current_twist`가 정착될 때까지 **점수와 정책 프레임은 유지**하면서도, **거짓 데이터로 인한 과도한 RUN/REPLAN/STOP** 쏠림을 막을 수 있어. 나중에 센서/추정이 안정화되면 `use_severity=True`, `use_ttc_inputs=True`만 다시 켜면 원상복구.
+
+---
+
+## 요약 체크리스트
+
+* [ ] `assign_roles_and_action()`에 네가 만든 **정책 표**를 그대로 옮겨적는다(입력: 나/상대/지표들 → 출력: RUN/SLOWDOWN/YIELD/REPLAN 등).
+* [ ] `arbitrate()`로 **동일 conflict_id**에 대한 **행동 충돌**을 100~200ms 내에 **결정론적으로** 해결.
+* [ ] 임시로 TTC/속도를 신뢰하지 않을 땐 `use_ttc_inputs=False`, `use_severity=False`로 두고,
+  `combine_ttc()`는 거리/상수속도 Fallback, `score`는 `yprio` 중심으로만 정렬.
+* [ ] 이 기간엔 `decide_with_primary()`의 `T_*` 문턱을 10~30% 상향해서 보수적으로 운용.
+
+필요하면, 네 표(policy) 스냅샷을 주면 `assign_roles_and_action()` 안을 딱 맞춰서 구체 코드로 펼쳐줄게.
