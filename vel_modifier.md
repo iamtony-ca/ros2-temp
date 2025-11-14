@@ -297,3 +297,219 @@ void VelocityModifierNode::cmdVelCallback(const geometry_msgs::msg::Twist::Share
   adjusted_cmd_vel_pub_->publish(std::move(adjusted_vel));
 }
 ```
+#####################  
+######################  
+######################  
+네, 코드를 검토해 본 결과, **몇 가지 심각한 버그**와 의도하신 대로 동작하지 않을 수 있는 **치명적인 로직적 문제**들이 있습니다.
+
+특히 \*\*컴파일 오류, 메모리 손상, 스레드 충돌(Data Race)\*\*을 일으킬 수 있는 부분들이 포함되어 있습니다.
+
+-----
+
+## 1\. 🚨 가장 심각한 버그 (컴파일 오류 / 스레드 충돌)
+
+### 가. `auto adjusted_vel_;` (헤더 파일)
+
+  * **문제**: C++ 클래스 멤버 변수는 `auto` 키워드로 선언할 수 없습니다. 이 코드는 컴파일되지 않습니다.
+  * **분석**: `cmdVelCallback`의 로컬 변수인 `adjusted_vel`을 다른 콜백(`controlCallback`)에서 사용하기 위해 멤버 변수로 선언하려 하신 것 같습니다. 이는 매우 위험한 접근 방식입니다.
+
+### 나. `controlCallback`에서의 `adjusted_vel_` 접근 (치명적)
+
+  * **문제**: `controlCallback`의 `case ModifierControl::TYPE_SPEED_LIMIT_SCALE:` 내부에서 `adjusted_vel_`에 접근하는 모든 코드(`current_speed_limit_scale_linear_ = adjusted_vel_->linear.x;`)는 심각한 버그입니다.
+  * **이유**:
+    1.  **데이터 경합 (Data Race)**: `cmdVelCallback`와 `controlCallback`은 **서로 다른 Reentrant 콜백 그룹**에서 실행됩니다. 즉, 두 함수는 **동시에 다른 스레드에서 실행**될 수 있습니다. `data_mutex_`는 `adjusted_vel_` 멤버를 보호하지 않으므로, 한 스레드가 `adjusted_vel_`에 쓰고 다른 스레드가 읽으려 하면 100% 스레드 충돌이 발생합니다.
+    2.  **댕글링 포인터 (Dangling Pointer)**: `cmdVelCallback`의 `adjusted_vel`은 `std::make_unique`로 생성된 로컬 `unique_ptr`입니다. `cmdVelCallback` 함수가 종료되면 이 포인터는 **즉시 메모리에서 해제됩니다.** `controlCallback`이 이 해제된 메모리 주소(`adjusted_vel_`)에 접근하면 프로그램은 \*\*즉시 비정상 종료(Crash)\*\*합니다.
+    3.  **잘못된 할당**: `adjusted_vel_ = adjusted_vel;` 이 라인은 `std::unique_ptr`를 복사하려 시도하므로 컴파일 오류입니다. (만약 `adjusted_vel_ = adjusted_vel.get()`으로 하셨더라도 위 1, 2번 문제로 인해 여전히 치명적입니다.)
+
+-----
+
+## 2\. 📝 로직 및 설계 문제
+
+### 가. `controlCallback`의 잘못된 로직
+
+  * **문제**: `controlCallback`은 `/velocity_modifier/control` 토픽이 수신될 때만 실행됩니다. `cmdVelCallback`은 `/cmd_vel_adjusted` 토픽이 수신될 때 실행됩니다.
+  * **분석**: `controlCallback`이 실행되는 시점에 로봇의 "현재 속도"(`adjusted_vel_`)를 가져오려는 설계 자체가 잘못되었습니다. `controlCallback`이 실행될 때 `cmdVelCallback`은 아예 실행 중이 아닐 수도 있습니다. "속도 제한"과 같은 *규칙*을 설정하는 콜백이, 특정 시점의 *데이터*에 의존해서는 안 됩니다.
+
+### 나. `flag_speed_limit_scale_` (One-Shot 로직)
+
+  * **문제**: `flag_speed_limit_scale_ = true;`로 플래그를 설정하고, `cmdVelCallback`에서 이 플래그를 확인하여 **단 한 번** 속도를 덮어쓴 뒤 `flag_speed_limit_scale_ = false;`로 리셋합니다.
+  * **분석**: 이 로직은 "지속적인 속도 제한"이나 "지속적인 스케일링"이 아닙니다. 이것은 "다음에 들어오는 `cmd_vel` 메시지를 무시하고, `controlCallback`에서 계산한 값으로 **단 한 번** 강제 발행"하는 기능입니다.
+  * **의도 확인**: 만약 이것이 의도한 기능이라면 위 1번 버그만 수정하면 되지만, `TYPE_SPEED_LIMIT_SCALE`라는 이름으로 볼 때, 아마도 \*\*"비율을 유지하는 지속적인 상한선"\*\*을 의도하신 것 같습니다.
+
+### 다. `controlCallback`의 불필요한 계산
+
+  * **문제**: `TYPE_SPEED_LIMIT_SCALE` 케이스에서 `msg->linear_value`와 `msg->angular_value`를 받아 변수에 저장한 뒤, `if/else if` 문을 통해 \*\*"현재 속도"\*\*를 기준으로 이 값들을 **다시 덮어쓰고 있습니다.**
+  * **분석**: 위 1, 2번 문제로 인해 이 로직은 동작하지 않으며, 설령 동작하더라도 매우 혼란스러운 로직입니다. "속도 제한" 메시지는 "새로운 제한 값은 이것이다"라고 명시적으로 값을 전달해야 합니다.
+
+-----
+
+## 3\. 💡 버그 수정 및 올바른 로직 제안
+
+아마도 의도하신 기능은 **"새로운 선속/각속 상한선을 설정하되, 이 상한선을 초과할 경우 비율을 유지하며 속도를 낮추는"** 기능으로 보입니다.
+
+이 기능을 올바르게 구현하려면 **`controlCallback`에서는 규칙(제한값)만 저장**하고, **`cmdVelCallback`에서 모든 계산을 수행**해야 합니다.
+
+### 제안 1: 헤더 파일 (`.hpp`) 수정
+
+`auto adjusted_vel_`와 `flag_speed_limit_scale_`를 제거하고, 이 모드가 활성화되었는지 알려주는 `bool` 플래그를 추가합니다.
+
+```cpp
+// ...
+  // 데이터 보호를 위한 뮤텍스
+  std::mutex data_mutex_;
+
+  // 모드별 상태 변수
+  double speed_limit_linear_;
+  double speed_limit_angular_;
+  double speed_scale_;
+
+  // 새로운 모드를 위한 변수
+  double ratio_limit_linear_;
+  double ratio_limit_angular_;
+
+  // 어떤 모드가 활성화되었는지 나타내는 Enum
+  enum class SpeedMode {
+    STANDARD_LIMIT,
+    STANDARD_SCALE,
+    RATIO_LIMIT_SCALE
+  };
+  SpeedMode current_mode_ = SpeedMode::STANDARD_LIMIT;
+
+  // (min_abs_linear_vel_ 등 다른 변수들...)
+  
+  bool recovery_mode_ = false;
+
+  // auto adjusted_vel_;  <-- [제거]
+  // bool flag_speed_limit_scale_ = false; <-- [제거]
+};
+```
+
+### 제안 2: `controlCallback` (`.cpp`) 수정
+
+각 `case`가 자신의 모드를 활성화하고 다른 모드의 설정을 초기화하도록 변경합니다. **`adjusted_vel_` 관련 코드를 모두 제거합니다.**
+
+```cpp
+void VelocityModifierNode::controlCallback(const ModifierControl::SharedPtr msg)
+{
+  const std::lock_guard<std::mutex> lock(data_mutex_);
+
+  switch (msg->command_type) {
+    case ModifierControl::TYPE_SPEED_LIMIT:
+      current_mode_ = SpeedMode::STANDARD_LIMIT;
+      speed_limit_linear_ = msg->linear_value;
+      speed_limit_angular_ = msg->angular_value;
+      speed_scale_ = 1.0;
+      RCLCPP_INFO(
+        this->get_logger(), "Set Mode: STANDARD_LIMIT. Linear: %.2f, Angular: %.2f",
+        speed_limit_linear_, speed_limit_angular_);
+      break;
+
+    case ModifierControl::TYPE_SPEED_SCALE:
+      current_mode_ = SpeedMode::STANDARD_SCALE;
+      speed_scale_ = msg->linear_value;
+      speed_limit_linear_ = std::numeric_limits<double>::max();
+      speed_limit_angular_ = std::numeric_limits<double>::max();
+      RCLCPP_INFO(this->get_logger(), "Set Mode: STANDARD_SCALE. Scale: %.2f", speed_scale_);
+      break;
+
+    case ModifierControl::TYPE_SPEED_LIMIT_SCALE:
+      current_mode_ = SpeedMode::RATIO_LIMIT_SCALE;
+      ratio_limit_linear_ = msg->linear_value;
+      ratio_limit_angular_ = msg->angular_value;
+      // 다른 모드 설정 초기화
+      speed_scale_ = 1.0; 
+      speed_limit_linear_ = std::numeric_limits<double>::max();
+      speed_limit_angular_ = std::numeric_limits<double>::max();
+
+      RCLCPP_INFO(
+        this->get_logger(), "Set Mode: RATIO_LIMIT_SCALE. Linear: %.2f, Angular: %.2f",
+        ratio_limit_linear_, ratio_limit_angular_);
+      break;
+
+    default:
+      RCLCPP_WARN(
+        this->get_logger(), "Received control command with unknown type: %d", msg->command_type);
+      break;
+  }
+}
+```
+
+### 제안 3: `cmdVelCallback` (`.cpp`) 수정
+
+`current_mode_`에 따라 다른 속도 제한 로직을 적용합니다.
+
+```cpp
+void VelocityModifierNode::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
+{
+  const std::lock_guard<std::mutex> lock(data_mutex_);
+  
+  auto adjusted_vel = std::make_unique<geometry_msgs::msg::Twist>(*msg);
+  // adjusted_vel_ = adjusted_vel;  <-- [제거]
+
+  // [수정된 로직 시작]
+  if (current_mode_ == SpeedMode::STANDARD_LIMIT) {
+    adjusted_vel->linear.x *= speed_scale_; // (speed_scale_은 1.0일 것)
+    adjusted_vel->angular.z *= speed_scale_;
+    adjusted_vel->linear.x = std::clamp(
+      adjusted_vel->linear.x, -speed_limit_linear_, speed_limit_linear_);
+    adjusted_vel->angular.z = std::clamp(
+      adjusted_vel->angular.z, -speed_limit_angular_, speed_limit_angular_);
+  } 
+  else if (current_mode_ == SpeedMode::STANDARD_SCALE) {
+    adjusted_vel->linear.x *= speed_scale_;
+    adjusted_vel->angular.z *= speed_scale_;
+    // (limit은 max일 것)
+    adjusted_vel->linear.x = std::clamp(
+      adjusted_vel->linear.x, -speed_limit_linear_, speed_limit_linear_);
+    adjusted_vel->angular.z = std::clamp(
+      adjusted_vel->angular.z, -speed_limit_angular_, speed_limit_angular_);
+  }
+  else if (current_mode_ == SpeedMode::RATIO_LIMIT_SCALE) {
+    // 1.0 스케일 적용 (다른 모드와 일관성)
+    adjusted_vel->linear.x *= speed_scale_; // (speed_scale_은 1.0일 것)
+    adjusted_vel->angular.z *= speed_scale_;
+
+    double abs_vx = std::abs(adjusted_vel->linear.x);
+    double abs_wz = std::abs(adjusted_vel->angular.z);
+    double scale = 1.0;
+    
+    // 비율 계산 (0으로 나누기 방지)
+    double linear_ratio = 1.0;
+    if (abs_vx > 1e-6) {
+      linear_ratio = ratio_limit_linear_ / abs_vx;
+    }
+    double angular_ratio = 1.0;
+    if (abs_wz > 1e-6) {
+      angular_ratio = ratio_limit_angular_ / abs_wz;
+    }
+
+    // 두 제한을 모두 만족해야 하므로, 더 작은 비율(더 많이 줄여야 하는)을 선택
+    if (abs_vx > ratio_limit_linear_ || abs_wz > ratio_limit_angular_) {
+      scale = std::min(linear_ratio, angular_ratio);
+    }
+    
+    // 1.0보다 큰 값으로 스케일링되지 않도록 (즉, 속도를 증가시키지 않도록)
+    scale = std::min(scale, 1.0); 
+
+    adjusted_vel->linear.x *= scale;
+    adjusted_vel->angular.z *= scale;
+  }
+  // [수정된 로직 끝]
+
+
+  // 3. 저속 보정 로직 (이 로직은 모든 모드에 공통으로 적용됨)
+  if (recovery_mode_) {
+    // ... (기존의 안정적인 저속 보정 로C logic) ...
+  } 
+
+  adjusted_cmd_vel_pub_->publish(std::move(adjusted_vel));
+}
+```
+
+**요약**:
+
+1.  **버그 수정**: `auto adjusted_vel_` 멤버를 제거하여 컴파일 오류, 메모리 손상, 스레드 충돌을 모두 해결합니다.
+2.  **로직 수정**: "One-shot 플래그" 대신 `SpeedMode`라는 상태(enum)를 도입하여, `controlCallback`이 모드를 설정하고 `cmdVelCallback`이 해당 모드의 로직을 수행하도록 책임을 명확히 분리합니다.
+3.  **새 기능 구현**: `RATIO_LIMIT_SCALE` 모드는 `cmdVelCallback` 내에서 비율을 계산하여 적용하도록 수정합니다.
+
+새로운 `TYPE_SPEED_LIMIT_SCALE`의 정확한 의도가 제가 추측한 것(비율 유지 상한선)과 다른지 확인해 주시면, 그에 맞게 코드를 다시 조정해 드릴 수 있습니다.
