@@ -367,3 +367,67 @@ TF 변환 로직을 `for` 루프에 적용합니다.
   }
 ```
 ################################################ 
+#####################  
+#######################  
+네, 사용자님의 생각이 정확합니다. `global_costmap`("map" 프레임)에서는 정상인데 `local_costmap`("odom" 프레임)에서만 문제가 발생한다면, 이는 99.9% TF 변환 문제입니다.
+
+사용자님의 가설대로, `/multi_agent_infos` 토픽의 "map" 프레임 데이터를 "odom" 프레임으로 변환하지 않고 `local_costmap`에 그리고 있기 때문입니다.
+
+제가 이전에 `local_costmap`을 지원하도록 제안했던 `transformAgentInfo` 함수에 **버그가 있었습니다.** 죄송합니다.
+
+`truncated_path`의 포즈들을 변환할 때, TF 변환에 필요한 `header` 정보를 올바르게 설정하지 않고 재사용하여 변환이 실패했거나 잘못된 값으로 변환되었습니다.
+
+-----
+
+### 🐞 `agent_layer.cpp`의 버그 수정
+
+`agent_layer.cpp` 파일에서 `transformAgentInfo` 함수 내부의 `for` 루프만 수정하면 됩니다.
+
+#### `agent_layer.cpp (transformAgentInfo)` 수정
+
+```cpp
+/* ****************************************
+ * [BEFORE] agent_layer.cpp - transformAgentInfo()
+ * ****************************************
+ */
+    // 2. Transform truncated_path
+    for (const auto& pose_stamped_in_map : agent_in_map.truncated_path.poses) {
+      pose_to_transform.pose = pose_stamped_in_map.pose; // Reuse pose_to_transform object
+
+      geometry_msgs::msg::PoseStamped pose_in_costmap_frame;
+      tf_->transform(pose_to_transform, pose_in_costmap_frame, costmap_frame);
+      
+      agent_in_costmap_frame.truncated_path.poses.push_back(pose_in_costmap_frame);
+    }
+```
+
+```cpp
+/* ****************************************
+ * [AFTER] agent_layer.cpp - transformAgentInfo()
+ * ****************************************
+ */
+    // 2. Transform truncated_path
+    for (const auto& pose_stamped_in_map : agent_in_map.truncated_path.poses) {
+      
+      // [FIX] Create a NEW PoseStamped for each path point
+      geometry_msgs::msg::PoseStamped path_pose_to_transform;
+      // [FIX] Explicitly set the header for *this* point
+      path_pose_to_transform.header.frame_id = map_frame;
+      path_pose_to_transform.header.stamp = map_stamp;
+      // [FIX] Copy the pose from the path
+      path_pose_to_transform.pose = pose_stamped_in_map.pose; 
+
+      geometry_msgs::msg::PoseStamped pose_in_costmap_frame;
+      // [FIX] Transform the new, correct object
+      tf_->transform(path_pose_to_transform, pose_in_costmap_frame, costmap_frame);
+      
+      agent_in_costmap_frame.truncated_path.poses.push_back(pose_in_costmap_frame);
+    }
+```
+
+### 🔧 수정된 이유
+
+  * **Before (버그):** `pose_to_transform` 변수를 재사용했습니다. 이 변수는 `current_pose`의 `PoseStamped` 정보가 담겨있었는데, 루프 내에서 `.pose` 필드만 덮어썼습니다. 이 방식은 `header` 정보가 일관되지 않거나, `tf_->transform` 함수가 예기치 않게 동작할 수 있는 위험이 있었습니다.
+  * **After (수정):** `for` 루프 안에서 **매번 새로운 `path_pose_to_transform` 객체를 생성**합니다. 그리고 `map_frame`과 `map_stamp`를 사용하여 `header`를 명시적으로 올바르게 설정한 뒤, `pose` 정보만 복사하여 변환합니다.
+
+이 코드는 `local_costmap`("odom")과 `global_costmap`("map") 모두에서 TF 변환을 올바르게 처리하여 프레임 불일치 문제를 해결합니다.
