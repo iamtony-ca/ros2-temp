@@ -60,7 +60,7 @@ controller_server:
 ```
 
 이 수정으로 후진 전용 주행에서 lookahead point가 항상 일정 거리를 유지하면서 부드럽게 움직일 것입니다!
-```
+```cpp
 // computeVelocityCommands 함수 내부 수정 부분
 
 geometry_msgs::msg::TwistStamped RegulatedPurePursuitController::computeVelocityCommands(
