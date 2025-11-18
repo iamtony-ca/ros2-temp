@@ -500,3 +500,96 @@ double AgentLayer::computeDilation(const multi_agent_msgs::msg::MultiAgentInfo &
 4.  `case` 문 내부의 상태 목록과 적용할 `r` 값(반지름)을 사용자님의 의도에 맞게 수정합니다.
 
 이 변경을 통해 `rasterizeAgentPath` 함수가 호출될 때마다 에이전트의 현재 상태에 맞는 팽창 크기가 `fillFootprintAt` 함수로 전달되어 코스트맵에 반영됩니다.  
+###################################  
+####################################  
+######################################  
+`AgentLayer`는 **Nav2 Costmap 2D**의 플러그인으로서, 외부에서 수신된 다른 로봇(Agent)들의 정보를 바탕으로 코스트맵에 장애물을 표시하는 역할을 합니다.
+
+요청하신 대로 주요 함수와 파라미터에 대해 상세히 설명해 드리겠습니다.
+
+---
+
+### 1. 주요 함수 (Key Functions)
+
+이 클래스의 핵심 로직을 담당하는 함수들입니다.
+
+#### **`onInitialize()`**
+* **역할:** 플러그인이 로드될 때 **최초 1회 실행**되는 초기화 함수입니다.
+* **주요 동작:**
+    1.  ROS 2 노드 핸들을 가져옵니다.
+    2.  **파라미터 선언 및 로딩:** YAML 파일에 정의된 모든 설정을 읽어옵니다.
+    3.  **Footprint 로딩:** `robot_ids` 리스트를 순회하며 각 로봇 ID에 해당하는 `footprint` 또는 `radius` 정보를 읽어 `agent_footprints_` 맵에 저장합니다.
+    4.  **ROS 통신 설정:** `/multi_agent_infos` 토픽 구독(Subscriber)과 메타 데이터 발행(Publisher)을 설정합니다.
+
+#### **`updateBounds(robot_x, robot_y, ...)`**
+* **역할:** 코스트맵 갱신 주기마다 호출되며, **"이번 주기에 갱신해야 할 영역(Bounding Box)"**을 계산합니다.
+* **주요 동작:**
+    1.  **로봇 위치 캐싱:** `updateCosts`에서 사용하기 위해 현재 로봇의 위치(`cached_robot_x/y`)를 저장합니다.
+    2.  **TF 변환:** 수신된 에이전트 정보를 현재 코스트맵의 프레임(Global은 "map", Local은 "odom")으로 변환합니다.
+    3.  **ROI 필터링:** 로봇과 에이전트 간의 거리가 `roi_range_m_` 이내인지 확인합니다.
+    4.  **영역 확장:** 유효한 에이전트의 현재 위치와 예측 경로(`truncated_path`)를 감싸는 사각형 영역만큼 `min_x`, `min_y`, `max_x`, `max_y`를 확장합니다.
+
+#### **`updateCosts(master_grid, ...)`**
+* **역할:** `updateBounds`에서 계산된 영역 내의 셀들에 **실제 비용(Cost)을 칠하는(Writing)** 함수입니다.
+* **주요 동작:**
+    1.  `updateBounds`와 동일하게 **TF 변환** 및 **ROI 필터링**을 수행합니다. (이중 체크를 통해 성능 최적화 및 버그 방지)
+    2.  각 에이전트에 대해 **`rasterizeAgentPath`**를 호출하여 장애물을 그립니다.
+    3.  디버깅용 메타 데이터(`/agent_layer_meta`)를 발행합니다.
+
+#### **`rasterizeAgentPath(agent, grid, ...)`**
+* **역할:** 단일 에이전트를 코스트맵에 그리기 위한 준비를 합니다.
+* **주요 동작:**
+    1.  `getFootprintForAgent`를 통해 해당 에이전트의 모양(Footprint)을 가져옵니다.
+    2.  `computeCost`와 `computeDilation`을 호출하여 적용할 비용과 팽창 크기를 결정합니다.
+    3.  이동 중(`isMovingPhase`)이라면 전방 스미어(`forward_smear_m_`) 값을 설정합니다.
+    4.  **`fillFootprintAt`**을 호출하여 실제 맵에 값을 씁니다.
+
+#### **`fillFootprintAt(footprint, pose, ...)`**
+* **역할:** 주어진 위치와 모양대로 맵에 색칠을 하는 **Low-level 그리기 함수**입니다.
+* **주요 동작:**
+    1.  **Dilation & Smear:** 기본 풋프린트 다각형을 등방성 팽창시키거나 전방으로 늘립니다.
+    2.  **Transform:** 로봇 중심 좌표계의 풋프린트를 월드 좌표계로 변환합니다.
+    3.  **Rasterization:** 다각형 내부의 모든 셀을 찾아내어 `master_grid`에 지정된 `cost`를 입력합니다. (기존 값보다 클 경우에만 덮어쓰는 Max-Merge 방식 사용)
+
+#### **`transformAgentInfo(...)`**
+* **역할:** 데이터의 좌표계("map")와 코스트맵의 좌표계("odom" 등)가 다를 때, TF를 사용하여 위치와 경로를 변환해 주는 헬퍼 함수입니다.
+
+---
+
+### 2. 파라미터 (Parameters)
+
+YAML 파일(`nav2_params.yaml`)에서 설정할 수 있는 변수들입니다.
+
+#### **기본 설정**
+* `enabled` (bool): 레이어 활성화 여부 (Default: `true`).
+* `topic` (string): 에이전트 정보를 수신할 토픽 이름 (Default: `"/multi_agent_infos"`).
+* `qos_reliable` (bool): 토픽 구독 시 Reliable QoS 사용 여부. False면 Best Effort 사용 (Default: `true`).
+
+#### **필터링 및 성능**
+* `self_machine_id` (int): 내 로봇의 ID. (자신은 장애물로 그리지 않기 위해 사용).
+* `roi_range_m` (double): 내 로봇을 중심으로 이 반경(미터) 내에 있는 에이전트만 처리합니다. (Default: `12.0`).
+* `time_decay_sec` (double): 데이터가 이 시간보다 오래되면 무시합니다. (현재 코드에서는 `freshness_timeout_ms`가 더 직접적으로 쓰임).
+* `freshness_timeout_ms` (int): 수신된 메시지가 이 시간(ms)보다 오래되면 맵에 그리지 않습니다 (Default: `800`).
+* `max_poses` (int): 예측 경로(`truncated_path`) 중 몇 번째 포즈까지만 그릴지 제한합니다 (Default: `40`).
+
+#### **비용(Cost) 관련**
+* `lethal_cost` (int): 충돌 시 부여할 치명적 비용 (Default: `254`).
+* `moving_cost` (int): 이동 중인 에이전트에게 부여할 비용 (Default: `254`).
+* `waiting_cost` (int): 정지 중인 에이전트에게 부여할 비용 (Default: `200`).
+* `manual_cost_bias` (int): 수동 조작 모드인 에이전트에게 추가할 비용 가중치 (Default: `30`).
+
+#### **형상 및 팽창 (Geometry & Dilation)**
+* `dilation_m` (double): 에이전트 주변에 적용할 기본 안전 여유 거리 (등방성 팽창) (Default: `0.05`).
+* `forward_smear_m` (double): 이동 중일 때 진행 방향(전방)으로 풋프린트를 늘릴 길이 (Default: `0.005`).
+* `sigma_k` (double): 위치 불확실성(`pos_std_m`)을 팽창에 반영할 때의 계수 (현재 코드는 주석 처리됨).
+
+#### **개별 로봇 Footprint 설정 (`robot_ids` 리스트)**
+* `robot_ids` (string list): 관리할 로봇들의 ID 목록 (예: `["robot_001", "robot_002"]`).
+* 각 ID 아래:
+    * `machine_id` (int): 해당 로봇의 정수형 ID 식별자.
+    * `footprint` (string): `[[x1,y1], [x2,y2], ...]` 형태의 좌표 문자열.
+    * `robot_radius` (double): 풋프린트가 비어있을 경우 사용할 원형 반지름.
+
+#### **디버깅**
+* `publish_meta` (bool): 디버깅용 메타 데이터 토픽 발행 여부.
+* `meta_stride` (int): 메타 데이터를 발행할 때 몇 개의 셀마다 하나씩 발행할지 (데이터 양 조절).
