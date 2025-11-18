@@ -431,3 +431,72 @@ TF 변환 로직을 `for` 루프에 적용합니다.
   * **After (수정):** `for` 루프 안에서 **매번 새로운 `path_pose_to_transform` 객체를 생성**합니다. 그리고 `map_frame`과 `map_stamp`를 사용하여 `header`를 명시적으로 올바르게 설정한 뒤, `pose` 정보만 복사하여 변환합니다.
 
 이 코드는 `local_costmap`("odom")과 `global_costmap`("map") 모두에서 TF 변환을 올바르게 처리하여 프레임 불일치 문제를 해결합니다.
+##############################  
+################################  
+################################  
+네, `agent_layer`에서 다른 로봇의 상태(`AgentStatus`)별로 코스트 팽창(dilation) 사이즈를 다르게 적용하는 방법을 알려드리겠습니다.
+
+### 🛠️ 변경해야 할 코드 부분
+
+`agent_layer.cpp`의 **`computeDilation` 함수**를 수정해야 합니다.
+
+현재 이 함수는 `dilation_m_` 파라미터 하나만을 반환하고 있지만, 여기서 `a.status.phase`를 확인하여 상태별로 다른 값을 반환하도록 로직을 확장하면 됩니다.
+
+-----
+
+### 📄 코드 템플릿 (computeDilation 수정)
+
+다음은 `computeDilation` 함수를 수정하는 템플릿입니다.
+
+```cpp
+// [CHANGED] 상태별 Dilation 적용
+double AgentLayer::computeDilation(const multi_agent_msgs::msg::MultiAgentInfo & a) const
+{
+  using S = multi_agent_msgs::msg::AgentStatus;
+  const uint8_t phase = a.status.phase;
+
+  // 1. 기본값 설정 (파라미터 dilation_m_)
+  double r = dilation_m_;
+
+  // 2. 상태별 조건부 Dilation 적용
+  switch (phase) {
+    // Case A: 팽창을 크게 하고 싶은 상태들 (예: 에러, 수동 주행, 충전 중 등)
+    // 다른 로봇이 멀리서부터 피해가도록 함
+    case S::STATUS_ERROR:
+    case S::STATUS_MANUAL_RUNNING:
+    case S::STATUS_CHARGING:
+    case S::STATUS_AUTORECOVERY:
+      r = std::max(r, 0.3); // 예: 최소 0.3m 보장 (수치는 직접 수정하세요)
+      break;
+
+    // Case B: 팽창을 작게 하고 싶은 상태들 (예: 좁은 곳 작업 중, 정밀 도킹 등)
+    // 다른 로봇이 가까이 지나갈 수 있도록 함
+    case S::STATUS_LOADING:
+    case S::STATUS_UNLOADING:
+    case S::STATUS_MARKING: 
+      r = std::max(r, 0.02); // 예: 아주 작게 (0.02m)
+      break;
+
+    // Case C: 일반 주행/대기 상태 (기본값 사용)
+    case S::STATUS_MOVING:
+    case S::STATUS_WAITING_FOR_OBS:
+    default:
+      // r = dilation_m_; // 이미 설정됨
+      break;
+  }
+
+  // 3. (옵션) 위치 불확실성 반영
+  // if (a.pos_std_m >= 0.0) r += sigma_k_ * a.pos_std_m;
+
+  return r;
+}
+```
+
+### 📝 적용 방법
+
+1.  `agent_layer.cpp` 파일을 엽니다.
+2.  기존의 `computeDilation` 함수를 찾습니다.
+3.  위의 템플릿 코드로 내용을 교체합니다.
+4.  `case` 문 내부의 상태 목록과 적용할 `r` 값(반지름)을 사용자님의 의도에 맞게 수정합니다.
+
+이 변경을 통해 `rasterizeAgentPath` 함수가 호출될 때마다 에이전트의 현재 상태에 맞는 팽창 크기가 `fillFootprintAt` 함수로 전달되어 코스트맵에 반영됩니다.  
