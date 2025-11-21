@@ -268,3 +268,100 @@ if __name__ == "__main__":
       * 궤적들이 부채꼴처럼 고르게 퍼져 있어야 합니다. 특정 각도로만 쏠려 있다면 장애물 회피 성능이 떨어집니다.
 
 혹시 시각화 실행에 문제가 있거나, 결과 해석이 애매하면 결과 이미지를 설명해주시거나 상황을 알려주세요. 추가로 분석해드리겠습니다.
+#####################  
+############################  
+############################  
+##########################  
+이 에러는 현재 실행 중인 환경(특히 **Docker 컨테이너**나 **VS Code의 터미널** 환경)이 그래픽 창(GUI)을 띄울 수 없는 상태(Headless)이거나, Matplotlib의 백엔드가 `Agg`(이미지 생성 전용, 비대화형)로 설정되어 있어서 발생합니다.
+
+사용자님의 환경이 **Docker**와 **Ubuntu Server(GUI 없음)** 기반일 가능성이 높으므로, 창을 띄우는 `plt.show()` 대신 \*\*이미지 파일로 저장하는 `plt.savefig()`\*\*를 사용하는 것이 가장 확실한 해결책입니다.
+
+코드를 다음과 같이 수정해 보세요.
+
+### 수정된 `view_primitives.py` (이미지 저장 방식)
+
+`plt.show()` 부분을 주석 처리하고 `plt.savefig()`를 추가했습니다.
+
+```python
+import json
+import matplotlib
+# GUI가 없는 환경(Docker 등)에서도 동작하도록 Agg 백엔드 강제 설정
+matplotlib.use('Agg') 
+import matplotlib.pyplot as plt
+import numpy as np
+
+# ==========================================
+# 설정: 확인하고 싶은 JSON 파일 경로 입력
+FILE_PATH = 'backward_only_primitives.json' 
+OUTPUT_IMG_NAME = 'primitives_result.png' # 저장할 이미지 파일 이름
+# ==========================================
+
+def visualize_primitives(file_path):
+    try:
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: 파일을 찾을 수 없습니다. 경로를 확인하세요: {file_path}")
+        return
+
+    primitives = data['primitives']
+    metadata = data['lattice_metadata']
+    
+    print(f"Visualizing {len(primitives)} trajectories from {file_path}")
+    
+    plt.figure(figsize=(10, 10))
+    
+    # 좌표축 설정 (로봇은 (0,0)에 위치, 앞쪽이 +x)
+    plt.axhline(0, color='black', linewidth=1)
+    plt.axvline(0, color='black', linewidth=1)
+    
+    # 로봇 위치 표시 (원점)
+    plt.plot(0, 0, 'ro', markersize=10, label='Robot Start (0,0)')
+    # 로봇 전방 방향 화살표 (붉은색)
+    plt.arrow(0, 0, 0.2, 0, head_width=0.05, head_length=0.05, fc='r', ec='r')
+
+    for i, prim in enumerate(primitives):
+        poses = prim['poses']
+        x = [p[0] for p in poses]
+        y = [p[1] for p in poses]
+        
+        # 궤적 그리기
+        line, = plt.plot(x, y, alpha=0.4, linewidth=1)
+        
+        # 방향 확인을 위해 끝점에 화살표 추가
+        end_x, end_y, end_yaw = poses[-1]
+        
+        plt.arrow(end_x, end_y, 
+                  0.05 * np.cos(end_yaw), 0.05 * np.sin(end_yaw),
+                  head_width=0.02, head_length=0.03, 
+                  fc=line.get_color(), ec=line.get_color(), alpha=0.8)
+
+    plt.title(f"Nav2 Lattice Primitives Visualization\nFile: {file_path}")
+    plt.xlabel("X (meter) - Forward(+)/Backward(-)")
+    plt.ylabel("Y (meter)")
+    plt.grid(True)
+    plt.axis('equal')
+    plt.legend()
+
+    # [수정됨] 화면에 출력하는 대신 파일로 저장합니다.
+    # plt.show() 
+    plt.savefig(OUTPUT_IMG_NAME)
+    print(f"Success! Image saved to '{OUTPUT_IMG_NAME}'")
+
+if __name__ == "__main__":
+    visualize_primitives(FILE_PATH)
+```
+
+### 해결 방법 요약 및 추가 팁
+
+1.  **코드 수정 (위 코드 사용):**
+
+      * `matplotlib.use('Agg')`: 코드가 시작될 때 명시적으로 비대화형 백엔드를 사용하도록 설정합니다.
+      * `plt.savefig('파일명.png')`: 창을 띄우는 대신 결과물을 이미지 파일로 저장합니다.
+      * 실행 후 생성된 `primitives_result.png` 파일을 VS Code 탐색기에서 클릭하여 확인하시면 됩니다.
+
+2.  **VS Code 팁 (Jupyter 활용):**
+
+      * Python 스크립트(`.py`) 대신 \*\*Jupyter Notebook (`.ipynb`)\*\*을 사용하시면 VS Code 내부에서 이미지를 바로 렌더링해서 보여줍니다. 데이터 시각화 작업 시에는 노트북 환경이 훨씬 편리할 수 있습니다.
+
+수정된 코드로 다시 실행해 보시고, 생성된 이미지에서 **모든 궤적이 X축 왼쪽(음수, 뒤쪽)으로 뻗어 있는지** 확인해 보시기 바랍니다.
