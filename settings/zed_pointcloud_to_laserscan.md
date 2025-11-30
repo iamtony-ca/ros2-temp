@@ -1,3 +1,7 @@
+https://github.com/ros-perception/pointcloud_to_laserscan/tree/humble
+
+  
+  
 정확하게 보셨습니다. 말씀하신 대로 **현재 사용 중인 `depthimage_to_laserscan` 패키지는 '미터(m) 단위의 물리적 높이'로 데이터를 잘라내는 기능을 제공하지 않습니다.**
 
 이 패키지는 3D 공간 연산을 하지 않고, 단순히 \*\*이미지 상의 픽셀 줄(Row)\*\*을 가져와서 레이저 스캔처럼 변환하는 "가볍고 빠른" 방식이기 때문입니다.
