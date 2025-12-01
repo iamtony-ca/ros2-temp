@@ -228,3 +228,112 @@ ZED X 1대가 쏘는 데이터 양을 대략 계산해보면:
 
 3.  **FPS 낮추기:**
     ZED 설정(`common.yaml`)에서 `grab_frame_rate`를 15로 낮추면 대역폭이 절반으로 줄어들어 1Gbps에서도 가능할 수 있습니다.
+######################
+##########################
+##########################
+#############################
+**2.5Gbps 대역폭**에 **SVGA 15fps**라면 대역폭은 차고 넘치는 상황입니다. 물리적인 네트워크 환경은 아주 훌륭합니다.
+
+그럼에도 불구하고 Depth 데이터(대용량 데이터)가 안 넘어오고 **"Sequence size exceeds remaining buffer"** 에러가 뜬다면, 원인은 **100% "FastDDS의 기본 설정(Default Configuration)이 대용량 데이터 전송용으로 잡혀있지 않아서"** 입니다.
+
+OS 버퍼(`sysctl`)를 늘려주셨지만, **FastDDS(미들웨어)에게 "이 늘어난 버퍼를 가져다 써라"고 알려주지 않으면** FastDDS는 여전히 작은 기본 버퍼만 사용하다가 에러를 뱉습니다.
+
+해결을 위해 다음 3단계를 **Jetson(송신)과 IPC(수신) 양쪽 모두**에 적용해 주세요.
+
+-----
+
+### 1단계: 누락된 Kernel 설정 추가 (중요)
+
+사용자님이 입력하신 명령어 4줄은 버퍼의 "최대치"만 늘렸지, **"UDP 프로토콜이 사용할 전체 메모리"** 설정이 빠져 있을 수 있습니다.
+
+아래 명령어를 양쪽 터미널에 추가로 입력하세요.
+
+```bash
+# UDP 전송을 위한 전체 메모리 할당 (Low / Pressure / High)
+sudo sysctl -w net.ipv4.udp_mem="102400 873800 26214400"
+
+# 적용 확인
+sudo sysctl -p
+```
+
+-----
+
+### 2단계: FastDDS XML 프로파일 적용 (핵심 해결책 ★)
+
+FastDDS가 65KB 이상의 큰 데이터(이미지)를 쪼개서(Fragmentation) 보내고, 받을 때 큰 버퍼를 쓰도록 강제하는 설정 파일입니다.
+
+**1. 파일 생성 (`~/fastdds_udp.xml`)**
+Jetson과 IPC 양쪽에 동일하게 만드세요.
+
+```xml
+<?xml version="1.0" encoding="UTF-8" ?>
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <transport_descriptors>
+        <transport_descriptor>
+            <transport_id>udp_transport</transport_id>
+            <type>UDPv4</type>
+            <sendBufferSize>25165824</sendBufferSize>
+            <receiveBufferSize>25165824</receiveBufferSize>
+            <maxMessageSize>65000</maxMessageSize>
+        </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="udp_participant" is_default_profile="true">
+        <rtps>
+            <useBuiltinTransports>false</useBuiltinTransports>
+            <userTransports>
+                <transport_id>udp_transport</transport_id>
+            </userTransports>
+        </rtps>
+    </participant>
+</profiles>
+```
+
+**2. 환경변수 적용 (터미널에서 실행)**
+ZED 노드를 실행하기 전(Jetson)과 데이터를 받기 전(IPC)에 이 환경변수를 선언해야 합니다.
+
+```bash
+export FASTRTPS_DEFAULT_PROFILES_FILE=~/fastdds_udp.xml
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+```
+
+*매번 치기 귀찮으시다면 `~/.bashrc` 맨 아래에 추가해 두세요.*
+
+-----
+
+### 3단계: 점보 프레임 (Jumbo Frames) 활성화 (선택 사항)
+
+2.5Gbps 네트워크 카드는 \*\*MTU(Maximum Transmission Unit)\*\*를 기본 1500에서 \*\*9000(Jumbo Frame)\*\*으로 늘릴 때 성능이 극대화됩니다. 큰 데이터를 덜 쪼개서 보내기 때문에 CPU 부하가 줄어듭니다.
+
+**양쪽(Jetson, IPC) 터미널에서 실행:**
+
+```bash
+# 인터페이스 이름이 eth0 이라고 가정 (ip link로 확인 필요)
+sudo ip link set dev eth0 mtu 9000
+```
+
+*(주의: 이더넷 스위치 허브를 거쳐간다면, 허브도 점보 프레임을 지원해야 합니다. 직결이면 상관없습니다.)*
+
+-----
+
+### 테스트 방법
+
+위 설정을 다 마친 후, IPC(수신측)에서 아래 명령어로 테스트해보세요.
+
+**잘못된 방법 (터미널 폭주):**
+`ros2 topic echo /zed/zed_node/depth/depth_registered` (데이터가 너무 커서 텍스트 변환하다가 죽습니다.)
+
+**올바른 방법:**
+
+```bash
+# 1. 대역폭 확인 (Best Effort로 받아서 끊김 없이 들어오는지 확인)
+ros2 topic bw /zed/zed_node/depth/depth_registered --qos-reliability best_effort
+
+# 2. 헤르츠 확인 (15hz가 안정적으로 나오는지)
+ros2 topic hz /zed/zed_node/depth/depth_registered --qos-reliability best_effort
+```
+
+### 요약
+
+사용자님의 문제는 \*\*"도로(2.5Gbps)는 넓은데 트럭(FastDDS 버퍼)이 작아서 짐을 못 싣는 상황"\*\*입니다.
+**`fastdds_udp.xml`** 파일을 만들고 환경변수로 적용하면 100% 해결될 겁니다. 이것이 적용되면 나중에 4대를 켜도 충분히 버팁니다.
