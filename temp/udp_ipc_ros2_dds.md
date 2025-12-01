@@ -337,3 +337,115 @@ ros2 topic hz /zed/zed_node/depth/depth_registered --qos-reliability best_effort
 
 사용자님의 문제는 \*\*"도로(2.5Gbps)는 넓은데 트럭(FastDDS 버퍼)이 작아서 짐을 못 싣는 상황"\*\*입니다.
 **`fastdds_udp.xml`** 파일을 만들고 환경변수로 적용하면 100% 해결될 겁니다. 이것이 적용되면 나중에 4대를 켜도 충분히 버팁니다.
+#########################  
+#############################  
+#############################  
+지금 겪고 계신 **"Sequence size exceeds remaining buffer"** 에러는 설정한 XML이 **제대로 로드되지 않았거나**, ROS 2 데몬(Daemon)이 **과거 설정(기본값)을 기억하고 있어서** 발생하는 현상일 확률이 99%입니다.
+
+특히, `.bashrc`를 수정하셨더라도 **이미 떠 있는 ROS 2 백그라운드 프로세스**는 이를 모릅니다.
+
+다음 **4단계 절차**를 순서대로 하나씩 수행해서 해결해 봅시다.
+
+-----
+
+### 1단계: 가장 중요\! ROS 2 데몬 죽이기 (Daemon Reset)
+
+ROS 2는 빠른 통신을 위해 백그라운드에서 `ros2 daemon`을 돌립니다. 이 녀석이 죽기 전까지는 `.bashrc`를 아무리 수정해도 \*\*옛날 설정(작은 버퍼)\*\*을 그대로 유지합니다.
+
+**Jetson(송신)과 IPC(수신) 양쪽 터미널에서 다음 명령어를 입력하세요:**
+
+```bash
+# 데몬 정지 (필수)
+ros2 daemon stop
+
+# 확인 사살 (프로세스가 없다면 에러가 떠도 괜찮음)
+pkill -f ros2
+pkill -f _ros2_daemon
+```
+
+이후 터미널을 껐다가 다시 켜거나, `source ~/.bashrc`를 해주세요.
+
+-----
+
+### 2단계: 환경변수 적용 확인 (검증)
+
+내가 설정한 XML 경로를 ROS 2가 진짜로 보고 있는지 확인해야 합니다.
+**양쪽 터미널**에서 아래 명령어를 입력하세요.
+
+```bash
+echo $FASTRTPS_DEFAULT_PROFILES_FILE
+```
+
+  * **결과:** `/dir/fastdds_udp.xml` (사용자님이 지정한 실제 경로)가 나와야 합니다.
+  * **주의:** 만약 아무것도 안 나오거나 경로가 틀렸다면 `.bashrc` 오타를 수정해야 합니다.
+  * **팁:** 파일이 실제로 존재하는지도 보세요: `ls -lh /dir/fastdds_udp.xml`
+
+-----
+
+### 3단계: XML 파일 강화 (안전장치 추가)
+
+기존 XML 설정에서 조금 더 강력하게 \*\*"기본 전송 방식(Builtin)을 끄고, 내가 정한 대용량 방식만 써라"\*\*고 강제하는 내용으로 수정해 드립니다.
+
+**`fastdds_udp.xml` 내용을 아래와 같이 수정하세요 (양쪽 모두):**
+
+```xml
+<?xml version="1.0" encoding="UTF-8" ?>
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <transport_descriptors>
+        <transport_descriptor>
+            <transport_id>udp_large_data</transport_id> <type>UDPv4</type>
+            <sendBufferSize>26214400</sendBufferSize>
+            <receiveBufferSize>26214400</receiveBufferSize>
+            <maxMessageSize>65000</maxMessageSize>
+        </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="udp_large_participant" is_default_profile="true">
+        <rtps>
+            <useBuiltinTransports>false</useBuiltinTransports> <userTransports>
+                <transport_id>udp_large_data</transport_id> </userTransports>
+            <use_simple_rtps_discovery>true</use_simple_rtps_discovery>
+        </rtps>
+    </participant>
+</profiles>
+```
+
+-----
+
+### 4단계: OS 커널 버퍼 확인 (재검증)
+
+아까 `sysctl` 설정을 하셨지만, 재부팅 후 초기화되었을 수도 있으니 확인합니다.
+
+```bash
+sysctl net.core.rmem_max
+```
+
+  * **결과:** `26214400` (또는 그 이상)이 나와야 합니다.
+  * **만약 `212992` 같은 작은 숫자가 나온다면:** `sudo sysctl -p`를 다시 입력하세요.
+
+-----
+
+### 실행 테스트
+
+이제 다시 실행해 봅니다.
+
+1.  **양쪽:** `ros2 daemon stop` (혹시 모르니 한번 더)
+2.  **Jetson:** ZED 노드 실행 (`ros2 launch ...`)
+3.  **IPC:** 대역폭 확인
+    ```bash
+    # echo 말고 bw로 먼저 확인하세요 (터미널 출력 부하 방지)
+    ros2 topic bw /zed/zed_node/depth/depth_registered --qos-reliability best_effort
+    ```
+
+**이래도 안 된다면?**
+정말 드문 경우지만, 설치된 ROS 2 패키지 중 `rmw-fastrtps-cpp`가 없거나 깨졌을 수 있습니다.
+양쪽에서 아래 명령어로 설치를 확실히 해주세요.
+
+```bash
+sudo apt update
+sudo apt install ros-humble-rmw-fastrtps-cpp
+```
+
+(Jetson이 Jazzy라면 `ros-jazzy-rmw-fastrtps-cpp`)
+
+대부분 \*\*1단계(데몬 정지)\*\*와 \*\*3단계(XML Builtin 끄기)\*\*에서 해결됩니다.
