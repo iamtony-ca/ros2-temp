@@ -449,3 +449,121 @@ sudo apt install ros-humble-rmw-fastrtps-cpp
 (Jetson이 Jazzy라면 `ros-jazzy-rmw-fastrtps-cpp`)
 
 대부분 \*\*1단계(데몬 정지)\*\*와 \*\*3단계(XML Builtin 끄기)\*\*에서 해결됩니다.
+#####################  
+######################  
+##########################  
+네, 사용자님의 분석이 **정확합니다.** 의심하신 부분이 문제의 핵심 원인입니다.
+
+사용자님은 **"로봇의 중심(base\_link)을 기준으로 Odometry를 사용"** 하고 싶은데, ZED Wrapper의 소스코드는 **"카메라 링크(zed\_camera\_link)를 강제로 Base로 지정"** 하고 있어 TF 트리 구조가 꼬이고 있습니다.
+
+이로 인해 `zed_node`가 초기화될 때 TF 트리를 조회하다가, 자신이 예상한 프레임(`zed_camera_link`)과 실제 TF 트리의 구조가 맞지 않아 **무한 대기(Wait for transform)** 상태에 빠지고, 결과적으로 이미지조차 발행하지 않는 것입니다.
+
+**소스코드를 수정해야 합니다.** 정확한 수정 방법을 알려드립니다.
+
+-----
+
+### [수정 가이드] `zed_camera_component_main.cpp` 수정
+
+제공해주신 코드의 **732번째 라인 근처** (`getPosTrackingParams` 함수 내부)를 수정하여, 하드코딩된 값을 `common.yaml`에서 설정할 수 있도록 변경해야 합니다.
+
+**파일 경로:** `zed-ros2-wrapper/zed_components/src/zed_camera/src/zed_camera_component_main.cpp`
+
+#### 1\. 수정할 위치 찾기
+
+함수: `void ZedCamera::getPosTrackingParams()` 내부
+
+**[변경 전 - 원본 코드]**
+
+```cpp
+// ... (라인 730 근처)
+  RCLCPP_INFO_STREAM(
+    get_logger(), " * Positional tracking mode: "
+      << sl::toString(mPosTrkMode).c_str());
+
+  // ▼▼▼ 여기가 문제입니다. 무조건 카메라 링크를 Base로 지정하고 있습니다. ▼▼▼
+  mBaseFrameId = mCameraName + "_camera_link"; 
+
+  sl_tools::getParam(
+    shared_from_this(), "pos_tracking.map_frame", mMapFrameId,
+    mMapFrameId, " * Map frame id: ");
+// ...
+```
+
+**[변경 후 - 수정 코드]**
+`mBaseFrameId`를 하드코딩하지 않고, 파라미터 서버에서 가져오도록 수정합니다. 만약 파라미터가 없으면 기존처럼 동작하도록 기본값을 설정합니다.
+
+```cpp
+// ... (라인 730 근처)
+  RCLCPP_INFO_STREAM(
+    get_logger(), " * Positional tracking mode: "
+      << sl::toString(mPosTrkMode).c_str());
+
+  // ▼▼▼ [수정] yaml에서 base_frame을 읽어오도록 변경 ▼▼▼
+  std::string defaultBaseFrame = mCameraName + "_camera_link"; // 기본값
+  sl_tools::getParam(
+    shared_from_this(), "pos_tracking.base_frame", mBaseFrameId,
+    defaultBaseFrame, " * Base frame id: ");
+  // ▲▲▲ [수정 끝] ▲▲▲
+
+  sl_tools::getParam(
+    shared_from_this(), "pos_tracking.map_frame", mMapFrameId,
+    mMapFrameId, " * Map frame id: ");
+// ...
+```
+
+-----
+
+### 2\. `common.yaml` 설정 파일 추가
+
+이제 소스코드가 수정되었으므로, `common.yaml` 파일에 `base_frame` 파라미터를 명시해주어야 합니다.
+
+**파일:** `zed_ros2_wrapper/zed_wrapper/config/common.yaml` (또는 사용 중인 config 파일)
+
+```yaml
+pos_tracking:
+    pos_tracking_enabled: true
+    # ... 기존 설정들 ...
+    
+    # ▼ [추가] 이제 이 설정이 소스코드에 반영됩니다.
+    base_frame: "base_link"  # 사용자님의 로봇 Base Frame 이름 (ipc에서 쏘는 이름)
+    
+    publish_tf: true         # ZED가 odom -> base_link를 발행하게 함
+    publish_map_tf: true     # ZED가 map -> odom을 발행하게 함
+```
+
+-----
+
+### 3\. 빌드 및 실행
+
+소스코드를 수정했으므로, Docker 이미지를 다시 빌드하거나 워크스페이스를 재빌드해야 합니다.
+
+1.  **재빌드:**
+    ```bash
+    cd ~/ros2_ws
+    colcon build --symlink-install --packages-select zed_components
+    source install/setup.bash
+    ```
+2.  **실행 및 확인:**
+    이제 ZED 노드가 실행될 때 로그에 다음과 같이 떠야 합니다.
+    > `* Base frame id: base_link`
+
+-----
+
+### 왜 이렇게 해야 해결되는가? (TF 흐름 설명)
+
+**수정 전 (문제 상황):**
+
+1.  ZED 노드는 `odom` -\> `zed_camera_link` 변환을 계산하려고 함.
+2.  하지만 내부적으로 `getCamera2BaseTransform()` 함수(라인 1133)가 `zed_camera_link`와 `base_link` 사이의 관계를 찾으려 시도함.
+3.  소스코드 상 `mBaseFrameId`가 `zed_camera_link`로 되어 있어, 자기 자신을 참조하거나 TF 트리가 꼬임.
+4.  결국 "유효한 정적 변환(Static Transform)을 찾을 수 없음" 상태가 되어 무한 대기.
+
+**수정 후 (정상 상황):**
+
+1.  ZED 노드에게 "Base Frame은 `base_link`야"라고 알려줌.
+2.  ZED 노드는 시작하자마자 TF 트리를 조회: "누가 `base_link` ↔ `zed_camera_link` 관계를 알고 있니?"
+3.  \*\*IPC(다른 PC)\*\*에서 `tf_static`으로 `base_link` -\> `zed_camera_link`를 보내주고 있음.
+4.  ZED 노드: "오케이, 관계 확인됨. 이제 내가 계산한 위치를 `odom` -\> `base_link`로 발행할게."
+5.  **결과:** TF 트리가 `map` -\> `odom` -\> `base_link` -\> `zed_camera_link`로 완벽하게 연결됨.
+
+이 수정을 적용하면 이미지 토픽도 정상적으로 나오고, TF 문제도 해결될 것입니다.
