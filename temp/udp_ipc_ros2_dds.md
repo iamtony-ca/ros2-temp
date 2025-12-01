@@ -567,3 +567,116 @@ pos_tracking:
 5.  **결과:** TF 트리가 `map` -\> `odom` -\> `base_link` -\> `zed_camera_link`로 완벽하게 연결됨.
 
 이 수정을 적용하면 이미지 토픽도 정상적으로 나오고, TF 문제도 해결될 것입니다.
+###########################  
+############################  
+#############################  
+정확히 이해했습니다. 제가 상황을 반대로 가정했네요. 정정해 주셔서 감사합니다.
+
+**상황 재정리:**
+
+1.  **IPC (Master):** `odom`, `tf` (odom -\> base\_link), `tf_static` (base\_link -\> camera\_link 등)을 이미 **모두 발행 중**입니다.
+2.  **Jetson AGX (ZED Host):** 이 토픽들을 **Subscribe**만 해서, ZED 카메라가 "로봇의 어디에 달려있는지(`base_link` 기준)"를 인지하고, ZED가 뽑아내는 영상/Depth 데이터가 올바른 `frame_id`를 갖도록 하는 것이 목표입니다.
+3.  **문제점:** ZED Wrapper 소스코드는 `mBaseFrameId`를 `camera_link`로 강제하고 있어서, \*\*"나는 내 카메라 자체가 로봇의 중심(Base)이다"\*\*라고 잘못 판단하고 있습니다. 이로 인해 IPC가 보내주는 `base_link -> camera_link` 관계를 무시하거나, 연결하지 못하고 있습니다.
+
+-----
+
+### 결론: 소스코드 수정이 **반드시 필요**합니다.
+
+사용자님이 보신 그 부분이 정확한 원인입니다. 코드를 수정해서 **"내 Base는 `zed_camera_link`가 아니라, IPC 형님이 보내주시는 `base_link`야"** 라고 알려줘야 합니다.
+
+그리고 `publish_tf`는 **꺼야(`false`)** 합니다. (이미 IPC가 쏘고 있으니까요)
+
+### 1\. 소스코드 수정 (`zed_camera_component_main.cpp`)
+
+파라미터로 `base_frame` 이름을 받아올 수 있도록 코드를 변경합니다.
+
+**파일:** `src/zed_ros2_wrapper/zed_components/src/zed_camera/src/zed_camera_component_main.cpp`
+**위치:** `void ZedCamera::getPosTrackingParams()` 함수 내부 (약 730라인 근처)
+
+**[수정 전]**
+
+```cpp
+  // ... 기존 코드 ...
+  RCLCPP_INFO_STREAM(
+    get_logger(), " * Positional tracking mode: "
+      << sl::toString(mPosTrkMode).c_str());
+
+  mBaseFrameId = mCameraName + "_camera_link"; // <--- 문제의 원인 (하드코딩)
+
+  sl_tools::getParam(
+    shared_from_this(), "pos_tracking.map_frame", mMapFrameId,
+    mMapFrameId, " * Map frame id: ");
+  // ...
+```
+
+**[수정 후]**
+
+```cpp
+  // ... 기존 코드 ...
+  RCLCPP_INFO_STREAM(
+    get_logger(), " * Positional tracking mode: "
+      << sl::toString(mPosTrkMode).c_str());
+
+  // [수정] yaml에서 base_frame을 읽어오도록 변경
+  // 파라미터가 없으면 기존처럼 camera_link를 쓰도록 default 설정
+  std::string defaultBaseFrame = mCameraName + "_camera_link"; 
+  sl_tools::getParam(
+    shared_from_this(), "pos_tracking.base_frame", mBaseFrameId,
+    defaultBaseFrame, " * Base frame id: ");
+
+  sl_tools::getParam(
+    shared_from_this(), "pos_tracking.map_frame", mMapFrameId,
+    mMapFrameId, " * Map frame id: ");
+  // ...
+```
+
+-----
+
+### 2\. `common.yaml` 설정 (매우 중요 ★)
+
+소스코드를 고쳤으니, 이제 파라미터 파일에서 \*\*"IPC가 보내주는 구조"\*\*에 맞게 설정을 잡아줘야 합니다.
+
+**핵심 포인트:**
+
+1.  `base_frame`: IPC가 사용하는 로봇 몸체 프레임 이름(`base_link`)을 적습니다.
+2.  `publish_tf`: \*\*`false`\*\*로 설정합니다. (IPC가 `odom -> base_link`를 이미 쏘고 있으므로, ZED가 또 쏘면 TF 트리가 진동하거나 깨집니다.)
+3.  `pos_tracking_enabled`: `true`로 둡니다. (TF를 안 쏘더라도, 내부적으로 위치 추적을 켜야 `base_link`와의 관계를 계산하려고 시도합니다.)
+
+**`common.yaml` 예시:**
+
+```yaml
+pos_tracking:
+    pos_tracking_enabled: true  # 내부 연산용으로 켜둠
+    
+    # [중요 1] 소스코드 수정으로 이제 먹히는 옵션
+    base_frame: "base_link"     # IPC가 정의한 로봇의 중심 프레임 이름
+    
+    # [중요 2] IPC와 충돌 방지
+    publish_tf: false           # ZED는 odom -> base_link를 쏘지 않음 (IPC가 함)
+    publish_map_tf: false       # IPC가 map을 관리한다면 false
+    
+    # 참조용 프레임 이름 (IPC 설정과 맞춰주기)
+    odometry_frame: "odom"
+    map_frame: "map"
+```
+
+-----
+
+### 3\. 작동 원리 (수정 후 흐름)
+
+이렇게 설정하고 빌드(`colcon build`) 후 실행하면 다음과 같이 작동합니다.
+
+1.  **ZED 노드 시작:** `base_frame` 파라미터를 읽어 `mBaseFrameId`가 **"base\_link"** 로 설정됩니다.
+2.  **TF 조회 (`getCamera2BaseTransform`):**
+      * ZED 노드는 이제 `zed_left_camera_frame` ↔ **`base_link`** 사이의 변환(TF)을 찾습니다.
+3.  **TF 수신 (from IPC):**
+      * IPC가 `tf_static`으로 `base_link -> ... -> zed_camera_link` 관계를 쏘고 있습니다.
+      * ZED 노드는 이 정보를 받아서 "아, 내 카메라가 로봇 중심에서 x=0.2m 앞에 있구나"라고 인지합니다. (성공)
+4.  **데이터 발행:**
+      * ZED 노드는 이미지나 PointCloud를 발행할 때 `header.frame_id`를 `zed_left_camera_frame` 등으로 정상적으로 찍어서 보냅니다.
+      * `publish_tf: false`이므로 ZED는 TF 트리에 개입하지 않고 데이터만 공급합니다.
+5.  **결과:**
+      * IPC(또는 Rviz)에서 볼 때: `odom -> base_link -> zed_camera_link` 구조가 완벽하게 연결되어 있고, PointCloud 데이터가 로봇 앞에 정확히 매핑되어 보입니다.
+
+**요약하자면:**
+발견하신 대로 **소스코드 수정이 정답**입니다. `mBaseFrameId`를 `base_link`로 바꿔주고, config에서 `publish_tf: false`를 하면 원하시는 대로 \*\*"IPC의 TF 트리에 기생하는 형태"\*\*로 완벽하게 동작합니다.
