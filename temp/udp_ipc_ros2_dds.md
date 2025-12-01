@@ -680,3 +680,63 @@ pos_tracking:
 
 **요약하자면:**
 발견하신 대로 **소스코드 수정이 정답**입니다. `mBaseFrameId`를 `base_link`로 바꿔주고, config에서 `publish_tf: false`를 하면 원하시는 대로 \*\*"IPC의 TF 트리에 기생하는 형태"\*\*로 완벽하게 동작합니다.
+####################  
+#######################  
+########################  
+사용자님의 환경(**IPC가 TF/Odom 마스터, Jetson은 데이터 수급용 Slave, 소스코드 수정 완료**)에 딱 맞게 수정한 `pos_tracking` 설정입니다.
+
+핵심 변경 사항은 **`publish_tf`를 꺼서(False) IPC와 충돌을 막고**, 사용자님이 코드에 추가한 **`base_frame` 파라미터를 명시**하여 ZED가 로봇의 중심(`base_link`)을 기준으로 작동하게 하는 것입니다.
+
+```yaml
+        pos_tracking:
+            pos_tracking_enabled: true       # [필수] True로 켜야 내부적으로 위치를 계산하고 데이터 토픽을 발행함
+            pos_tracking_mode: 'GEN_2'       # 최신 모드 사용
+            
+            # ▼ [중요 1] IPC가 이미 TF를 쏘고 있으므로 ZED는 TF 발행을 꺼야 합니다. (충돌 방지)
+            publish_tf: false                # false: odom -> base_link 발행 안 함 (IPC가 함)
+            publish_map_tf: false            # false: map -> odom 발행 안 함 (IPC가 함)
+            
+            # ▼ [중요 2] 소스코드 수정으로 추가된 파라미터. ZED에게 "나는 base_link에 달려있다"고 알려줌
+            base_frame: 'base_link'          # IPC에서 정의한 로봇 Body Frame 이름
+            
+            map_frame: 'map'                 # IPC와 동일하게 맞춤
+            odometry_frame: 'odom'           # IPC와 동일하게 맞춤
+            
+            imu_fusion: true                 # ZED X의 IMU를 사용하여 위치 추적 정밀도 향상
+            
+            area_memory: false               # [추천] IPC가 SLAM/Map을 담당한다면, ZED의 독자적인 Loop Closure는 끄는 게 안전함 (데이터 튐 방지)
+            area_file_path: '' 
+            save_area_memory_on_closing: false 
+            reset_odom_with_loop_closure: false 
+            
+            publish_3d_landmarks: false      # 대역폭 절약을 위해 끔
+            publish_lm_skip_frame: 5 
+            
+            depth_min_range: 0.0             # 필요 시 로봇 본체가 보이는 거리를 설정하여 무시 가능
+            
+            set_as_static: false             # 로봇은 움직이므로 false
+            set_gravity_as_origin: true      # true 권장 (IMU 기반으로 수평을 맞춤)
+            floor_alignment: false           # false 권장 (IPC의 TF/URDF 높이를 신뢰)
+            
+            initial_base_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0] # TF를 사용하므로 0으로 둠
+            
+            path_pub_rate: 2.0 
+            path_max_count: -1 
+            
+            two_d_mode: false                # 3D 위치 추적 허용 (로봇이 평지면 true로 해도 됨)
+            fixed_z_value: 0.0 
+            
+            transform_time_offset: 0.0 
+            reset_pose_with_svo_loop: true 
+            
+            # ▼ [중요 3] TF는 안 쏘지만, 데이터(Topic)는 쏴야 IPC가 활용 가능함
+            publish_odom_pose: true          # /zed/zed_node/pose, /zed/zed_node/odom 토픽 발행
+            publish_pose_cov: true           # [수정] true 추천. IPC의 EKF(Robot Localization)에서 융합하려면 공분산 데이터가 필요함
+            publish_cam_path: false
+```
+
+### 적용 포인트 요약
+
+1.  **`base_frame: 'base_link'`**: 사용자님이 수정한 C++ 코드가 이 값을 읽어서, ZED가 `base_link` ↔ `zed_camera_link` 관계를 IPC의 `tf_static`으로부터 가져옵니다.
+2.  **`publish_tf: false`**: IPC가 이미 `odom` -\> `base_link`를 방송 중이므로, ZED가 중복으로 방송하여 로봇 위치가 진동하는 것을 막습니다.
+3.  **`publish_pose_cov: true`**: 보통 멀티 로봇이나 IPC 환경에서는 `robot_localization` 패키지 등을 사용해 센서를 융합하므로, Covariance(오차 범위) 데이터가 있는 것이 유리합니다.
