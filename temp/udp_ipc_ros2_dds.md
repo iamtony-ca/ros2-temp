@@ -740,3 +740,121 @@ pos_tracking:
 1.  **`base_frame: 'base_link'`**: 사용자님이 수정한 C++ 코드가 이 값을 읽어서, ZED가 `base_link` ↔ `zed_camera_link` 관계를 IPC의 `tf_static`으로부터 가져옵니다.
 2.  **`publish_tf: false`**: IPC가 이미 `odom` -\> `base_link`를 방송 중이므로, ZED가 중복으로 방송하여 로봇 위치가 진동하는 것을 막습니다.
 3.  **`publish_pose_cov: true`**: 보통 멀티 로봇이나 IPC 환경에서는 `robot_localization` 패키지 등을 사용해 센서를 융합하므로, Covariance(오차 범위) 데이터가 있는 것이 유리합니다.
+#####################
+#######################
+#########################
+제공해주신 Stereolabs 문서는 **대역폭(Bandwidth)과 버퍼(Buffer)** 튜닝에 집중되어 있어, 실제 네트워크 연결(Discovery) 설정에 대해서는 다소 범용적인(`autodetermine="true"`) 설정을 안내하고 있습니다.
+
+FastDDS는 기본적으로 시스템의 모든 인터페이스를 훑어서 통신을 시도하는 경향이 강한 반면, **Cyclone DDS는 설정 파일(`cyclonedds.xml`)을 적용하는 순간, 해당 설정에 매우 엄격해집니다.** 현재 Discovery가 아예 안 되는 이유는 90% 이상의 확률로 **"네트워크 인터페이스 자동 선택 실패"** 또는 **"멀티캐스트 패킷 차단"** 때문입니다.
+
+해결을 위해 다음 3단계 절차를 제안합니다.
+
+-----
+
+### 1\. 원인 분석: 왜 Discovery가 안 되는가?
+
+제공된 XML 설정 중 이 부분이 문제입니다:
+
+```xml
+<NetworkInterface autodetermine="true" priority="default" multicast="default" />
+```
+
+  * **문제점:** Jetson이나 IPC는 보통 Docker(`docker0`), WiFi(`wlan0`), 유선랜(`eth0` or `enp*`), 가상 브리지(`l4tbr0`) 등 여러 인터페이스를 가집니다.
+  * `autodetermine="true"`로 두면, Cyclone DDS가 유선 랜카드가 아닌 **Docker 브리지나 WiFi를 주 통신 경로로 잘못 잡아버릴 수 있습니다.** 서로 다른 경로를 잡으면 절대 만나지 못합니다.
+
+-----
+
+### 2\. 해결책: 인터페이스 강제 지정 (가장 확실한 방법)
+
+Jetson과 IPC에서 각각 터미널을 열어 `ifconfig` 또는 `ip addr`을 입력해 **서로 연결된 유선 랜카드의 이름**을 확인하세요. (예: Jetson은 `eth0`, IPC는 `enp3s0` 등)
+
+그 다음, `cyclonedds.xml` 파일의 `<NetworkInterface>` 부분을 아래와 같이 **명시적으로 수정**해야 합니다.
+
+**수정된 cyclonedds.xml 예시:**
+
+```xml
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain Id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="eth0" autodetermine="false" multicast="true" />
+      </Interfaces>
+      <AllowMulticast>true</AllowMulticast>
+      <MaxMessageSize>65500B</MaxMessageSize>
+    </General>
+    <Internal>
+      <SocketReceiveBufferSize min="10MB"/>
+      <Watermarks>
+        <WhcHigh>500kB</WhcHigh>
+      </Watermarks>
+    </Internal>
+    </Domain>
+</CycloneDDS>
+```
+
+**주의:** Jetson과 IPC의 인터페이스 이름이 다를 수 있으니 각각의 장비에 맞는 XML 파일을 따로 만들어야 할 수도 있습니다.
+
+-----
+
+### 3\. 추가 체크리스트 (Discovery 실패 시 필수 확인)
+
+위의 인터페이스 지정 후에도 안 된다면 다음 두 가지를 확인하세요.
+
+#### (1) 방화벽 확인 (Ubuntu UFW)
+
+ROS 2는 Discovery를 위해 UDP 포트 등을 사용합니다. 방화벽이 켜져 있으면 차단됩니다.
+
+```bash
+sudo ufw status
+# 만약 active 상태라면
+sudo ufw disable
+```
+
+#### (2) ROS 데몬 재시작
+
+설정을 바꾸고 나서는 반드시 기존에 떠있는 ROS 2 데몬을 죽여야 새로운 설정이 먹힙니다.
+
+```bash
+ros2 daemon stop
+ros2 daemon start
+```
+
+-----
+
+### 4\. 만약 그래도 안 된다면? (Unicast 강제 연결)
+
+유선 직결 환경에서는 멀티캐스트(Discovery 패킷)가 제대로 라우팅되지 않는 경우가 종종 있습니다. 이 경우 \*\*상대방 IP를 직접 지정(Unicast)\*\*해주면 100% 해결됩니다.
+
+`cyclonedds.xml`의 `<Domain>` 태그 안에 `<Discovery>` 섹션을 추가하세요.
+
+**Jetson 측 `cyclonedds.xml`:**
+
+```xml
+<Discovery>
+    <Peers>
+        <Peer address="192.168.1.100"/> </Peers>
+    <ParticipantIndex>auto</ParticipantIndex>
+</Discovery>
+```
+
+**IPC 측 `cyclonedds.xml`:**
+
+```xml
+<Discovery>
+    <Peers>
+        <Peer address="192.168.1.50"/> </Peers>
+    <ParticipantIndex>auto</ParticipantIndex>
+</Discovery>
+```
+
+-----
+
+### 요약된 실행 가이드
+
+1.  **인터페이스 이름 확인:** `ip addr`로 유선 랜카드 이름 확인.
+2.  **XML 수정:** 제공해 드린 대로 `autodetermine="false"`로 변경하고 `name="인터페이스명"` 입력.
+3.  **환경변수 확인:** 터미널에서 `echo $CYCLONEDDS_URI` 했을 때 경로가 맞는지, `echo $RMW_IMPLEMENTATION`이 `rmw_cyclonedds_cpp`인지 확인.
+4.  **적용:** `ros2 daemon stop` 후 `ros2 topic list`로 확인.
+
+이 설정으로 변경하면 `sequence size exceeds...` 오류는 Stereolabs가 제안한 커널 튜닝(sysctl) 덕분에 해결될 것이고, 인터페이스 지정으로 Discovery 문제도 해결될 것입니다.
