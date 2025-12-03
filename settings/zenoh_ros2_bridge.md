@@ -177,3 +177,86 @@ ros2 node list
 놀랍게도 IPC(Jazzy/Domain 1)에서 실행 중인 노드 이름들이 리스트에 뜰 것입니다. Zenoh Bridge가 노드 정보(Discovery info)까지 교환해주기 때문에, 마치 로컬에 있는 것처럼 `ros2 topic list`, `ros2 service list`가 모두 통합되어 보입니다.
 
 **결론:** 토픽이 100개든 1000개든, 컨테이너는 양쪽에 하나씩만 있으면 됩니다.
+#####################  
+######################  
+#######################  
+좋은 질문입니다. \*\*"Server(Listener) 쪽은 왜 IP 옵션이 없는가?"\*\*에 대한 의문과 \*\*"역할 변경"\*\*에 대해 명확히 설명해 드릴게요.
+
+결론부터 말씀드리면, **Server(Listener) 역할은 "누구에게 걸겠다(`-e`)"는 옵션이 없으면 자동으로 "모든 IP(`0.0.0.0`)에서 전화 올 때까지 대기"하는 모드**로 작동하기 때문입니다.
+
+상황에 따라 역할을 바꾸는 방법(Scenario A vs B)을 정리해 드립니다.
+
+-----
+
+### 1\. `-e` 옵션과 `-l` 옵션의 차이
+
+Zenoh Bridge 실행 시 두 가지 핵심 옵션이 있습니다.
+
+  * **`-e` (Connect Endpoint):** "내가 저쪽 IP로 전화를 **걸겠다**." (Client 역할)
+  * **`-l` (Listen Endpoint):** "나는 내 IP에서 전화를 **기다리겠다**." (Server 역할)
+      * **생략 시 기본값:** `-l tcp/0.0.0.0:7447` (내 PC의 **모든** 랜카드/IP에서 7447 포트로 들어오는 연결을 받음)
+
+따라서 아까 Orin에서 `-e`를 안 쓴 이유는, \*\*"Orin은 가만히 대기하고, IPC가 접속해오길 기다리기 때문"\*\*입니다.
+
+-----
+
+### 2\. 상황별 역할 설정 (Scenario A vs B)
+
+두 호스트가 유선으로 직결되어 있으니, **IP가 고정되어 있거나 잘 변하지 않는 쪽**을 Server(Listener)로 두는 것이 편합니다. 성능 차이는 전혀 없습니다. 연결만 되면 양방향 통신은 똑같습니다.
+
+두 호스트의 IP를 아래와 같이 가정하고 설정을 비교해 보겠습니다.
+
+  * **Orin IP:** `192.168.1.10`
+  * **IPC IP:** `192.168.1.20`
+
+#### 상황 A: Orin이 대기하고(Server), IPC가 접속(Client)
+
+*가장 추천하는 방식 (로봇 본체인 Orin이 서버 역할을 하는 것이 관리상 편할 때가 많음)*
+
+  * **Orin (Server):** 옵션 없이 실행 (혹은 명시적으로 `-l` 사용)
+    ```bash
+    # 모든 인터페이스에서 대기 (기본값)
+    docker run --rm -it --net host -e ROS_DOMAIN_ID=0 eclipse/zenoh-bridge-ros2dds:latest
+
+    # [권장] 만약 특정 유선 LAN IP로만 대기하고 싶다면:
+    docker run --rm -it --net host -e ROS_DOMAIN_ID=0 eclipse/zenoh-bridge-ros2dds:latest -l tcp/192.168.1.10:7447
+    ```
+  * **IPC (Client):** Orin의 IP를 적어줌
+    ```bash
+    docker run --rm -it --net host -e ROS_DOMAIN_ID=1 eclipse/zenoh-bridge-ros2dds:latest -e tcp/192.168.1.10:7447
+    ```
+
+#### 상황 B: IPC가 대기하고(Server), Orin이 접속(Client)
+
+*만약 로봇(Orin) IP가 DHCP로 자주 바뀌고, 관제 PC(IPC) IP가 고정이라면 이 방식이 유리함*
+
+  * **IPC (Server):** 옵션 없이 실행
+    ```bash
+    # IPC가 대기 모드
+    docker run --rm -it --net host -e ROS_DOMAIN_ID=1 eclipse/zenoh-bridge-ros2dds:latest
+    ```
+  * **Orin (Client):** IPC의 IP를 적어줌
+    ```bash
+    # Orin이 IPC에게 접속 시도
+    docker run --rm -it --net host -e ROS_DOMAIN_ID=0 eclipse/zenoh-bridge-ros2dds:latest -e tcp/192.168.1.20:7447
+    ```
+
+-----
+
+### 3\. 개발자님을 위한 추천 설정
+
+현재 **유선 직결** 상태라고 하셨으므로, 물리적으로 연결된 이더넷 인터페이스의 IP를 서로 확실히 알고 계실 겁니다.
+
+보안과 명확성을 위해 **Server 역할을 하는 쪽도 `-l` (listen) 옵션을 명시적으로 적어주는 것**을 추천합니다. 그래야 실수로 와이파이 망 등 다른 네트워크로 패킷이 새는 것을 방지할 수 있습니다.
+
+**최종 추천 커맨드 (Orin을 Server로 쓸 경우):**
+
+```bash
+# [Orin] 내 유선 IP가 192.168.1.10 이라면:
+docker run --rm -it --net host -e ROS_DOMAIN_ID=0 eclipse/zenoh-bridge-ros2dds:latest -l tcp/192.168.1.10:7447
+
+# [IPC] Orin으로 접속:
+docker run --rm -it --net host -e ROS_DOMAIN_ID=1 eclipse/zenoh-bridge-ros2dds:latest -e tcp/192.168.1.10:7447
+```
+
+이렇게 하면 역할이 바뀌더라도 `-l` 과 `-e` 옵션만 서로 바꾸고 IP만 상대방 것으로 맞춰주면 됩니다.
