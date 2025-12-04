@@ -164,3 +164,92 @@ def generate_launch_description():
       * `static_transform_publisher` (`tf2_ros`): **삭제됨** (이미 TF가 존재하므로)
 
 이렇게 작성해서 실행하시면(`ros2 launch ...`), 기존 ZED 노드에 영향을 주지 않고 PointCloud 데이터를 받아 원하는 높이만큼만 잘라낸 깨끗한 LaserScan 데이터를 얻으실 수 있습니다.
+###############################################  
+###################################################  
+###################################################  
+제공해주신 코드를 분석해 본 결과, **C++ 문법적인 오류나 로직 자체의 심각한 버그는 없습니다.**
+
+하지만 ROS 2 환경, 특히 센서 데이터를 다룰 때 매우 빈번하게 발생하는 **QoS(Quality of Service) 정책 불일치** 문제가 원인일 확률이 90% 이상입니다.
+
+전문가의 관점에서 왜 "No camera info..." 로그가 계속 뜨는지, 그리고 해결 방법은 무엇인지 분석해 드립니다.
+
+### 1\. 원인 분석: QoS 정책 불일치 (가장 유력)
+
+문제의 핵심은 `DepthImageToLaserScanROS.cpp`의 생성자 부분에 있습니다.
+
+```cpp
+// DepthImageToLaserScanROS.cpp 중 일부
+auto qos = rclcpp::SystemDefaultsQoS(); // <--- 여기가 문제의 원인일 가능성이 높습니다.
+
+cam_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
+  "depth_camera_info", qos, ...);
+```
+
+  * **코드의 설정:** `rclcpp::SystemDefaultsQoS()`는 기본적으로 **Reliable(신뢰성 보장)** 통신을 요구합니다.
+  * **실제 센서의 동작:** RealSense, Oak-D, Gazebo, Isaac Sim 등 대부분의 ROS 2 카메라 드라이버는 성능(Latency 최소화)을 위해 `CameraInfo`와 `Image` 토픽을 **Best Effort(최선 노력)** 정책으로 발행(Publish)합니다.
+  * **ROS 2 규칙:** "Reliable" Subscriber는 "Best Effort" Publisher와 **연결될 수 없습니다.**
+
+따라서, 토픽 이름이 정확하더라도 QoS 호환성 문제로 인해 `infoCb` 콜백 함수가 단 한 번도 실행되지 않게 되고, 결과적으로 `cam_info_` 변수가 영원히 `nullptr` 상태로 남아 `depthCb`에서 에러 로그를 띄우는 것입니다.
+
+### 2\. 해결 방법
+
+두 가지 해결 방법이 있습니다. 소스 코드를 수정하는 것을 권장합니다.
+
+#### 방법 A: 소스 코드 수정 (권장)
+
+`SystemDefaultsQoS` 대신 센서 데이터에 적합한 `SensorDataQoS`를 사용하도록 변경하세요. `SensorDataQoS`는 자동으로 `Best Effort`로 설정되므로, 상대방이 Reliable이든 Best Effort이든 모두 수신할 수 있습니다.
+
+**수정 파일:** `DepthImageToLaserScanROS.cpp`
+
+```cpp
+// [수정 전]
+// auto qos = rclcpp::SystemDefaultsQoS();
+
+// [수정 후]
+auto qos = rclcpp::SensorDataQoS(); 
+```
+
+이렇게 변경하고 다시 빌드(`colcon build`)하면 `infoCb`가 정상적으로 호출되어 `cam_info_`가 채워질 것입니다.
+
+#### 방법 B: 실행 시 QoS 오버라이드 (코드 수정 없이 확인용)
+
+만약 코드를 당장 수정하기 어렵다면, 런치 파일이나 파라미터 설정을 통해 QoS를 강제할 수도 있지만, 이 노드는 코드 내에 QoS가 하드코딩 되어 있어 외부에서 바꾸기 까다롭습니다. 대신 현재 상황을 확진하기 위해 다음 명령어를 터미널에 입력해 보세요.
+
+```bash
+# 실행 중인 카메라의 info 토픽 QoS 확인
+ros2 topic info -v /카메라/depth/camera_info_토픽명
+```
+
+출력 결과에서 `Reliability: BEST_EFFORT`라고 나온다면, 제 분석대로 코드 수정(방법 A)이 필수적입니다.
+
+### 3\. 추가 점검 사항: 토픽 리매핑 (Remapping)
+
+작성자분께서 "토픽 명을 제대로 입력해준 것 같다"고 하셨지만, 이 노드는 두 개의 구독(Subscription)을 가지고 있습니다.
+
+1.  `depth` (이미지)
+2.  `depth_camera_info` (카메라 정보)
+
+보통 런치 파일에서 이미지만 리매핑하고, `camera_info`는 리매핑을 깜빡하는 경우가 많습니다. 런치 파일에서 아래와 같이 두 가지 모두 실제 센서 토픽에 맞게 연결되었는지 확인해 주세요.
+
+```python
+# launch 파일 예시
+Node(
+    package='depthimage_to_laserscan',
+    executable='depthimage_to_laserscan_node',
+    remappings=[
+        ('depth', '/camera/depth/image_rect_raw'),
+        ('depth_camera_info', '/camera/depth/camera_info') # <--- 이 부분 확인 필수
+    ],
+    # ...
+)
+```
+
+### 4\. 코드 개선 제안 (Expert Tip)
+
+현재 코드는 `Image`와 `CameraInfo`를 서로 다른 콜백에서 받아, 단순히 변수에 저장된 `cam_info_`를 재사용하고 있습니다. 이는 카메라의 줌이나 설정이 실시간으로 바뀌지 않는다면 큰 문제는 없으나, 엄밀한 동기화 방식은 아닙니다.
+
+더 나은 설계를 원하신다면 향후에는 `message_filters` 패키지의 `ApproximateTimeSynchronizer`를 사용하여 `Image`와 `CameraInfo`가 쌍(pair)으로 들어올 때만 처리하도록 구조를 변경하는 것이 좋습니다. 하지만 현재 문제(No camera info)를 해결하는 데는 **QoS 수정**만으로 충분합니다.
+
+### 요약
+
+`DepthImageToLaserScanROS.cpp`의 19번째 줄 근처에 있는 `rclcpp::SystemDefaultsQoS()`를 \*\*`rclcpp::SensorDataQoS()`\*\*로 변경하세요.
