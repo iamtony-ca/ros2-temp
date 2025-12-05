@@ -359,3 +359,269 @@ ros2 run voxel_filter voxel_filter_node \
 ---
 
 원하는 구조가 Python 버전이거나, TF/frame 변경, dynamic parameter callback까지 넣고 싶으면 말해줘. 그 버전으로도 바로 만들어 줄게!
+####################  
+#####################  
+######################  
+간단히 말하면:
+**네, 먼저 height(z) 범위로 잘라낸 다음 VoxelGrid를 돌리면 보통 더 빨라집니다.**
+불필요한 점들을 미리 버려서, VoxelGrid가 처리해야 할 포인트 수 자체를 줄이니까요.
+
+물론,
+
+* Passthrough 필터도 O(N) 연산이 들어가지만,
+* VoxelGrid는 보통 더 무거운 편이라
+  “의미 있는 비율로 포인트를 줄일 수 있다면” → 전체적으로 이득인 경우가 많습니다.
+
+아래는 **z-min/z-max height 필터 + VoxelGrid** 를 한 노드에서 처리하는 **완전한 C++ 코드** 예시예요.
+
+---
+
+## 1. `src/voxel_filter_node.cpp`
+
+```cpp
+#include <memory>
+#include <string>
+
+#include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
+
+#include <pcl/PCLPointCloud2.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/filters/passthrough.h>
+#include <pcl_conversions/pcl_conversions.h>
+
+class VoxelFilterNode : public rclcpp::Node
+{
+public:
+  VoxelFilterNode()
+  : Node("voxel_filter_node")
+  {
+    // Parameters
+    this->declare_parameter<std::string>("input_topic", "/points_raw");
+    this->declare_parameter<std::string>("output_topic", "/points_voxel");
+    this->declare_parameter<double>("voxel_leaf_size", 0.05);
+    this->declare_parameter<bool>("use_height_filter", true);
+    this->declare_parameter<double>("z_min", -1.0);
+    this->declare_parameter<double>("z_max",  1.0);
+
+    this->get_parameter("input_topic", input_topic_);
+    this->get_parameter("output_topic", output_topic_);
+    this->get_parameter("voxel_leaf_size", voxel_leaf_size_);
+    this->get_parameter("use_height_filter", use_height_filter_);
+    this->get_parameter("z_min", z_min_);
+    this->get_parameter("z_max", z_max_);
+
+    RCLCPP_INFO(get_logger(), "VoxelFilterNode started.");
+    RCLCPP_INFO(get_logger(), "  input_topic      : %s", input_topic_.c_str());
+    RCLCPP_INFO(get_logger(), "  output_topic     : %s", output_topic_.c_str());
+    RCLCPP_INFO(get_logger(), "  voxel_leaf_size  : %.3f m", voxel_leaf_size_);
+    RCLCPP_INFO(get_logger(), "  use_height_filter: %s", use_height_filter_ ? "true" : "false");
+    RCLCPP_INFO(get_logger(), "  z_min / z_max    : %.3f / %.3f", z_min_, z_max_);
+
+    // SensorData QoS 사용
+    auto qos = rclcpp::SensorDataQoS();
+
+    pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(output_topic_, qos);
+    sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+      input_topic_,
+      qos,
+      std::bind(&VoxelFilterNode::pointCloudCallback, this, std::placeholders::_1)
+    );
+  }
+
+private:
+  void pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+  {
+    if (!msg) {
+      RCLCPP_WARN(get_logger(), "Received null PointCloud2 message.");
+      return;
+    }
+
+    // ROS2 PointCloud2 -> PCLPointCloud2
+    pcl::PCLPointCloud2::Ptr pcl_cloud_in(new pcl::PCLPointCloud2());
+    pcl::PCLPointCloud2::Ptr pcl_cloud_filtered_height(new pcl::PCLPointCloud2());
+    pcl::PCLPointCloud2::Ptr pcl_cloud_voxeled(new pcl::PCLPointCloud2());
+
+    pcl_conversions::toPCL(*msg, *pcl_cloud_in);
+
+    std::size_t input_points = pcl_cloud_in->width * pcl_cloud_in->height;
+
+    // 1) Height (z) 필터: 필요 영역만 남기기
+    if (use_height_filter_) {
+      pcl::PassThrough<pcl::PCLPointCloud2> pass;
+      pass.setInputCloud(pcl_cloud_in);
+      pass.setFilterFieldName("z");
+      pass.setFilterLimits(static_cast<float>(z_min_), static_cast<float>(z_max_));
+      pass.filter(*pcl_cloud_filtered_height);
+    } else {
+      *pcl_cloud_filtered_height = *pcl_cloud_in;
+    }
+
+    std::size_t after_height_points =
+      pcl_cloud_filtered_height->width * pcl_cloud_filtered_height->height;
+
+    // height 필터 후 남은 포인트가 없으면 바로 return
+    if (after_height_points == 0) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *this->get_clock(), 2000,
+        "No points left after height filter. (input: %zu)", input_points);
+      return;
+    }
+
+    // 2) VoxelGrid 필터 적용
+    pcl::VoxelGrid<pcl::PCLPointCloud2> voxel_filter;
+    voxel_filter.setInputCloud(pcl_cloud_filtered_height);
+    voxel_filter.setLeafSize(
+      static_cast<float>(voxel_leaf_size_),
+      static_cast<float>(voxel_leaf_size_),
+      static_cast<float>(voxel_leaf_size_)
+    );
+    voxel_filter.filter(*pcl_cloud_voxeled);
+
+    std::size_t after_voxel_points =
+      pcl_cloud_voxeled->width * pcl_cloud_voxeled->height;
+
+    // PCL -> ROS2 PointCloud2
+    sensor_msgs::msg::PointCloud2 output_msg;
+    pcl_conversions::fromPCL(*pcl_cloud_voxeled, output_msg);
+    output_msg.header = msg->header;
+
+    pub_->publish(output_msg);
+
+    // 디버그용 로그 (과하면 주석처리해도 됨)
+    RCLCPP_DEBUG(
+      get_logger(),
+      "Points: input=%zu, after_z_filter=%zu, after_voxel=%zu",
+      input_points, after_height_points, after_voxel_points);
+  }
+
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_;
+
+  std::string input_topic_;
+  std::string output_topic_;
+  double voxel_leaf_size_;
+  bool use_height_filter_;
+  double z_min_;
+  double z_max_;
+};
+
+int main(int argc, char ** argv)
+{
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<VoxelFilterNode>());
+  rclcpp::shutdown();
+  return 0;
+}
+```
+
+---
+
+## 2. `CMakeLists.txt` (필요한 부분 포함 전체 예시)
+
+이전 버전에서 `pcl::PassThrough`를 쓰기 위해 `filters` 컴포넌트는 이미 포함돼 있으니 그대로 사용하면 됩니다.
+
+```cmake
+cmake_minimum_required(VERSION 3.5)
+project(voxel_filter)
+
+# Default to C++17
+if(NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 17)
+endif()
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -Wall -Wextra")
+
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(pcl_conversions REQUIRED)
+find_package(PCL REQUIRED COMPONENTS common filters)
+
+include_directories(
+  include
+  ${PCL_INCLUDE_DIRS}
+)
+
+add_definitions(${PCL_DEFINITIONS})
+
+add_executable(voxel_filter_node src/voxel_filter_node.cpp)
+
+ament_target_dependencies(voxel_filter_node
+  rclcpp
+  sensor_msgs
+  pcl_conversions
+)
+
+target_link_libraries(voxel_filter_node
+  ${PCL_LIBRARIES}
+)
+
+install(TARGETS
+  voxel_filter_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+ament_package()
+```
+
+---
+
+## 3. `package.xml` (이전과 거의 동일)
+
+```xml
+<?xml version="1.0"?>
+<package format="3">
+  <name>voxel_filter</name>
+  <version>0.0.1</version>
+  <description>Height-filter + VoxelGrid filter node for PointCloud2 in ROS2 Humble</description>
+
+  <maintainer email="you@example.com">Your Name</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>pcl_conversions</depend>
+
+  <exec_depend>libpcl-dev</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
+```
+
+---
+
+## 4. 실행 예시
+
+```bash
+cd ~/ros2_ws
+colcon build --packages-select voxel_filter
+source install/setup.bash
+
+# 예: -1.0m ~ 2.0m 높이만 사용 + 0.05m voxel
+ros2 run voxel_filter voxel_filter_node \
+  --ros-args \
+  -p input_topic:=/points_raw \
+  -p output_topic:=/points_voxel \
+  -p voxel_leaf_size:=0.05 \
+  -p use_height_filter:=true \
+  -p z_min:=-1.0 \
+  -p z_max:=2.0
+```
+
+---
+
+### 성능 관점에서 한 줄 정리
+
+* **ROI(예: z 필터)로 포인트 수를 먼저 줄인다 → 그 다음 VoxelGrid**
+  → 포인트가 많이 줄어든다면 **전체 처리 시간은 보통 감소**합니다.
+  특히, 지면/천장/불필요한 구조물이 많을수록 효과가 커져요.
+
+원하면,
+
+* height 말고도 x/y 범위까지 포함한 3D ROI filter 버전,
+* 또는 `dynamic_reconfigure` 느낌으로 ROS2 parameter callback을 붙여서 실시간으로 z_min/z_max, voxel size 바꾸는 버전도 만들어 줄게!
