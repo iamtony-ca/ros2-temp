@@ -339,3 +339,98 @@ void DepthImageToLaserScanROS::depthCb(const sensor_msgs::msg::Image::SharedPtr 
 1.  가장 먼저 **오타**를 의심하세요. `_frame_optical`은 매우 어색한 이름입니다. `_optical_frame`일 확률이 높습니다. `tf2_echo`로 확인해보세요.
 2.  오타가 아니라면, **TF 트리**가 끊겨 있을 수 있습니다.
 3.  TF도 정상이라면, **코드에서 `scan_msg->header.stamp = this->now();`를 추가**하고 다시 빌드하세요. 그러면 100% 해결됩니다.
+######################
+########################
+########################
+정말 중요한 발견을 하셨습니다\! 이 현상이 모든 문제의 실마리입니다.
+
+지금 겪고 계신 \*\*"일직선으로 나오는 현상"\*\*과 **"Message Filter Dropping"** 문제는 모두 **ROS의 좌표계 표준(Standard)과 광학 좌표계(Optical)의 차이**를 `depthimage_to_laserscan` 노드가 제대로 처리하지 못해서 발생하는 것입니다.
+
+해결을 위한 분석과 솔루션을 드립니다.
+
+### 1\. 현상 분석: 왜 PointCloud는 되고 Depth는 이상할까?
+
+  * **PointCloud (`..._camera_frame`):**
+      * 이 프레임은 **ROS 표준 좌표계** (X: 앞, Y: 왼쪽, Z: 위)를 따릅니다.
+      * RViz에서 `base_link` 기준으로 봤을 때 정상적으로 보이는 이유는, 데이터 자체가 "앞쪽(X축)"으로 뻗어 나가도록 이미 변환되어 있기 때문입니다.
+  * **Depth Image (`..._camera_optical_frame`):**
+      * 이 프레임은 **광학 좌표계** (Z: 앞, X: 오른쪽, Y: 아래)를 따릅니다.
+      * **일직선 현상:** RViz에서 Depth Image를 `Point Cloud` 형태로 보여주려고 할 때, `optical` 프레임(Z축이 깊이)을 ROS 표준(X축이 깊이)으로 해석하거나, TF 변환 없이 `base_link`에 억지로 끼워 맞추면 모든 점이 한 축(주로 Z축이나 X축)으로 찌그러져서 일직선이나 평면처럼 보이게 됩니다.
+
+### 2\. 문제의 핵심: LaserScan은 "X축"을 좋아해
+
+`sensor_msgs/LaserScan` 메시지는 정의상 **데이터가 X축(Forward)을 기준으로 부채꼴 모양으로 퍼져나간다**고 가정합니다.
+
+  * 하지만 `depthimage_to_laserscan`에 들어가는 입력 데이터(Depth)는 \*\*Optical Frame (Z축이 깊이)\*\*입니다.
+  * 만약 `output_frame`을 `..._optical_frame`으로 설정하면?
+      * LaserScan 데이터가 생성되지만, RViz나 Nav2는 \*\*"이 스캔은 X축(오른쪽)으로 쏘는거구나"\*\*라고 오해하게 됩니다. (Optical의 X는 오른쪽이니까요). 결과적으로 스캔이 로봇의 오른쪽이나 바닥을 향해 꺾여버립니다.
+  * 그렇다고 `output_frame`을 `..._camera_frame`으로 설정하면?
+      * 방향은 맞지만, 아까 겪으셨던 **Message Filter(TF 시간 불일치)** 문제가 발생합니다. (이미지는 `optical`인데 출력은 `frame`이라서 TF를 찾으려고 대기함)
+
+-----
+
+### 3\. 최종 솔루션 (코드 수정 + 파라미터 설정)
+
+가장 깔끔한 해결책은 \*\*"데이터의 시간은 최신으로 갱신하되, 프레임 이름은 ROS 표준(X-forward)인 녀석을 빌려 쓰는 것"\*\*입니다.
+
+ZED 카메라는 `camera_frame`과 `optical_frame`의 원점(Origin) 위치가 동일합니다(회전만 다름). 따라서 거리값(Range) 자체는 똑같습니다.
+
+다음 두 가지를 적용하세요.
+
+#### 단계 A: 소스 코드 수정 (시간 & 프레임 강제 할당)
+
+TF 대기 문제를 원천 차단하고, 스캔 데이터를 올바른 프레임(X-Forward)에 태워 보내기 위해 코드를 수정합니다.
+
+**파일:** `DepthImageToLaserScanROS.cpp`
+
+```cpp
+void DepthImageToLaserScanROS::depthCb(const sensor_msgs::msg::Image::SharedPtr image)
+{
+  if (nullptr == cam_info_) {
+    RCLCPP_INFO(get_logger(), "No camera info, skipping point cloud squash");
+    return;
+  }
+
+  try {
+    sensor_msgs::msg::LaserScan::UniquePtr scan_msg = dtl_->convert_msg(image, cam_info_);
+
+    // [핵심 수정 1] 타임스탬프를 '현재 시간'으로 변경 (TF 지연/Queue Full 해결)
+    scan_msg->header.stamp = this->now();
+    
+    // [핵심 수정 2] 프레임을 'optical'이 아닌 표준 'camera_frame'으로 강제 지정
+    // (ZED의 경우 zed_front_left_camera_frame 이 X-Forward 프레임임)
+    scan_msg->header.frame_id = "zed_front_left_camera_frame"; 
+
+    scan_pub_->publish(std::move(scan_msg));
+  } catch (const std::runtime_error & e) {
+    RCLCPP_ERROR(get_logger(), "Could not convert depth image to laserscan: %s", e.what());
+  }
+}
+```
+
+*(참고: `zed_front_left_camera_frame` 부분은 하드코딩하기 싫다면 파라미터 `output_frame` 변수를 그대로 사용하고, 런치 파일에서 이 값을 `zed_front_left_camera_frame`으로 넣어주면 됩니다.)*
+
+#### 단계 B: Launch 파일 파라미터 확인
+
+코드에서 `scan_msg->header.frame_id`를 하드코딩하지 않고 `output_frame` 변수를 쓰도록 했다면, 런치 파일은 아래와 같아야 합니다.
+
+```python
+# Launch 파일
+parameters=[{
+    # Optical이 아닙니다! X축이 앞을 보는 프레임을 넣으세요.
+    'output_frame': 'zed_front_left_camera_frame', 
+    'scan_height': 10, # 안정성을 위해 10 이상 추천
+    # ...
+}]
+```
+
+### 결과 예상
+
+이렇게 수정하면 다음과 같이 작동합니다.
+
+1.  **방향 문제 해결:** `zed_front_left_camera_frame`을 사용하므로, LaserScan이 로봇의 \*\*정면(X축)\*\*으로 올바르게 뻗어 나갑니다. (RViz에서 PointCloud와 겹쳐 보일 것입니다.)
+2.  **Message Filter 해결:** `this->now()`를 사용했으므로, Nav2와 TF 시스템이 "어? 방금 들어온 따끈따끈한 데이터네?" 하고 즉시 처리합니다. `Message filter dropping` 에러가 사라집니다.
+3.  **Nav2 Costmap:** 올바른 위치에 장애물이 찍히기 시작할 것입니다.
+
+**요약:**
+ZED의 `point_cloud`가 잘 나오는 그 프레임(`zed_front_left_camera_frame`)이 정답입니다. `depthimage_to_laserscan`의 결과물도 그 프레임 이름을 달고 나가야 합니다. 단, TF 에러를 피하기 위해 **코드에서 타임스탬프를 현재 시간으로 갱신**해주는 것이 필수입니다.
