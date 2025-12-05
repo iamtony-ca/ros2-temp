@@ -253,3 +253,89 @@ Node(
 ### 요약
 
 `DepthImageToLaserScanROS.cpp`의 19번째 줄 근처에 있는 `rclcpp::SystemDefaultsQoS()`를 \*\*`rclcpp::SensorDataQoS()`\*\*로 변경하세요.
+######################  
+#########################  
+#########################  
+`transform_tolerance`를 2.0초나 주었는데도 \*\*"discarding message because the queue is full"\*\*이 뜬다는 것은, 단순히 "데이터가 늦게 도착해서(Delay)" 생기는 문제가 아닙니다.
+
+이 에러의 진짜 의미는 \*\*"내가 아무리 기다려도 `zed_front_left_camera_frame_optical`이라는 프레임에 대한 TF(위치 정보)를 찾을 수 없다"\*\*는 뜻입니다. Nav2나 RViz가 메시지를 큐(대기열)에 쌓아두고 TF가 오기만을 기다리다가, 큐가 꽉 차서 포기하고 버리는 상황입니다.
+
+가장 유력한 원인 3가지를 순서대로 짚어드립니다. **1번이 원인일 확률이 90%입니다.**
+
+-----
+
+### 1\. 프레임 이름의 오타 (가장 강력한 용의자)
+
+작성자님께서 적어주신 프레임 이름은 `zed_front_left_camera_frame_optical` 입니다.
+하지만 ROS나 ZED의 일반적인 작명 규칙을 볼 때, `frame`과 `optical`의 순서가 바뀌었거나 `frame`이라는 글자가 빠져야 할 가능성이 높습니다.
+
+  * **의심:** `zed_front_left_camera_frame_optical` (현재 설정)
+  * **정답 가능성 1:** `zed_front_left_camera_optical_frame` (가장 일반적)
+  * **정답 가능성 2:** `zed_front_left_camera_optical`
+
+**확인 방법:**
+터미널에 다음 명령어를 입력하여 현재 발행되고 있는 **진짜 TF 이름들**을 확인해보세요.
+
+```bash
+ros2 run tf2_tools view_frames
+```
+
+명령어를 치면 `frames.pdf` 파일이 생성됩니다. 이 파일을 열어서 `base_link`와 연결된 ZED 카메라의 **정확한 프레임 이름** 철자를 확인하세요. 그 이름을 그대로 복사해서 코드/파라미터에 넣어야 합니다.
+
+-----
+
+### 2\. TF 연결 끊김 (Tree Disconnected)
+
+이름이 정확하다면, 해당 프레임이 로봇의 중심(`base_link` 또는 `odom`)과 **연결**되어 있는지 확인해야 합니다. 이름은 존재하지만 부모-자식 관계가 끊겨 있다면 변환을 할 수 없습니다.
+
+**확인 방법:**
+터미널에 다음 명령어를 쳐서 TF 변환이 실제로 가능한지 테스트합니다. (아래 명령어의 `<정확한_프레임_이름>` 자리에 1번에서 확인한 이름을 넣으세요)
+
+```bash
+# 문법: ros2 run tf2_ros tf2_echo [부모프레임] [자식프레임]
+ros2 run tf2_ros tf2_echo base_link zed_front_left_camera_optical_frame
+```
+
+  * **정상:** `At time ... translation: ... rotation: ...` 하고 숫자가 계속 뜹니다.
+  * **비정상:** `Frame ... does not exist` 또는 아무 반응 없이 멈춰 있음.
+      * \-\> 이 경우 ZED Wrapper의 런치 파일에서 `publish_tf`가 `true`로 되어 있는지, 혹은 URDF(Robot Description) 파일에서 해당 링크가 정의되어 있는지 확인해야 합니다.
+
+-----
+
+### 3\. Timestamp 문제 해결 (최후의 수단: 코드 수정)
+
+만약 1, 2번이 모두 정상인데도(이름도 맞고, tf2\_echo도 잘 됨) 여전히 큐가 꽉 찬다면, 앞서 우려했던 **PC 간 시간 동기화 미세 오류** 또는 **미래 시간 스탬프** 문제 때문입니다.
+
+이 경우, 이전에 제안드린 \*\*"소스코드에서 시간 덮어쓰기"\*\*가 가장 확실한 해결책입니다. 데이터의 시간을 "지금 당장(Now)"으로 바꾸면, TF 시스템은 즉시 변환 가능한 데이터를 찾게 되므로 큐가 찰 일이 없습니다.
+
+**수정할 파일:** `DepthImageToLaserScanROS.cpp`
+
+```cpp
+void DepthImageToLaserScanROS::depthCb(const sensor_msgs::msg::Image::SharedPtr image)
+{
+  if (nullptr == cam_info_) {
+    RCLCPP_INFO(get_logger(), "No camera info, skipping point cloud squash");
+    return;
+  }
+
+  try {
+    sensor_msgs::msg::LaserScan::UniquePtr scan_msg = dtl_->convert_msg(image, cam_info_);
+    
+    // [수정] Frame ID는 그대로(혹은 파라미터값) 쓰되, 시간(Stamp)만 현재 시간으로 리셋
+    scan_msg->header.stamp = this->now(); 
+    
+    // 만약 파라미터로 받은 output_frame을 강제로 적용하고 싶다면 아래 주석 해제
+    // scan_msg->header.frame_id = output_frame_; 
+
+    scan_pub_->publish(std::move(scan_msg));
+  } catch (const std::runtime_error & e) {
+    RCLCPP_ERROR(get_logger(), "Could not convert depth image to laserscan: %s", e.what());
+  }
+}
+```
+
+### 요약 및 추천 행동
+
+1.  가장 먼저 **오타**를 의심하세요. `_frame_optical`은 매우 어색한 이름입니다. `_optical_frame`일 확률이 높습니다. `tf2_echo`로 확인해보세요.
+2.  오타가 아니라면, **TF 트리**가 끊겨 있을 수 있습니다.
+3.  TF도 정상이라면, **코드에서 `scan_msg->header.stamp = this->now();`를 추가**하고 다시 빌드하세요. 그러면 100% 해결됩니다.
