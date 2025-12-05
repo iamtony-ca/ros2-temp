@@ -434,3 +434,116 @@ parameters=[{
 
 **요약:**
 ZED의 `point_cloud`가 잘 나오는 그 프레임(`zed_front_left_camera_frame`)이 정답입니다. `depthimage_to_laserscan`의 결과물도 그 프레임 이름을 달고 나가야 합니다. 단, TF 에러를 피하기 위해 **코드에서 타임스탬프를 현재 시간으로 갱신**해주는 것이 필수입니다.
+##########################  
+##########################  
+##########################  
+네, 4개의 카메라(front, right, left, rear)를 효율적으로 실행할 수 있도록 Loop(반복문)를 사용하여 Launch 파일을 작성해 드리겠습니다.
+
+**주요 변경 및 최적화 사항:**
+
+1.  **반복문 사용:** 코드를 4번 복사/붙여넣기 하는 대신, 딕셔너리를 사용하여 관리하기 편하게 만들었습니다.
+2.  **`output_frame` 자동 지정:** 이전 대화에서 해결했던 TF 문제를 방지하기 위해, 각 카메라에 맞는 프레임(`zed_X_left_camera_frame`)을 자동으로 할당하도록 했습니다.
+3.  **Namespace 및 Node Name 분리:** 각 노드가 서로 충돌하지 않도록 노드 이름을 `depthimage_to_laserscan_front`, `_rear` 등으로 구분했습니다.
+4.  **Scan Topic 분리:** 출력되는 레이저 스캔 토픽도 `/scan_front`, `/scan_rear` 등으로 분리했습니다. (Nav2에서 합쳐서 쓰기 위함)
+
+### 수정된 Launch 파일 (`multi_laserscan.launch.py`)
+
+```python
+import os
+
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch_ros.actions import Node
+
+def generate_launch_description():
+    # 1. 기본 설정 파일 경로 (공통 파라미터용)
+    # param_front.yaml 등 하나만 있어도 공통 설정(range_min 등)은 가져올 수 있습니다.
+    # 파일이 없다면 이 부분은 주석 처리하고 아래 parameters 리스트에 직접 적어도 됩니다.
+    config_dir = os.path.join(get_package_share_directory('depthimage_to_laserscan'), 'cfg')
+    param_config = os.path.join(config_dir, 'param_front.yaml')
+
+    # 2. 실행할 카메라 목록 정의
+    # key: 카메라 위치 이름 (토픽명에 들어갈 이름)
+    # value: 해당 카메라의 TF Frame ID (X축이 정면인 Frame 권장)
+    cameras = {
+        'front': 'zed_front_left_camera_frame',
+        'left':  'zed_left_left_camera_frame',
+        'right': 'zed_right_left_camera_frame',
+        'rear':  'zed_rear_left_camera_frame'
+    }
+
+    nodes_to_start = []
+
+    for cam_name, frame_id in cameras.items():
+        # 각 카메라별 노드 생성
+        node = Node(
+            package='depthimage_to_laserscan',
+            executable='depthimage_to_laserscan_node',
+            name=f'depthimage_to_laserscan_{cam_name}', # 노드 이름 중복 방지
+            remappings=[
+                # 입력 Depth 이미지 (토픽명 규칙 확인 필요: /zed_multi/zed_front/...)
+                ('depth', f'/zed_multi/zed_{cam_name}/depth/depth_registered'),
+                # 입력 Camera Info (소스코드 내부 이름인 depth_camera_info 로 매핑)
+                ('depth_camera_info', f'/zed_multi/zed_{cam_name}/depth/camera_info'),
+                # 출력 Scan Topic (scan_front, scan_rear 등으로 분리)
+                ('scan', f'/scan_{cam_name}')
+            ],
+            parameters=[
+                param_config, # YAML 파일 로드 (있다면)
+                {
+                    'output_frame': frame_id, # [중요] 각 카메라의 위치에 맞는 Frame ID 강제 할당
+                    'scan_height': 10,        # [중요] 안정적인 감지를 위해 10 이상 설정
+                    'range_min': 0.45,
+                    'range_max': 10.0,
+                    'scan_time': 0.033
+                }
+            ]
+        )
+        nodes_to_start.append(node)
+
+    return LaunchDescription(nodes_to_start)
+```
+
+-----
+
+### 💡 다음 단계: Nav2 Costmap 설정 수정
+
+이제 4개의 `/scan_xxx` 토픽이 발행되므로, `nav2_params.yaml`의 **Obstacle Layer** 설정도 이에 맞춰 4개를 모두 등록해줘야 합니다.
+
+```yaml
+# nav2_params.yaml 예시
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      # ...
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        # 4개의 소스를 모두 관찰하도록 설정
+        observation_sources: scan_front scan_rear scan_left scan_right 
+        
+        # 각 소스별 상세 설정
+        scan_front:
+          topic: /scan_front
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 10.0
+          obstacle_max_range: 9.5
+          inf_is_valid: true
+          
+        scan_rear:
+          topic: /scan_rear
+          # ... (위와 동일한 설정 복사) ...
+          
+        scan_left:
+          topic: /scan_left
+          # ...
+          
+        scan_right:
+          topic: /scan_right
+          # ...
+```
+
+이렇게 하면 4방향의 Depth 데이터가 모두 2D Costmap에 장애물로 반영됩니다.
