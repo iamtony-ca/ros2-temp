@@ -409,3 +409,89 @@ ros2 topic echo /tf_static --once
 [2]: https://www.stereolabs.com/docs/development/zed-sdk/jetson?utm_source=chatgpt.com "How to Install ZED SDK on NVIDIA® Jetson"
 [3]: https://www.stereolabs.com/docs/ros2/multi_camera/ "Multi-camera setup - Stereolabs"
 [4]: https://github.com/stereolabs/zed-ros2-wrapper "GitHub - stereolabs/zed-ros2-wrapper: ROS 2 wrapper for the ZED SDK"
+##########################  
+############################  
+##############################  
+`common_stereo.yaml` 파일을 찾으셨군요\! 바로 이 부분이 \*\*"토픽이 리스트에 보이지 않던 원인"\*\*입니다. ZED SDK는 네트워크 대역폭과 CPU 자원을 아끼기 위해, 기본적으로 필수적인 토픽 외에는 모두 `false`로 꺼두기 때문입니다.
+
+각 파라미터가 무엇을 의미하는지, 그리고 \*\*작성자님의 목적(Left/Right 개별 이미지 + Gray 이미지)\*\*에 맞게 어떻게 수정해야 하는지 설명해 드릴게요.
+
+-----
+
+### 1\. 파라미터 상세 설명
+
+| 파라미터 | 의미 및 설명 | 추천 설정 |
+| :--- | :--- | :--- |
+| **`enable_24bit_output`** | **이미지 데이터의 크기 결정**<br>- `false`: **32-bit BGRA** (투명도 채널 포함). 데이터가 큼.<br>- `true`: **24-bit BGR** (투명도 제거). 데이터가 작음.<br>로봇 비전에서는 투명도(Alpha) 채널이 필요 없으므로 **true**로 설정하여 대역폭을 25% 절약하는 것이 좋습니다. | **true** (강력 추천) |
+| **`publish_rgb`** | **메인 컬러 이미지 발행 여부**<br>주로 **Left 카메라의 보정된(Rectified) 컬러 이미지**를 발행합니다. 우리가 흔히 보는 메인 화면입니다. | **true** |
+| **`publish_left_right`** | **Left / Right 개별 이미지 발행 여부**<br>- 이게 `true`여야 **Right 카메라의 컬러 이미지**(`.../right/image_rect_color`)가 발행됩니다.<br>- 작성자님이 찾던 \*\*"오른쪽, 왼쪽 이미지 각각 필요해"\*\*를 해결해 주는 옵션입니다. | **true** (필수) |
+| **`publish_raw`** | **보정되지 않은(Distorted) 원본 이미지**<br>렌즈 왜곡이 그대로 있는 이미지입니다. 직접 캘리브레이션을 하거나 특수한 VSLAM을 돌리는 게 아니라면 보통 필요 없습니다. | **false** |
+| **`publish_gray`** | **Grayscale(흑백) 이미지 발행 여부**<br>- 컬러 이미지를 흑백으로 변환하여 발행합니다.<br>- 작성자님이 찾던 \*\*"grey 이미지도 받고 싶어"\*\*를 해결해 주는 옵션입니다. | **true** (필수) |
+| **`publish_stereo`** | **Stereo Pair 이미지**<br>Left와 Right 이미지를 하나로 합쳐서(Side-by-Side) 보냅니다. VR 헤드셋 등에는 유용하지만, 로봇 개발에서는 이미지를 다시 잘라내야 해서 잘 안 씁니다. | **false** |
+
+-----
+
+### 2\. 작성자님의 상황에 맞는 추천 설정
+
+작성자님의 요구사항은 \*\*"Left/Right 각각의 이미지"\*\*와 \*\*"Grayscale 이미지"\*\*를 얻는 것입니다. 또한 ZED X를 사용 중이므로 데이터 전송량이 많을 텐데, 이를 효율적으로 관리해야 합니다.
+
+아래와 같이 `common_stereo.yaml`을 수정하세요.
+
+```yaml
+        video:
+            saturation: 4 
+            sharpness: 4 
+            gamma: 8 
+            auto_exposure_gain: true 
+            exposure: 80 
+            gain: 80 
+            auto_whitebalance: true 
+            whitebalance_temperature: 42 
+            
+            # [핵심 변경 1] 대역폭 절약을 위해 24bit 사용 (투명도 채널 제거)
+            enable_24bit_output: true 
+
+            # 기본 RGB (Left)
+            publish_rgb: true 
+
+            # [핵심 변경 2] Right 카메라 이미지 토픽 활성화
+            # 이걸 켜면 /zed_multi/.../right/image_rect_color 가 나옵니다.
+            publish_left_right: true 
+
+            # 왜곡된 원본은 필요 없으므로 끔
+            publish_raw: false 
+
+            # [핵심 변경 3] Grayscale 이미지 토픽 활성화
+            # 이걸 켜면 /zed_multi/.../left/image_rect_gray 등이 나옵니다.
+            publish_gray: true 
+
+            # Stereo 합친 이미지는 필요 없으므로 끔
+            publish_stereo: false 
+```
+
+### 3\. 적용 후 확인 방법
+
+위와 같이 수정하고 저장한 뒤, ZED 노드를 재시작(`ctrl+c` -\> `ros2 launch...`) 해주세요.
+그다음 터미널에서 토픽 리스트를 확인하면 원하시던 토픽들이 보일 것입니다.
+
+```bash
+ros2 topic list
+```
+
+**예상되는 추가 토픽들:**
+
+  * `/zed_multi/zed_right/left/image_rect_color` (Left 컬러)
+  * `/zed_multi/zed_right/right/image_rect_color` (Right 컬러)
+  * `/zed_multi/zed_right/left/image_rect_gray` (Left 흑백)
+  * `/zed_multi/zed_right/right/image_rect_gray` (Right 흑백)
+
+### ⚠️ 주의사항 (Expert Tip)
+
+`publish_left_right: true`와 `publish_gray: true`를 모두 켜면, 카메라가 뱉어내는 데이터 양이 **2배\~3배**로 늘어납니다.
+ZED X는 해상도가 높기 때문에(FHD or 1200p), 모든 이미지를 다 켜면 **IPC의 CPU 부하가 급증**하거나 \*\*네트워크 지연(Lag)\*\*이 발생할 수 있습니다.
+
+만약 로봇이 버벅거린다면?
+
+1.  **해상도(Resolution) 낮추기:** `common.yaml` 다른 부분에 있는 해상도 설정을 한 단계 낮춥니다.
+2.  **FPS 낮추기:** 프레임 레이트를 30fps에서 15fps 정도로 낮춥니다.
+3.  **필요한 것만 켜기:** 만약 알고리즘이 Gray 이미지만 쓴다면, `publish_rgb`와 `publish_left_right`를 끄고 Gray만 켤 수도 있습니다.
