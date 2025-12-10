@@ -576,3 +576,212 @@ def launch_setup(context, *args, **kwargs):
       * Camera 2: 8초 뒤 실행
       * Camera 3: 12초 뒤 실행
 3.  이렇게 하면 각 카메라가 하드웨어(GMSL Link)와 데몬을 점유하는 시간을 분산시켜 "Camera Detection Error"가 사라질 것입니다.
+####################
+#######################
+###########################
+############################
+지금 상황 정리하면 대충 이런 그림이야:
+
+* JetPack 6.2.1 + ZED SDK 5.1.1
+* `zed-ros2-wrapper` + `zed-ros2-examples` 돌리면
+* 시간이 갈수록 RAM이 서서히 계속 올라가는 패턴 (일정 수준에서 평탄해지는 게 아니라 *계속* 증가)
+
+이 조합에서 비슷한 보고가 실제로 꽤 있고, 특히 **ZED SDK 5.x + ROS2 Humble + ZED X 계열**에서 `pos_tracking_mode: GEN_3` 쓸 때 안정성/리소스 이슈가 언급돼 있어.([Stereolabs Forums][1])
+또, `zed-ros2-wrapper` 이슈에서도 “시간 지나면서 메모리가 계속 증가해서 결국 죽는다”는 리포트가 올라온 상태고, 아직 완전한 fix가 안 된 케이스도 있어.([GitHub][2])
+
+아래 순서대로 체크·튜닝해보는 걸 추천할게. (질문 안 하고 내가 가정해서 써줄게.)
+
+---
+
+## 1. 진짜 “메모리 릭”인지, 아님 정상적인 버퍼 증가인지 먼저 확인
+
+1. **wrapper만 단독 실행해서 확인**
+
+   ```bash
+   ros2 launch zed_wrapper zed_camera.launch.py camera_model:=zedx
+   # 또는 사용 중인 모델 이름
+   ```
+
+   그리고 `jtop`이나 `top`에서 **프로세스별** 메모리 확인:
+
+   ```bash
+   top -p $(pgrep -d',' zed_wrapper)
+   ```
+
+   * `zed_wrapper` 한 프로세스의 RES 메모리가 **몇 분~수십 분 동안 계속 선형적으로 증가**하면 거의 확실히 릭 느낌.
+   * 처음 몇 분 동안만 올라가다가 어느 지점에서 **평탄**해지면 내부 버퍼가 한번 채워지는 정상 동작일 수도 있음.
+
+2. **예제 노드 끄고 다시 확인**
+
+   * `zed-ros2-examples`에서 돌리는 subscriber/demo 노드들이 각자 버퍼/벡터를 쌓고 있을 수 있음.
+   * wrapper만 켰을 때도 같은 패턴이면, 문제는 거의 **SDK / wrapper 쪽**.
+
+---
+
+## 2. YAML 최소화: 불필요한 모듈 다 끄고 재측정
+
+`zed-ros2-wrapper`의 `common.yaml` / `zedx.yaml` 등을 열어서 아래처럼 **전부 OFF** 기준으로 한 번 테스트해봐.
+
+```yaml
+/**:
+  ros__parameters:
+    depth:
+      depth_mode: "NEURAL"          # 어차피 depth는 써야 하니까 유지
+      publish_point_cloud: false    # 일단 point cloud는 끔
+      publish_depth_map: true
+      point_cloud_freq: 10.0        # 나중에 켤 때도 너무 높지 않게
+
+    pos_tracking:
+      pos_tracking_enabled: false   # 1차 테스트에서는 완전히 OFF
+      path_pub_rate: 0.0
+      path_max_count: 0            # 히스토리 안쌓게
+
+    mapping:
+      mapping_enabled: false
+
+    object_detection:
+      od_enabled: false
+
+    body_tracking:
+      bt_enabled: false
+
+    stream_server:
+      stream_enabled: false
+
+    sensors:
+      publish_imu: false
+      publish_imu_raw: false
+      publish_baro: false
+      publish_temp: false
+      sensors_pub_rate: 100.0
+```
+
+이 상태에서 20~30분 돌려보고:
+
+* **여기서도 메모리가 계속 올라가면** → 거의 SDK / wrapper 내부 이슈.
+* 여기서는 안정인데, 나중에 pos_tracking / mapping / OD 등을 켜면 다시 증가 → **어떤 모듈 켰을 때부터** 증가하는지 단계별로 찾으면 됨.
+
+---
+
+## 3. `pos_tracking_mode: GEN_3` 사용 중이면 **GEN_2로 바꾸기 (매우 중요)**
+
+Stereolabs 포럼에서 **JetPack 6.2 + ZED SDK 5.1.1 + `pos_tracking_mode: 'GEN_3'`** 조합이 문제를 일으킨다고 공식 답변이 있음.
+해결책으로:
+
+* **SDK 5.1.2 이상으로 업데이트**하거나
+* 당분간 **`GEN_1` / `GEN_2`로 내려서 사용**하라고 권장해.([Stereolabs Forums][1])
+
+그래서 YAML에서:
+
+```yaml
+pos_tracking:
+  pos_tracking_enabled: true
+  pos_tracking_mode: "GEN_2"   # GEN_3 → GEN_2 로 변경
+  publish_tf: true
+  publish_map_tf: true
+  path_pub_rate: 2.0
+  path_max_count: 2000         # 꼭 유한한 값으로!
+```
+
+로 바꾸고 다시 메모리 추세를 봐봐.
+
+> 특히 `path_max_count: -1` (unlimited) 로 두면 camera trajectory를 계속 쌓아서 **시간에 비례해 메모리 늘어나는 느낌**을 줄 수 있음.([GitHub][2])
+> 로봇 운용에서는 보통 수천 개 정도면 충분하니까 1000~5000 선에서 잘라주는 게 안전해.
+
+---
+
+## 4. `zed-ros2-examples`가 메모리를 잡아먹는지 분리 확인
+
+예제 노드들은 보통:
+
+* 이미지/포인트클라우드 콜백에서 `cv::Mat`/`np.array` 복사
+* 내부 리스트/벡터/큐에 계속 push_back만 하고 clear를 안 하거나
+* 시각화용 버퍼를 무한히 쌓는 코드
+
+같은 게 있어서, **장시간 돌리는 용도**가 아니라 “데모용”인 경우가 많아.
+
+테스트 순서 제안:
+
+1. wrapper만 실행 → 메모리 추세 기록
+2. `ros2 run zed_examples <어떤 노드>` 하나만 추가 → 다시 기록
+3. 의심되는 예제 노드에서,
+
+   * 큰 컨테이너(`std::vector`, `std::deque`, Python list 등)를 전역/멤버로 들고 있다면
+   * 콜백마다 `clear()` 해주거나, 크기를 제한하는 ring buffer 구조로 바꾸는 것도 방법.
+
+만약 특정 예제를 켰을 때만 메모리가 가파르게 증가한다면, 그 노드는 그냥 **참고용으로만 사용**하고 실제 시스템에서는 비슷한 기능을 직접 구현하는 게 낫다.
+
+---
+
+## 5. 설정 차원에서 할 수 있는 추가 “메모리 안전화” 팁
+
+1. **해상도/프레임레이트 줄이기**
+
+   ```yaml
+   general:
+     pub_resolution: "CUSTOM"
+     pub_downscale_factor: 2.0   # 필요하면 3.0까지 올려도 됨
+     pub_frame_rate: 15.0
+   ```
+
+   * 메모리 릭이 아니라도, 처리량/버퍼 크기가 줄어서 전체 메모리 압박이 확 줄어듦.
+
+2. **Point Cloud, depth topic 최소화**
+
+   * 필요 없는 토픽은 아예 `publish_xxx: false` 로 꺼두기 (특히 `publish_point_cloud`, `publish_depth_confidence` 등).([Stereolabs Forums][1])
+
+3. **SVO / streaming 사용 시**
+
+   * `svo_loop`, `stream_server.stream_enabled` 같이 recording/streaming 관련 기능은 버그를 타기 쉬운 부분이라 안 쓰면 끄는 게 좋음. 일부 버전에서 SVO 녹화 관련 메모리 이슈가 보고된 적도 있음.([Stereolabs][3])
+
+---
+
+## 6. 여기까지 했는데도 계속 샌다면?
+
+그럼 거의 “환경 + 버전 조합” 문제일 가능성이 높아.
+
+1. **최신 zed-ros2-wrapper로 업데이트 & 재빌드**
+
+   ```bash
+   cd ~/zed_ws/src/zed-ros2-wrapper
+   git pull origin master   # 또는 JetPack용 권장 브랜치/태그
+   cd ~/zed_ws
+   colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+   ```
+
+   최근 릴리즈들에서 point cloud transport, FFMPEG image transport 등 관련 수정이 계속 올라와 있어서, 최신 버전이 메모리 사용을 개선해줄 수 있어.([GitHub][4])
+
+2. **가능하면 SDK 패치버전(5.1.2 이상)로 올리기**
+
+   * Stereolabs가 JetPack 6.x용 5.1.x를 계속 패치하는 중이라, `POSITIONAL_TRACKING::GEN_3` 관련 안정성/레이스 조건 해결이 5.1.1~5.1.2에서 반복으로 이뤄지고 있음.([Stereolabs][5])
+   * 설치 가능해지면, Jetson용 5.1.x 최신 패치로 올리는 게 장기적으로 가장 깔끔한 해결책.
+
+3. **이슈 리포트용 자료 준비**
+
+   * `zed_wrapper` 단독 실행, 최소 설정 YAML,
+   * `jtop`/`tegrastats` 로그 10~30분 정도,
+   * JetPack / L4T / SDK / wrapper commit hash
+     이런 걸 모아서 `zed-ros2-wrapper` GitHub Issue에 올리면, 개발자들이 실제 버그로 잡아줄 확률이 높아.
+
+---
+
+## 7. 요약 – 지금 당장 해볼 순서
+
+1. **모듈 최소화한 YAML로 wrapper만 돌려보고** 메모리 증가하는지 확인
+2. `pos_tracking` 켜야 한다면:
+
+   * `pos_tracking_mode: "GEN_2"` 로 바꾸고
+   * `path_max_count` 를 0이 아닌 적당한 유한 값(예: 2000)으로 설정
+3. 필요 없는 토픽(특히 pointcloud, depth confidence, mapping, OD, body tracking, stream server) 전부 OFF
+4. 그래도 계속 샌다면,
+
+   * wrapper 최신으로 업데이트 & 재빌드
+   * 가능해지면 SDK 5.1.x 최신 패치로 업그레이드 고려
+
+혹시 나중에 `common.yaml` / `zedx.yaml` 내용이랑 `jtop` 캡처까지 공유해주면, 어떤 모듈이 특히 수상한지 내가 같이 하나씩 짚어줄게 (예: GEN_3 사용 여부, path/landmark 히스토리 쌓이는지 등).
+
+[1]: https://community.stereolabs.com/t/ros2-humble-zed-multi-container-dies-frequently-jetson-agx-orin-64gb-l4t-36-4-7-zed-sdk-5-1-1-3-zedx-mini-via-quad-capture-card/10374 "ROS2 Humble ZED multi container dies frequently, Jetson AGX Orin 64gb, L4T 36.4.7, ZED SDK 5.1.1, 3 ZEDx Mini via Quad Capture Card    - Stereolabs Forums"
+[2]: https://github.com/stereolabs/zed-ros2-wrapper/issues/268 "Wrapper memory usage increasing over time · Issue #268 · stereolabs/zed-ros2-wrapper · GitHub"
+[3]: https://www.stereolabs.com/developers/release/5.0?utm_source=chatgpt.com "ZED SDK 5.0 - Download"
+[4]: https://github.com/stereolabs/zed-ros2-wrapper/releases?utm_source=chatgpt.com "Releases · stereolabs/zed-ros2-wrapper"
+[5]: https://www.stereolabs.com/developers/release "ZED SDK 5.1 - Download | Stereolabs"
