@@ -785,3 +785,86 @@ pos_tracking:
 [3]: https://www.stereolabs.com/developers/release/5.0?utm_source=chatgpt.com "ZED SDK 5.0 - Download"
 [4]: https://github.com/stereolabs/zed-ros2-wrapper/releases?utm_source=chatgpt.com "Releases · stereolabs/zed-ros2-wrapper"
 [5]: https://www.stereolabs.com/developers/release "ZED SDK 5.1 - Download | Stereolabs"
+
+#################  
+########################  
+####№###################  
+제공해주신 소스 코드에서 **Speckle Filter가 전혀 먹히지 않는(Pass Through) 결정적인 원인**으로 보이는 부분을 발견했습니다.
+
+소스 코드 상의 **Filter Chain 설정 부분**에 버그(또는 설정 실수)가 있습니다. 이로 인해 YAML 파일에 아무리 값을 1000으로 바꿔 적어도, 노드는 \*\*"필터를 하나도 로드하지 않은 상태"\*\*로 동작하고 있을 확률이 매우 높습니다.
+
+-----
+
+### 🔍 문제의 코드 라인
+
+제공해주신 `cpp` 파일의 생성자(`ScanToScanFilterChain::ScanToScanFilterChain`) 부분을 보시면:
+
+```cpp
+  // Configure filter chain
+  filter_chain_.configure(
+    "", // <--- 여기가 문제입니다! (Empty String)
+    this->get_node_logging_interface(), this->get_node_parameters_interface());
+```
+
+`filter_chain_.configure()` 함수의 첫 번째 인자는 \*\*"파라미터 이름(Key)"\*\*입니다.
+보통 ROS 2의 표준 `laser_filters` 노드는 이 값이 \*\*`"scan_filter_chain"`\*\*으로 되어 있습니다.
+
+#### 왜 문제가 되는가?
+
+1.  **YAML 파일의 구조:** 보통 `laser_filters`용 YAML 파일은 아래와 같이 작성합니다.
+    ```yaml
+    scan_to_scan_filter_chain:
+      ros__parameters:
+        scan_filter_chain:  # <--- 이 이름을 찾아서 로드해야 함
+          - name: speckle_filter
+            type: laser_filters/LaserScanSpeckleFilter
+            ...
+    ```
+2.  **코드의 동작:** 작성자님의 코드는 `configure("")`, 즉 **"이름이 없는(빈 문자열)"** 파라미터를 찾으려고 시도합니다.
+3.  **결과:** 노드는 `scan_filter_chain`이라는 파라미터 리스트를 발견하지 못하고, \*\*"아, 적용할 필터가 없구나"\*\*라고 판단합니다.
+4.  **증상:** 필터 체인이 비어있으므로 들어온 `scan` 데이터를 그대로 `publish` 합니다. 그래서 `filter_window`를 1000으로 하든 1로 하든 **원본 데이터가 그대로 통과**되는 것입니다.
+
+-----
+
+### ✅ 해결 방법
+
+코드를 수정하여 다시 빌드하셔야 합니다.
+
+**수정 전:**
+
+```cpp
+  filter_chain_.configure(
+    "",
+    this->get_node_logging_interface(), this->get_node_parameters_interface());
+```
+
+**수정 후:**
+
+```cpp
+  filter_chain_.configure(
+    "scan_filter_chain",  // YAML 파일에 적힌 리스트 이름과 일치시킴
+    this->get_node_logging_interface(), this->get_node_parameters_interface());
+```
+
+-----
+
+### 🛑 추가 확인 사항 (ZED 카메라 특성)
+
+코드를 수정한 뒤에도 필터가 제대로 작동하지 않는다면, **ZED의 `NaN` (Not a Number) 데이터** 문제일 가능성이 큽니다.
+
+Speckle Filter는 점과 점 사이의 거리를 계산(`diff = range[i] - range[i-1]`)합니다.
+
+  * ZED는 유효 거리가 아닌 곳을 `inf`가 아닌 `NaN`으로 채우는 경우가 있습니다.
+  * C++에서 `NaN`과의 비교 연산은 무조건 `False`가 나옵니다.
+  * 만약 `NaN` 데이터가 섞여 들어오면, Speckle Filter가 **"거리 차이가 없다(연결되어 있다)"고 착각**하게 만들어 필터링을 무력화시킬 수 있습니다.
+
+**조치:**
+ZED `pointcloud_to_laserscan` 변환 노드 설정에서, 유효하지 않은 데이터 처리를 어떻게 하고 있는지 확인해 보시고, 필요하다면 Speckle Filter **앞단**에 `LaserScanRangeFilter`를 두어 `NaN`이나 범위를 벗어난 값을 먼저 청소해주는 것이 안전합니다.
+
+### 요약
+
+1.  **가장 큰 원인:** 소스 코드의 `filter_chain_.configure("")` 부분.
+2.  **해결:** `""`를 `"scan_filter_chain"`으로 변경 후 재빌드.
+3.  \*\* Shadow Filter는 왜 됐을까?:\*\* 아마 Shadow Filter 테스트 때는 이 소스 코드로 만든 노드가 아니라, `apt`로 설치된 공식 패키지(`ros-jazzy-laser-filters`)를 실행하셨거나, 우연히 다른 설정이 맞아떨어졌을 가능성이 높습니다.
+
+우선 \*\*코드 수정(빈 문자열 채우기)\*\*부터 진행해 보시길 권장합니다.
