@@ -868,3 +868,106 @@ ZED `pointcloud_to_laserscan` 변환 노드 설정에서, 유효하지 않은 �
 3.  \*\* Shadow Filter는 왜 됐을까?:\*\* 아마 Shadow Filter 테스트 때는 이 소스 코드로 만든 노드가 아니라, `apt`로 설치된 공식 패키지(`ros-jazzy-laser-filters`)를 실행하셨거나, 우연히 다른 설정이 맞아떨어졌을 가능성이 높습니다.
 
 우선 \*\*코드 수정(빈 문자열 채우기)\*\*부터 진행해 보시길 권장합니다.
+#########################  
+############################  
+#############################  
+사용자님의 질문은 **"이미지 단계에서 잘라내면(ROI), 그 결과물인 PointCloud의 품질이 더 좋아지거나 연산이 더 효율적이지 않을까?"** 라는 아주 날카로운 통찰입니다.
+
+결론부터 말씀드리면:
+
+1.  **품질(Quality):** **동일합니다.** 이미지 단계에서 자르나, PointCloud 변환 루프에서 자르나, 중앙 부분의 Depth 데이터 정밀도가 더 올라가는 것은 아닙니다. (단지 가장자리의 쓰레기 데이터를 안 보는 것일 뿐입니다.)
+2.  **효율(Efficiency):** **제가 제안한 `publishPointCloud` 코드 수정(Loop 제어)** 방식이 이미지 단계에서 별도로 ROI 처리를 하는 것보다 **메모리 복사 비용이 없어 더 빠릅니다.**
+
+왜 그런지, 그리고 \*\*가장 스마트하게 자르는 방법(코드)\*\*을 정리해 드립니다.
+
+-----
+
+### 1\. 왜 결과 품질은 같은가?
+
+ZED의 Depth 생성 방식(Stereo Matching) 때문입니다.
+
+  * 중앙에 있는 픽셀 `(300, 200)`의 거리를 계산할 때, 가장자리에 있는 픽셀 `(0, 200)`의 데이터는 영향을 주지 않습니다.
+  * 즉, 가장자리를 미리 잘라낸다고 해서 중앙 부분의 계산이 더 정밀해지거나 노이즈가 줄어들지는 않습니다.
+  * **결론:** 이미지 단계에서 자르든, 나중에 자르든 **"남아있는 중앙 데이터의 값"은 100% 동일**합니다.
+
+-----
+
+### 2\. 왜 `publishPointCloud` 루프 수정이 더 효율적인가?
+
+**[시나리오 A: Depth Image 단계에서 ROI 자르기]**
+
+1.  ZED SDK에서 전체 해상도 이미지 가져옴 (`sl::Mat`).
+2.  **[비용 발생]** ROI 영역을 설정하여 새로운 이미지를 생성하거나 메모리를 복사(Crop)함.
+3.  복사된 이미지를 루프 돌면서 PointCloud로 변환.
+
+**[시나리오 B: `publishPointCloud` 루프 범위 수정 (제안하는 방식)]**
+
+1.  ZED SDK에서 전체 해상도 이미지 가져옴.
+2.  **[비용 0]** 변환 루프(for문)를 돌 때, 아예 **가장자리 인덱스는 건너뛰고 중앙 부분만 돔.**
+3.  PointCloud 생성.
+
+**[결론]**
+시나리오 B는 **"불필요한 메모리 복사"** 과정이 아예 없고, CPU가 처리해야 할 횟수(Loop Count)도 줄어들기 때문에 **시스템 부하 측면에서 가장 효율적**입니다.
+
+-----
+
+### 3\. [최적화 코드] 가장 효율적으로 자르는 방법
+
+이전 답변에서는 이해를 돕기 위해 `if` 문으로 `continue` 하는 방식을 보여드렸지만, **성능을 극한으로 끌어올리려면** `if` 문조차 없애고 **for 문의 시작과 끝 인덱스를 조절**하는 것이 정석입니다.
+
+아래 코드는 **좌우 15%를 아예 연산하지 않고 건너뛰는** 가장 빠른 코드입니다.
+
+```cpp
+void ZedCamera::publishPointCloud()
+{
+    // ... (앞부분 TimeStamp 처리 등 동일) ...
+    
+    // 1. ZED 데이터 포인터 획득
+    int width = mMatCloud.getWidth();
+    int height = mMatCloud.getHeight();
+    sl::Vector4<float>* cpu_cloud = mMatCloud.getPtr<sl::float4>();
+
+    // 2. Crop 영역 계산 (좌우 15% 컷)
+    int crop_margin = width * 0.15; // 예: 640폭이면 약 96픽셀
+    int start_col = crop_margin;
+    int end_col = width - crop_margin;
+
+    // 3. PCL Cloud 준비
+    pcl::PointCloud<pcl::PointXYZBGRA>::Ptr temp_cloud(new pcl::PointCloud<pcl::PointXYZBGRA>);
+    // 메모리 예약 (전체 크기가 아니라, 잘라낸 만큼만 예약 -> 메모리 절약)
+    temp_cloud->reserve((end_col - start_col) * height);
+
+    // 4. [핵심] 이중 Loop를 사용하여 가장자리는 아예 접근조차 안 함 (CPU 세이브)
+    for (int v = 0; v < height; v++) {
+        // 행(Row)의 시작 포인터 계산
+        int row_offset = v * width;
+        
+        // 열(Col) 루프 범위를 처음부터 '중앙'으로 제한
+        for (int u = start_col; u < end_col; u++) {
+            
+            int i = row_offset + u; // 1차원 인덱스
+
+            // 데이터 가져오기
+            float x = cpu_cloud[i][0];
+            float y = cpu_cloud[i][1];
+            float z = cpu_cloud[i][2];
+
+            // 유효성 검사 및 Height Filter (이전과 동일)
+            if (std::isfinite(z) && z >= Z_MIN && z <= Z_MAX) {
+                pcl::PointXYZBGRA pt;
+                pt.x = x; pt.y = y; pt.z = z;
+                pt.rgba = *reinterpret_cast<uint32_t*>(&cpu_cloud[i][3]);
+                temp_cloud->points.push_back(pt);
+            }
+        }
+    }
+
+    // ... (이후 Voxel Grid 및 Publish 동일) ...
+}
+```
+
+### 요약
+
+1.  **이미지에서 먼저 자르나 여기서 자르나 결과물은 똑같습니다.**
+2.  하지만 위 코드처럼 **루프 범위 자체를 줄여버리는 것**이 **CPU 사용량을 가장 많이 줄일 수 있는 방법**입니다. (Ghost가 생기는 가장자리는 아예 쳐다보지도 않기 때문입니다.)
+3.  이 코드를 적용하면 \*\*"협소 공간 코너링 시 Ghost 현상 제거"\*\*와 **"시스템 부하 감소"** 두 가지 효과를 동시에 확실하게 보실 수 있습니다.
