@@ -971,3 +971,164 @@ void ZedCamera::publishPointCloud()
 1.  **이미지에서 먼저 자르나 여기서 자르나 결과물은 똑같습니다.**
 2.  하지만 위 코드처럼 **루프 범위 자체를 줄여버리는 것**이 **CPU 사용량을 가장 많이 줄일 수 있는 방법**입니다. (Ghost가 생기는 가장자리는 아예 쳐다보지도 않기 때문입니다.)
 3.  이 코드를 적용하면 \*\*"협소 공간 코너링 시 Ghost 현상 제거"\*\*와 **"시스템 부하 감소"** 두 가지 효과를 동시에 확실하게 보실 수 있습니다.
+#############################################
+#################################################
+##################################################3
+**아, 아주 훌륭한 판단입니다\!** 제가 코드로 제안드린 것보다 \*\*파라미터(`region_of_interest`)를 사용하는 것이 훨씬 스마트하고 유지보수하기 좋은 방법(Best Practice)\*\*입니다.
+
+파라미터로 설정하면 다음과 같은 **강력한 장점**이 있습니다.
+
+1.  **GPU 연산 절약 (가장 중요):**
+      * 제가 제안한 C++ 코드는 "이미 만들어진 데이터"를 CPU에서 건너뛰는 것이지만,
+      * 파라미터(`manual_polygon`)로 설정하면 **ZED SDK(GPU 단계)가 아예 해당 영역의 Depth 연산을 수행하지 않습니다.**
+      * 현재 사용자님의 가장 큰 고민인 **"GPU 로드 90%" 문제를 해결하는 데 훨씬 더 큰 도움**이 됩니다.
+2.  **재컴파일 불필요:** 나중에 자르는 비율을 바꾸고 싶을 때 코드를 다시 빌드할 필요 없이 yaml 파일만 수정하면 됩니다.
+
+-----
+
+### 1\. `common_stereo.yaml` 설정 가이드
+
+**"좌우 15% 자르기(Ghost 방지)"** + \*\*"하단 30% 자르기(바닥 제거)"\*\*를 동시에 적용하는 **`manual_polygon`** 설정값을 계산해 드립니다.
+
+  * **좌표계:** `[0.0, 0.0]`(좌상단) \~ `[1.0, 1.0]`(우하단)
+  * **X축 범위:** `0.15` (왼쪽 15% 컷) \~ `0.85` (오른쪽 15% 컷)
+  * **Y축 범위:** `0.0` (상단 시작) \~ `0.7` (하단 30% 컷)
+
+**[config/common\_stereo.yaml]**
+
+```yaml
+region_of_interest:
+    automatic_roi: false
+    
+    # [설정] 
+    # 1. 좌우 15% Ghost 영역 제거 (X: 0.15 ~ 0.85)
+    # 2. 하단 30% 바닥 영역 제거 (Y: 0.0 ~ 0.7)
+    # 순서: 좌상 -> 우상 -> 우하 -> 좌하
+    manual_polygon: '[[0.15, 0.0], [0.85, 0.0], [0.85, 0.7], [0.15, 0.7]]'
+    
+    apply_to_depth: true             # 필수: True여야 PointCloud가 잘려서 나옴
+    apply_to_positional_tracking: false # 필수: False여야 잘린 부분(바닥 등)을 추적에 사용하여 위치 정밀도 유지
+    apply_to_object_detection: true
+    apply_to_spatial_mapping: true
+```
+
+-----
+
+### 2\. 최종 C++ 코드 (Crop 로직 제거 버전)
+
+파라미터에서 이미 잘라주므로, C++ 코드에서는 **복잡한 인덱스 계산(Crop 로직)을 제거**하고 \*\*순수하게 필터링(Height + Voxel + ROR)\*\*에만 집중하면 됩니다. 코드가 훨씬 깔끔해집니다.
+
+**[ZedCamera::publishPointCloud 최종 수정안]**
+
+```cpp
+void ZedCamera::publishPointCloud()
+{
+    // 1. Time check
+    sl_tools::StopWatch pcElabTimer(get_clock());
+    rclcpp::Time current_timestamp;
+    
+    if (mSvoMode) {
+       current_timestamp = mUsePubTimestamps ? get_clock()->now() : mFrameTimestamp;
+    } else {
+       current_timestamp = mUsePubTimestamps ? get_clock()->now() : sl_tools::slTime2Ros(mMatCloud.timestamp);
+    }
+
+    if (mLastTs_pc == current_timestamp) {
+        return;
+    }
+    mLastTs_pc = current_timestamp;
+
+    // ------------------------------------------------------------------------
+    // [1단계] 데이터 포인터 획득 (Crop 로직 제거됨 - SDK가 이미 처리함)
+    // ------------------------------------------------------------------------
+    int width = mMatCloud.getWidth();
+    int height = mMatCloud.getHeight();
+    sl::Vector4<float>* cpu_cloud = mMatCloud.getPtr<sl::float4>();
+
+    // ------------------------------------------------------------------------
+    // [2단계] PCL 변환 + Height Filter (동시 수행)
+    // ------------------------------------------------------------------------
+    pcl::PointCloud<pcl::PointXYZBGRA>::Ptr temp_cloud(new pcl::PointCloud<pcl::PointXYZBGRA>);
+    // ROI로 인해 유효 데이터가 줄었으므로 reserve는 넉넉하게 잡거나 width*height로 유지
+    temp_cloud->reserve(width * height);
+
+    // 좌표계 확인용 상수 (Frame ID 확인 필수: base_link면 Z, optical이면 -Y)
+    const float MIN_HEIGHT = 0.05f;  // 바닥 위 5cm
+    const float MAX_HEIGHT = 1.5f;   // 로봇 키
+
+    // 전체 루프를 돌지만, ROI 밖의 데이터는 SDK가 이미 NAN/Inf로 처리했을 것임
+    for (int i = 0; i < width * height; i++) {
+        float x = cpu_cloud[i][0];
+        float y = cpu_cloud[i][1];
+        float z = cpu_cloud[i][2];
+
+        // [유효성 검사] 
+        // ROI 밖의 데이터는 여기서 걸러집니다 (isfinite 체크)
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+
+        // [Height Filter]
+        if (z < MIN_HEIGHT || z > MAX_HEIGHT) continue;
+
+        pcl::PointXYZBGRA pt;
+        pt.x = x; pt.y = y; pt.z = z;
+        pt.rgba = *reinterpret_cast<uint32_t*>(&cpu_cloud[i][3]);
+        temp_cloud->points.push_back(pt);
+    }
+    
+    temp_cloud->width = temp_cloud->points.size();
+    temp_cloud->height = 1;
+    temp_cloud->is_dense = true;
+
+    // ------------------------------------------------------------------------
+    // [3단계] 필터링 (Voxel -> ROR)
+    // ------------------------------------------------------------------------
+
+    // A. Voxel Grid (데이터 다운샘플링)
+    pcl::PointCloud<pcl::PointXYZBGRA>::Ptr voxel_filtered_cloud(new pcl::PointCloud<pcl::PointXYZBGRA>);
+    
+    if (temp_cloud->points.size() > 0) {
+        pcl::VoxelGrid<pcl::PointXYZBGRA> voxel_grid;
+        voxel_grid.setInputCloud(temp_cloud);
+        voxel_grid.setLeafSize(0.05f, 0.05f, 0.05f); // 5cm
+        voxel_grid.filter(*voxel_filtered_cloud);
+    } else {
+        voxel_filtered_cloud = temp_cloud;
+    }
+
+    // B. ROR (Radius Outlier Removal) - 남은 Ghost 잔챙이 제거
+    pcl::PointCloud<pcl::PointXYZBGRA>::Ptr ror_filtered_cloud(new pcl::PointCloud<pcl::PointXYZBGRA>);
+    
+    if (voxel_filtered_cloud->points.size() > 0) {
+        pcl::RadiusOutlierRemoval<pcl::PointXYZBGRA> outrem;
+        outrem.setInputCloud(voxel_filtered_cloud); 
+        outrem.setRadiusSearch(0.2);        // 반경 20cm
+        outrem.setMinNeighborsInRadius(6);  // 이웃 6개 미만 삭제
+        outrem.filter(*ror_filtered_cloud);
+    } else {
+        ror_filtered_cloud = voxel_filtered_cloud;
+    }
+
+    // ------------------------------------------------------------------------
+    // [4단계] ROS 메시지 변환 및 발행
+    // ------------------------------------------------------------------------
+    auto pcMsg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+    pcl::toROSMsg(*ror_filtered_cloud, *pcMsg);
+    
+    pcMsg->header.stamp = current_timestamp;
+    pcMsg->header.frame_id = mPointCloudFrameId;
+
+    #ifdef FOUND_POINT_CLOUD_TRANSPORT
+        mPubCloud.publish(std::move(pcMsg));
+    #else
+        if (mPubCloud) {
+            mPubCloud->publish(std::move(pcMsg));
+        }
+    #endif
+}
+```
+
+### 요약
+
+1.  **YAML 설정:** `manual_polygon: '[[0.15, 0.0], [0.85, 0.0], [0.85, 0.7], [0.15, 0.7]]'` 설정을 통해 GPU 부하를 줄이고 고스트 영역을 원천 차단합니다.
+2.  **C++ 코드:** Crop 로직을 빼서 코드를 단순화하고, **Height + Voxel + ROR 필터**만 적용하여 품질을 극대화합니다.
+3.  이 조합이 \*\*성능(GPU/CPU)\*\*과 **품질(Ghost 제거)** 모든 면에서 가장 완벽한 솔루션입니다.
