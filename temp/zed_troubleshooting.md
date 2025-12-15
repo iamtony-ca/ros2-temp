@@ -1132,3 +1132,674 @@ void ZedCamera::publishPointCloud()
 1.  **YAML 설정:** `manual_polygon: '[[0.15, 0.0], [0.85, 0.0], [0.85, 0.7], [0.15, 0.7]]'` 설정을 통해 GPU 부하를 줄이고 고스트 영역을 원천 차단합니다.
 2.  **C++ 코드:** Crop 로직을 빼서 코드를 단순화하고, **Height + Voxel + ROR 필터**만 적용하여 품질을 극대화합니다.
 3.  이 조합이 \*\*성능(GPU/CPU)\*\*과 **품질(Ghost 제거)** 모든 면에서 가장 완벽한 솔루션입니다.
+#########################
+#############################
+###############################
+네, 가능합니다. 최소한의 수정으로 **각 카메라별로 다른 `common_stereo.yaml`이나 `zedx.yaml` 파일을 지정**할 수 있도록 수정해 드리겠습니다.
+
+수정 전략은 다음과 같습니다.
+
+1.  **`zed_camera.launch.py` (단일 실행)**: 외부에서 설정 파일 경로를 직접 주입받을 수 있도록 **새로운 Launch Argument (`config_common_path`, `config_camera_path`)를 추가**합니다.
+2.  **`zed_multi_camera.launch.py` (멀티 실행)**: 카메라 개수만큼 설정 파일 경로를 배열(`[]`)로 입력받아, 각 카메라를 실행할 때 개별 경로를 넘겨주도록 수정합니다.
+
+아래 수정된 코드를 복사해서 사용하시면 됩니다.
+
+-----
+
+### 1\. `zed_camera.launch.py` 수정
+
+기존에는 내부에서 경로를 자동 생성했지만, 이제 외부에서 경로가 들어오면 그 파일을 우선적으로 사용하도록 변경했습니다.
+
+```python
+# [zed-ros2-wrapper/zed_wrapper/launch/zed_camera.launch.py]
+
+import os
+import sys
+
+from ament_index_python.packages import get_package_share_directory
+
+from launch import LaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    OpaqueFunction,
+    LogInfo
+)
+from launch.conditions import IfCondition
+from launch.substitutions import (
+    LaunchConfiguration,
+    Command,
+    TextSubstitution
+)
+from launch_ros.actions import (
+    Node,
+    ComposableNodeContainer,
+    LoadComposableNodes
+)
+from launch_ros.descriptions import ComposableNode
+
+# Enable colored output
+os.environ["RCUTILS_COLORIZED_OUTPUT"] = "1"
+
+# ZED Configurations to be loaded by ZED Node
+default_config_common = os.path.join(
+    get_package_share_directory('zed_wrapper'),
+    'config',
+    'common'
+)
+
+# Object Detection Configuration to be loaded by ZED Node
+default_object_detection_config_path = os.path.join(
+    get_package_share_directory('zed_wrapper'),
+    'config',
+    'object_detection.yaml'
+)
+# Custom Object Detection Configuration to be loaded by ZED Node
+default_custom_object_detection_config_path = os.path.join(
+    get_package_share_directory('zed_wrapper'),
+    'config',
+    'custom_object_detection.yaml'
+)
+
+# URDF/xacro file to be loaded by the Robot State Publisher node
+default_xacro_path = os.path.join(
+    get_package_share_directory('zed_wrapper'),
+    'urdf',
+    'zed_descr.urdf.xacro'
+)
+
+# Function to parse array-like launch arguments
+def parse_array_param(param):
+    cleaned = param.replace('[', '').replace(']', '').replace(' ', '')
+    if not cleaned:
+        return []
+    return cleaned.split(',')
+
+def launch_setup(context, *args, **kwargs):
+    return_array = []
+
+    # Launch configuration variables
+    node_log_type = LaunchConfiguration('node_log_type')
+
+    svo_path = LaunchConfiguration('svo_path')
+    publish_svo_clock = LaunchConfiguration('publish_svo_clock')
+
+    enable_ipc = LaunchConfiguration('enable_ipc')
+    use_sim_time = LaunchConfiguration('use_sim_time')
+    sim_mode = LaunchConfiguration('sim_mode')
+    sim_address = LaunchConfiguration('sim_address')
+    sim_port = LaunchConfiguration('sim_port')
+
+    stream_address = LaunchConfiguration('stream_address')
+    stream_port = LaunchConfiguration('stream_port')
+
+    container_name = LaunchConfiguration('container_name')
+    namespace = LaunchConfiguration('namespace')
+    camera_name = LaunchConfiguration('camera_name')
+    camera_model = LaunchConfiguration('camera_model')
+
+    node_name = LaunchConfiguration('node_name')
+
+    ros_params_override_path = LaunchConfiguration('ros_params_override_path')
+    
+    # [Modified] Custom config path arguments
+    config_common_path = LaunchConfiguration('config_common_path')
+    config_camera_path = LaunchConfiguration('config_camera_path')
+
+    object_detection_config_path = LaunchConfiguration('object_detection_config_path')
+    custom_object_detection_config_path = LaunchConfiguration('custom_object_detection_config_path')
+
+    serial_number = LaunchConfiguration('serial_number')
+    camera_id = LaunchConfiguration('camera_id')
+
+    serial_numbers = LaunchConfiguration('serial_numbers')
+    camera_ids = LaunchConfiguration('camera_ids')
+
+    publish_urdf = LaunchConfiguration('publish_urdf')
+    publish_tf = LaunchConfiguration('publish_tf')
+    publish_map_tf = LaunchConfiguration('publish_map_tf')
+    publish_imu_tf = LaunchConfiguration('publish_imu_tf')
+    xacro_path = LaunchConfiguration('xacro_path')
+
+    enable_gnss = LaunchConfiguration('enable_gnss')
+    gnss_antenna_offset = LaunchConfiguration('gnss_antenna_offset')
+
+    node_log_type_val = node_log_type.perform(context)
+    container_name_val = container_name.perform(context)
+    namespace_val = namespace.perform(context)
+    camera_name_val = camera_name.perform(context)
+    camera_model_val = camera_model.perform(context)
+    node_name_val = node_name.perform(context)
+    enable_gnss_val = enable_gnss.perform(context)
+    gnss_coords = parse_array_param(gnss_antenna_offset.perform(context))
+    serial_numbers_val = serial_numbers.perform(context)
+    camera_ids_val = camera_ids.perform(context)
+
+    # [Modified] Values from LaunchConfiguration
+    config_common_path_val = config_common_path.perform(context)
+    config_camera_path_val = config_camera_path.perform(context)
+
+    if(node_log_type_val == 'both'):
+        node_log_effective = 'both'
+    else:  # 'screen' or 'log'
+        node_log_effective = {
+            'stdout': node_log_type_val,
+            'stderr': node_log_type_val
+            }
+
+    if (camera_name_val == ''):
+        camera_name_val = 'zed'
+
+    if (camera_model_val == 'virtual'):
+        serials = parse_array_param(serial_numbers_val)
+        ids = parse_array_param(camera_ids_val)
+        if(len(serials) != 2 and len(ids) != 2 and svo_path.perform(context) == 'live'):
+            return [
+                LogInfo(msg=TextSubstitution(
+                    text='With a Virtual Stereo Camera setup, one of `serial_numbers` or `camera_ids` launch arguments must contain two valid values.'))
+            ]
+    
+    if(namespace_val == ''):
+        namespace_val = camera_name_val
+    else:
+        node_name_val = camera_name_val
+    
+    # [Modified] Common configuration file Logic
+    # 만약 외부에서 경로를 입력하지 않았다면(빈 문자열), 기존 로직대로 default 경로 생성
+    if config_common_path_val == '':
+        if (camera_model_val == 'zed' or 
+            camera_model_val == 'zedm' or 
+            camera_model_val == 'zed2' or 
+            camera_model_val == 'zed2i' or 
+            camera_model_val == 'zedx' or 
+            camera_model_val == 'zedxm' or
+            camera_model_val == 'zedxhdr' or
+            camera_model_val == 'zedxhdrmini' or
+            camera_model_val == 'zedxhdrmax' or
+            camera_model_val == 'virtual'):
+            config_common_path_val = default_config_common + '_stereo.yaml'
+        else:
+            config_common_path_val = default_config_common + '_mono.yaml'
+
+    info = 'Using common configuration file: ' + config_common_path_val
+    return_array.append(LogInfo(msg=TextSubstitution(text=info)))
+
+    # [Modified] Camera configuration file Logic
+    # 만약 외부에서 경로를 입력하지 않았다면(빈 문자열), 기존 로직대로 default 경로 생성
+    if config_camera_path_val == '':
+        config_camera_path_val = os.path.join(
+            get_package_share_directory('zed_wrapper'),
+            'config',
+            camera_model_val + '.yaml'
+        )
+
+    info = 'Using camera configuration file: ' + config_camera_path_val
+    return_array.append(LogInfo(msg=TextSubstitution(text=info)))
+
+    # ... (Rest is same) ...
+    info = 'Using Object Detection configuration file: ' + object_detection_config_path.perform(context)
+    return_array.append(LogInfo(msg=TextSubstitution(text=info)))
+    
+    info = 'Using Custom Object Detection configuration file: ' + custom_object_detection_config_path.perform(context)
+    return_array.append(LogInfo(msg=TextSubstitution(text=info)))
+
+    ros_params_override_path_val = ros_params_override_path.perform(context)
+    if(ros_params_override_path_val != ''):
+        info = 'Using ROS parameters override file: ' + ros_params_override_path_val
+        return_array.append(LogInfo(msg=TextSubstitution(text=info)))
+
+    xacro_command = []
+    xacro_command.append('xacro')
+    xacro_command.append(' ')
+    xacro_command.append(xacro_path.perform(context))
+    xacro_command.append(' ')
+    xacro_command.append('camera_name:=')
+    xacro_command.append(camera_name_val)
+    xacro_command.append(' ')
+    xacro_command.append('camera_model:=')
+    xacro_command.append(camera_model_val)
+    xacro_command.append(' ')
+    if(enable_gnss_val=='true'):
+        xacro_command.append(' ')
+        xacro_command.append('enable_gnss:=true')
+        xacro_command.append(' ')
+        if(len(gnss_coords)==3):
+            xacro_command.append('gnss_x:=')
+            xacro_command.append(gnss_coords[0])
+            xacro_command.append(' ')
+            xacro_command.append('gnss_y:=')
+            xacro_command.append(gnss_coords[1])
+            xacro_command.append(' ')
+            xacro_command.append('gnss_z:=')
+            xacro_command.append(gnss_coords[2])
+            xacro_command.append(' ')
+
+    rsp_name = camera_name_val + '_state_publisher'
+    rsp_node = Node(
+        condition=IfCondition(publish_urdf),
+        package='robot_state_publisher',
+        namespace=namespace_val,
+        executable='robot_state_publisher',
+        name=rsp_name,
+        output=node_log_effective,
+        parameters=[{
+            'use_sim_time': publish_svo_clock,
+            'robot_description': Command(xacro_command)
+        }],
+        remappings=[('robot_description', camera_name_val+'_description')]
+    )
+    return_array.append(rsp_node)
+
+    if(container_name_val == ''):
+        container_name_val='zed_container'
+        distro = os.environ['ROS_DISTRO']
+        if distro == 'foxy':
+            container_exec='component_container'
+            arguments_val=['--ros-args', '--log-level', 'info']
+        else:
+            container_exec='component_container_isolated'
+            arguments_val=['--use_multi_threaded_executor','--ros-args', '--log-level', 'info']
+        
+        zed_container = ComposableNodeContainer(
+                name=container_name_val,
+                namespace=namespace_val,
+                package='rclcpp_components',
+                executable=container_exec,
+                arguments=arguments_val,
+                output=node_log_effective,
+                composable_node_descriptions=[]
+        )
+        return_array.append(zed_container)
+
+    # ZED Node parameters
+    node_parameters = [
+            # [Modified] Use validated values
+            config_common_path_val,  
+            config_camera_path_val,  
+            object_detection_config_path, 
+            custom_object_detection_config_path 
+    ]
+
+    if( ros_params_override_path_val != ''):
+        node_parameters.append(ros_params_override_path)
+
+    node_parameters.append( 
+            {
+                'use_sim_time': use_sim_time,
+                'simulation.sim_enabled': sim_mode,
+                'simulation.sim_address': sim_address,
+                'simulation.sim_port': sim_port,
+                'stream.stream_address': stream_address,
+                'stream.stream_port': stream_port,
+                'general.camera_name': camera_name_val,
+                'general.camera_model': camera_model_val,
+                'svo.svo_path': svo_path,
+                'svo.publish_svo_clock': publish_svo_clock,
+                'general.serial_number': serial_number,
+                'general.camera_id': camera_id,
+                'pos_tracking.publish_tf': publish_tf,
+                'pos_tracking.publish_map_tf': publish_map_tf,
+                'sensors.publish_imu_tf': publish_imu_tf,
+                'gnss_fusion.gnss_fusion_enabled': enable_gnss,
+                'general.virtual_serial_numbers': serial_numbers_val,
+                'general.virtual_camera_ids': camera_ids_val
+            }
+    )
+
+    if( camera_model_val=='zed' or
+        camera_model_val=='zedm' or
+        camera_model_val=='zed2' or
+        camera_model_val=='zed2i' or
+        camera_model_val=='zedx' or
+        camera_model_val=='zedxm' or
+        camera_model_val == 'zedxhdr' or
+        camera_model_val == 'zedxhdrmini' or
+        camera_model_val == 'zedxhdrmax' or
+        camera_model_val=='virtual'):
+        zed_wrapper_component = ComposableNode(
+            package='zed_components',
+            namespace=namespace_val,
+            plugin='stereolabs::ZedCamera',
+            name=node_name_val,
+            parameters=node_parameters,
+            extra_arguments=[{'use_intra_process_comms': enable_ipc}]
+        )
+    else: 
+        zed_wrapper_component = ComposableNode(
+            package='zed_components',
+            namespace=namespace_val,
+            plugin='stereolabs::ZedCameraOne',
+            name=node_name_val,
+            parameters=node_parameters,
+            extra_arguments=[{'use_intra_process_comms': enable_ipc}]
+        )
+    
+    full_container_name = '/' + namespace_val + '/' + container_name_val
+    info = 'Loading ZED node `' + node_name_val + '` in container `' + full_container_name + '`'
+    return_array.append(LogInfo(msg=TextSubstitution(text=info)))
+    
+    load_composable_node = LoadComposableNodes(
+        target_container=full_container_name,
+        composable_node_descriptions=[zed_wrapper_component]
+    )
+    return_array.append(load_composable_node)
+
+    return return_array
+
+def generate_launch_description():
+    return LaunchDescription(
+        [
+            # ... (Existing Arguments) ...
+            DeclareLaunchArgument('node_log_type', default_value=TextSubstitution(text='both'), description='...'),
+            DeclareLaunchArgument('camera_name', default_value=TextSubstitution(text='zed'), description='...'),
+            DeclareLaunchArgument('camera_model', description='...'),
+            DeclareLaunchArgument('container_name', default_value='', description='...'),
+            DeclareLaunchArgument('namespace', default_value='', description='...'),
+            DeclareLaunchArgument('node_name', default_value='zed_node', description='...'),
+            DeclareLaunchArgument('ros_params_override_path', default_value='', description='...'),
+            DeclareLaunchArgument('object_detection_config_path', default_value=TextSubstitution(text=default_object_detection_config_path), description='...'),
+            DeclareLaunchArgument('custom_object_detection_config_path', default_value=TextSubstitution(text=default_custom_object_detection_config_path), description='...'),
+
+            # [Modified] Add New Arguments for custom configuration paths
+            DeclareLaunchArgument(
+                'config_common_path', 
+                default_value='', 
+                description='Path to the common configuration file. If empty, default is used.'),
+            DeclareLaunchArgument(
+                'config_camera_path', 
+                default_value='', 
+                description='Path to the camera configuration file. If empty, default is used.'),
+
+            DeclareLaunchArgument('serial_number', default_value='0', description='...'),
+            DeclareLaunchArgument('serial_numbers', default_value='[]', description='...'),
+            DeclareLaunchArgument('camera_id', default_value='-1', description='...'),
+            DeclareLaunchArgument('camera_ids', default_value='[]', description='...'),
+            DeclareLaunchArgument('publish_urdf', default_value='true', description='...'),
+            DeclareLaunchArgument('publish_tf', default_value='true', description='...'),
+            DeclareLaunchArgument('publish_map_tf', default_value='true', description='...'),
+            DeclareLaunchArgument('publish_imu_tf', default_value='false', description='...'),
+            DeclareLaunchArgument('xacro_path', default_value=TextSubstitution(text=default_xacro_path), description='...'),
+            DeclareLaunchArgument('svo_path', default_value=TextSubstitution(text='live'), description='...'),
+            DeclareLaunchArgument('publish_svo_clock', default_value='false', description='...'),
+            DeclareLaunchArgument('enable_gnss', default_value='false', description='...'),
+            DeclareLaunchArgument('gnss_antenna_offset', default_value='[]', description='...'),
+            DeclareLaunchArgument('enable_ipc', default_value='true', description='...'),
+            DeclareLaunchArgument('use_sim_time', default_value='false', description='...'),
+            DeclareLaunchArgument('sim_mode', default_value='false', description='...'),
+            DeclareLaunchArgument('sim_address', default_value='127.0.0.1', description='...'),
+            DeclareLaunchArgument('sim_port', default_value='30000', description='...'),
+            DeclareLaunchArgument('stream_address', default_value='', description='...'),
+            DeclareLaunchArgument('stream_port', default_value='30000', description='...'),
+            OpaqueFunction(function=launch_setup)
+        ]
+    )
+```
+
+-----
+
+### 2\. `zed_multi_camera.launch.py` 수정
+
+경로 배열(`cam_config_common_paths`, `cam_config_camera_paths`)을 입력받아서 각 카메라 노드를 실행할 때 해당 인덱스의 파일을 전달하도록 수정했습니다.
+
+```python
+# [zed-ros2-examples/tutorials/zed_multi_camera/launch/zed_multi_camera.launch.py]
+
+import os
+
+from ament_index_python.packages import get_package_share_directory
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+
+from launch import LaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    OpaqueFunction,
+    IncludeLaunchDescription,
+    LogInfo,
+    TimerAction
+)
+from launch.substitutions import (
+    LaunchConfiguration,
+    Command,
+    TextSubstitution
+)
+from launch_ros.actions import (
+    Node,
+    ComposableNodeContainer
+)
+
+def parse_array_param(param):
+    str = param.replace('[', '')
+    str = str.replace(']', '')
+    str = str.replace(' ', '')
+    arr = str.split(',')
+    # 빈 문자열 처리
+    if len(arr) == 1 and arr[0] == '':
+        return []
+    return arr
+
+def launch_setup(context, *args, **kwargs):
+
+    # List of actions to be launched
+    actions = []
+
+    namespace_val = 'zed_multi'
+    
+    multi_zed_xacro_path = os.path.join(
+    get_package_share_directory('zed_multi_camera'),
+    'urdf',
+    'zed_multi.urdf.xacro')
+
+    names = LaunchConfiguration('cam_names')
+    models = LaunchConfiguration('cam_models')
+    serials = LaunchConfiguration('cam_serials')
+    ids = LaunchConfiguration('cam_ids')
+
+    # [Modified] Config Path Arrays
+    config_common_paths = LaunchConfiguration('cam_config_common_paths')
+    config_camera_paths = LaunchConfiguration('cam_config_camera_paths')
+
+    disable_tf = LaunchConfiguration('disable_tf')
+
+    names_arr = parse_array_param(names.perform(context))
+    models_arr = parse_array_param(models.perform(context))
+    serials_arr = parse_array_param(serials.perform(context))
+    ids_arr = parse_array_param(ids.perform(context))
+
+    # [Modified] Parse Config Paths
+    config_common_paths_arr = parse_array_param(config_common_paths.perform(context))
+    config_camera_paths_arr = parse_array_param(config_camera_paths.perform(context))
+
+    disable_tf_val = disable_tf.perform(context)
+
+    num_cams = len(names_arr)
+
+    if (num_cams != len(models_arr)):
+        return [
+            LogInfo(msg=TextSubstitution(
+                text='The `cam_models` array argument must match the size of the `cam_names` array argument.'))
+        ]
+
+    # ... (기존 검사 로직 유지)
+
+    container_name = 'zed_multi_container'
+    distro = os.environ['ROS_DISTRO']
+    if distro == 'foxy':
+        container_exec='component_container'
+    else:
+        container_exec='component_container_isolated'
+    
+    info = '* Starting Composable node container: /' + namespace_val + '/' + container_name
+    actions.append(LogInfo(msg=TextSubstitution(text=info)))
+
+    zed_container = ComposableNodeContainer(
+        name=container_name,
+        namespace=namespace_val,
+        package='rclcpp_components',
+        executable=container_exec,
+        arguments=['--ros-args', '--log-level', 'info'],
+        output='screen',
+    )
+    actions.append(zed_container)
+
+    # Set the first camera idx
+    cam_idx = 0
+    launch_delay_step = 4.0 # 앞서 논의한 Delay 적용
+
+    for name in names_arr:
+        model = models_arr[cam_idx]
+        if len(serials_arr) == num_cams:
+            serial = serials_arr[cam_idx]
+        else:
+            serial = '0'
+
+        if len(ids_arr) == num_cams:
+            id = ids_arr[cam_idx]
+        else:
+            id = '-1'
+        
+        # [Modified] 현재 Index에 맞는 Config Path 선택
+        # 배열이 제공되지 않았거나 길이가 부족하면 빈 문자열('') 전달 -> Default 사용
+        current_config_common = ''
+        if cam_idx < len(config_common_paths_arr):
+            current_config_common = config_common_paths_arr[cam_idx]
+
+        current_config_camera = ''
+        if cam_idx < len(config_camera_paths_arr):
+            current_config_camera = config_camera_paths_arr[cam_idx]
+
+        pose = '['
+
+        info_text = '* Queueing ZED ROS2 node for camera ' + name + ' (' + model
+        if(serial != '0'):
+            info_text += ', serial: ' + serial
+        elif( id!= '-1'):
+            info_text += ', id: ' + id
+        info_text += ') with delay: ' + str(cam_idx * launch_delay_step) + 's'
+
+        # Only the first camera send odom and map TF
+        publish_tf = 'false'
+        if (cam_idx == 0):
+            if (disable_tf_val == 'False' or disable_tf_val == 'false'):
+                publish_tf = 'true'
+
+        node_name = 'zed_node_' + str(cam_idx)
+
+        # Add the node
+        # ZED Wrapper launch file
+        zed_wrapper_launch = IncludeLaunchDescription(
+            launch_description_source=PythonLaunchDescriptionSource([
+                get_package_share_directory('zed_wrapper'),
+                '/launch/zed_camera.launch.py'
+            ]),
+            launch_arguments={
+                'container_name': container_name,
+                'camera_name': name,
+                'camera_model': model,
+                'serial_number': serial,
+                'camera_id': id,
+                'publish_tf': publish_tf,
+                'publish_map_tf': publish_tf,
+                'namespace': namespace_val,
+                # [Modified] Pass custom config paths
+                'config_common_path': current_config_common,
+                'config_camera_path': current_config_camera
+            }.items()
+        )
+        
+        # [Modified] TimerAction 적용 (순차 실행)
+        delay_action = TimerAction(
+            period=float(cam_idx) * launch_delay_step,
+            actions=[
+                LogInfo(msg=TextSubstitution(text=info_text)),
+                zed_wrapper_launch
+            ]
+        )
+        actions.append(delay_action)
+
+        cam_idx += 1
+
+    # Robot State Publisher node
+    # ... (이하 동일) ...
+    xacro_command = []
+    xacro_command.append('xacro')
+    xacro_command.append(' ')
+    xacro_command.append(multi_zed_xacro_path)
+    xacro_command.append(' ')
+    cam_idx = 0
+    for name in names_arr:
+        xacro_command.append('camera_name_'+str(cam_idx)+':=')
+        xacro_command.append(name)
+        xacro_command.append(' ')
+        cam_idx+=1
+
+    rsp_name = 'state_publisher'
+    info = '* Starting robot_state_publisher node to link all the frames: ' + rsp_name
+    actions.append(LogInfo(msg=TextSubstitution(text=info)))
+    multi_rsp_node = Node(
+        package='robot_state_publisher',
+        namespace=namespace_val,
+        executable='robot_state_publisher',
+        name=rsp_name,
+        output='screen',
+        parameters=[{
+            'robot_description': Command(xacro_command).perform(context)
+        }]
+    )
+
+    actions.append(multi_rsp_node)
+
+    return actions
+
+
+def generate_launch_description():
+    return LaunchDescription(
+        [
+            DeclareLaunchArgument(
+                'cam_names',
+                description='An array containing the name of the cameras, e.g. [zed_front,zed_back]'),
+            DeclareLaunchArgument(
+                'cam_models',
+                description='An array containing the model of the cameras, e.g. [zed2i,zed2]'),
+            DeclareLaunchArgument(
+                'cam_serials',
+                default_value=[],
+                description='An array containing the serial number of the cameras, e.g. [35199186,23154724]'),
+            DeclareLaunchArgument(
+                'cam_ids',
+                default_value=[],
+                description='An array containing the ID number of the cameras, e.g. [0,1]'),
+            
+            # [Modified] Add Config Path Arrays Arguments
+            DeclareLaunchArgument(
+                'cam_config_common_paths',
+                default_value='[]',
+                description='An array of paths to common configuration files (e.g. [/path/to/c1_common.yaml, /path/to/c2_common.yaml]). Keep empty to use defaults.'),
+            DeclareLaunchArgument(
+                'cam_config_camera_paths',
+                default_value='[]',
+                description='An array of paths to camera-specific configuration files (e.g. [/path/to/c1_zedx.yaml, ...]). Keep empty to use defaults.'),
+
+            DeclareLaunchArgument(
+                'disable_tf',
+                default_value='False',
+                description='If `True` disable TF broadcasting for all the cameras in order to fuse visual odometry information externally.'),
+            OpaqueFunction(function=launch_setup)
+        ]
+    )
+```
+
+-----
+
+### 사용 방법
+
+이제 `ros2 launch` 명령어를 실행할 때, **`cam_config_common_paths`** 옵션을 통해 각 카메라에 적용할 설정 파일 경로를 배열 형태로 넣어주시면 됩니다.
+
+**예시:**
+
+```bash
+ros2 launch zed_multi_camera zed_multi_camera.launch.py \
+    cam_names:='[zed_front,zed_back,zed_left,zed_right]' \
+    cam_models:='[zedx,zedx,zedx,zedx]' \
+    cam_config_common_paths:='[/home/user/config/common_front.yaml,/home/user/config/common_back.yaml,/home/user/config/common_left.yaml,/home/user/config/common_right.yaml]'
+```
+
+이렇게 하면 `zed_front`는 `common_front.yaml`의 설정을 따르고, `zed_back`은 `common_back.yaml` 설정을 따르게 됩니다. (ROI, Exposure, Gain 등을 개별 설정 가능)
