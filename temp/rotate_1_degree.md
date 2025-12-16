@@ -193,3 +193,195 @@ if __name__ == '__main__':
 
 
 이 코드를 사용하면 AMCL 상태와 무관하게 **SLAM이 추정한 현재 로봇의 정확한 `map` 좌표**를 기준으로 테스트가 진행됩니다. `nav2_params.yaml`의 `yaw_goal_tolerance` 설정은 여전히 중요하니 꼭 체크해 주세요!
+######################  
+############################  
+###############################  
+네, 요청하신 두 가지 사항에 맞춰 답변 드립니다.
+
+###1. 도착 후 헤딩 값 출력 (기존 코드 수정)기존 코드의 `main()` 함수 내부, 반복 루프 부분만 수정하면 됩니다. `TaskResult.SUCCEEDED` 이후에 `tf_reader`를 통해 현재 값을 다시 읽어와 출력하는 로직을 추가했습니다.
+
+**수정된 `main` 함수 루프 부분:**
+
+```python
+    # ... (이전 코드와 동일) ...
+
+    # 6. 반복 루프 시작
+    for i in range(1, REPEAT_COUNT + 1):
+        print(f"\n================ [ 반복 {i} / {REPEAT_COUNT} ] ================")
+        
+        # ---------------- Goal 1 ----------------
+        goal_pose_1 = create_goal_pose(navigator, current_x, current_y, yaw_1)
+        print(f"1. 명령 전송: Yaw {yaw_1:.2f}도")
+        navigator.goToPose(goal_pose_1)
+
+        wait_for_task_completion(navigator)
+
+        result = navigator.getResult()
+        if result == TaskResult.SUCCEEDED:
+            # [추가됨] 도착 후 실제 위치/헤딩 업데이트 및 출력
+            rclpy.spin_once(tf_reader, timeout_sec=0.1) 
+            _, _, final_yaw = tf_reader.get_current_pose()
+            
+            print(">> Goal 1 도착 성공.")
+            if final_yaw is not None:
+                error = final_yaw - yaw_1
+                print(f"   [결과] 실제 헤딩: {final_yaw:.4f}도 (목표 오차: {error:.4f}도)")
+        else:
+            print(f">> Goal 1 실패/취소됨. (상태: {result})")
+            break
+        
+        print("   (다음 명령 전 2초 대기...)")
+        time.sleep(2.0)
+
+        # ---------------- Goal 2 ----------------
+        goal_pose_2 = create_goal_pose(navigator, current_x, current_y, yaw_2)
+        print(f"2. 명령 전송: Yaw {yaw_2:.2f}도 (+1.0 deg)")
+        navigator.goToPose(goal_pose_2)
+
+        wait_for_task_completion(navigator)
+
+        result = navigator.getResult()
+        if result == TaskResult.SUCCEEDED:
+            # [추가됨] 도착 후 실제 위치/헤딩 업데이트 및 출력
+            rclpy.spin_once(tf_reader, timeout_sec=0.1)
+            _, _, final_yaw = tf_reader.get_current_pose()
+
+            print(">> Goal 2 도착 성공.")
+            if final_yaw is not None:
+                error = final_yaw - yaw_2
+                print(f"   [결과] 실제 헤딩: {final_yaw:.4f}도 (목표 오차: {error:.4f}도)")
+        else:
+            print(f">> Goal 2 실패/취소됨. (상태: {result})")
+            break
+        
+        print("   (다음 명령 전 2초 대기...)")
+        time.sleep(2.0)
+
+    # ... (이하 동일)
+
+```
+
+---
+
+###2. Localization 안정성 테스트 (New Script)로봇이 정지해 있을 때 `map` -> `base_link` 간의 TF를 지속적으로 모니터링하여 **현재값, 평균, 표준편차**를 실시간으로 출력하는 새로운 스크립트(`check_localization_stability.py`)입니다.
+
+* **기능**: 0.5초(설정 가능)마다 TF를 조회하여 통계를 누적 계산합니다.
+* **목적**: SLAM이나 Localization 노드가 정지 상태에서 얼마나 튀는지(Jitter) 수치로 확인합니다.
+* **참고**: 표준편차(Std Dev)가 클수록 Localization이 불안정하다는 뜻입니다.
+
+```python
+#!/usr/bin/env python3
+import math
+import time
+import statistics
+import rclpy
+from rclpy.node import Node
+from rclpy.duration import Duration
+from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
+
+"""
+Description:
+    로봇이 정지해 있는 동안 /tf (map -> base_link)를 지속적으로 모니터링하여
+    X, Y, Yaw에 대한 실시간 현재값, 평균, 표준편차(Jitter)를 계산해 출력합니다.
+"""
+
+def quaternion_to_yaw(qx, qy, qz, qw):
+    # yaw (z-axis rotation)
+    siny_cosp = 2 * (qw * qz + qx * qy)
+    cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
+    yaw_rad = math.atan2(siny_cosp, cosy_cosp)
+    return math.degrees(yaw_rad)
+
+class LocalizationMonitor(Node):
+    def __init__(self):
+        super().__init__('localization_monitor')
+        
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        
+        # 데이터 저장소
+        self.history_x = []
+        self.history_y = []
+        self.history_yaw = []
+        
+        # 0.5초마다 실행 (주기 변경 가능)
+        self.timer = self.create_timer(0.5, self.timer_callback)
+        self.start_time = time.time()
+        
+        print(f"{'Time(s)':<8} | {'X (curr/avg/std)':<28} | {'Y (curr/avg/std)':<28} | {'Yaw (curr/avg/std)':<28}")
+        print("-" * 100)
+
+    def get_tf(self):
+        try:
+            now = rclpy.time.Time()
+            # map -> base_link 조회
+            trans = self.tf_buffer.lookup_transform(
+                'map', 'base_link', now, timeout=Duration(seconds=0.1))
+            
+            x = trans.transform.translation.x
+            y = trans.transform.translation.y
+            
+            qx = trans.transform.rotation.x
+            qy = trans.transform.rotation.y
+            qz = trans.transform.rotation.z
+            qw = trans.transform.rotation.w
+            
+            yaw = quaternion_to_yaw(qx, qy, qz, qw)
+            return x, y, yaw
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            return None, None, None
+
+    def timer_callback(self):
+        x, y, yaw = self.get_tf()
+        
+        if x is None:
+            return # TF 실패 시 패스
+
+        # 데이터 저장
+        self.history_x.append(x)
+        self.history_y.append(y)
+        self.history_yaw.append(yaw)
+        
+        # 통계 계산 (데이터가 2개 이상일 때부터 표준편차 계산)
+        count = len(self.history_x)
+        if count < 2:
+            return
+
+        avg_x = statistics.mean(self.history_x)
+        std_x = statistics.stdev(self.history_x)
+        
+        avg_y = statistics.mean(self.history_y)
+        std_y = statistics.stdev(self.history_y)
+        
+        avg_yaw = statistics.mean(self.history_yaw)
+        std_yaw = statistics.stdev(self.history_yaw)
+        
+        elapsed = time.time() - self.start_time
+        
+        # 출력 포맷팅
+        # 예: 10.5 | 1.000 / 1.001 / 0.005 ...
+        print(f"{elapsed:6.1f}   | "
+              f"{x:.3f} / {avg_x:.3f} / {std_x:.4f}   | "
+              f"{y:.3f} / {avg_y:.3f} / {std_y:.4f}   | "
+              f"{yaw:.3f} / {avg_yaw:.3f} / {std_yaw:.4f}")
+
+def main():
+    rclpy.init()
+    monitor = LocalizationMonitor()
+    
+    try:
+        rclpy.spin(monitor)
+    except KeyboardInterrupt:
+        print("\n모니터링 종료.")
+    finally:
+        monitor.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+```
+
+###팁* 이 코드를 실행하고 로봇을 가만히 두세요.
+* **Std (표준편차)** 값이 `0.00xx` 수준으로 유지되면 매우 안정적입니다.
+* 만약 로봇이 가만히 있는데 Std 값이 계속 증가하거나 튀면, SLAM의 스캔 매칭이 불안정하거나 IMU 드리프트가 보정되지 않고 있다는 신호입니다.
