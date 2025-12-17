@@ -2412,3 +2412,171 @@ def generate_launch_description():
           * `zed_back` -\> `common_stereo_zed_back.yaml`, `zedx_zed_back.yaml` 로딩
 
 이렇게 하면 절대 경로 입력 없이 깔끔하게 관리가 가능합니다\!
+#########################  
+################################  
+################################  
+로그의 핵심은 **(1) CAM3에서 Argus 프레임 타임아웃 발생 → (2) ZED SDK가 “CAMERA REBOOTING”으로 복구 시도 → (3) Argus/캡처카드(공유 리소스) 쪽이 불안정해지면서 나머지 카메라까지 연쇄적으로 동일 증상 → 노드 종료** 흐름일 가능성이 큽니다.
+
+## 왜 “CAM3 timeout”이 4대 전체 다운으로 번질 수 있나
+
+* ZED X(+ZED Link Quad)는 내부적으로 Jetson의 **NvArgus(Argus) 카메라 스택**을 타고 동작합니다. Argus 쪽에서 타임아웃이 나면 “복구(recovering)”를 시도하지만, **GMSL 디시리얼라이저/VI-CSI 파이프라인/Argus 데몬은 여러 카메라가 공유**하는 부분이 있어서 **한 채널(CAM3) 문제/리셋이 전체 세션을 흔들어** 다른 카메라도 같이 “CAMERA REBOOTING”으로 넘어갈 수 있습니다.
+* 실제로 Stereolabs 쪽에서도 **일정 시간 사용 후 Argus가 불안정해지고, grab 실패→reboot 시도 이후 애플리케이션이 죽어서 재시작이 필요**한 유형의 케이스가 보고돼 있습니다. ([Stereolabs Forums][1])
+* NVIDIA 포럼에서도 **GMSL + Argus 사용 시 “시간이 좀 지난 뒤” 타임아웃이 나고, 이후 에러 상태가 “복구 불가(unrecoverable)”로 고착**되는 케이스가 보고됩니다. ([NVIDIA Developer Forums][2])
+
+## 가장 흔한 원인 Top 5 (우선순위)
+
+1. **물리 링크 불안정(케이블/커넥터/리본 케이블 접촉)**
+
+   * Stereolabs도 ZED Link 캡처카드의 **리본 케이블 체결 상태**를 1순위로 보라고 가이드합니다. ([Stereolabs Forums][3])
+2. **특정 포트/특정 카메라/특정 케이블 불량**
+
+   * “CAM3에서만 먼저 터진다”면 특히 의심. (그 다음 전체가 연쇄 다운)
+3. **과부하(해상도/프레임/Depth 모드/추가 기능)로 인한 파이프라인 타임아웃**
+
+   * Stereolabs 포럼에서도 **해상도 낮추기**를 바로 권장합니다. ([Stereolabs Forums][3])
+4. **JetPack 6.x Argus 계열 이슈(장시간/멀티카메라에서 타임아웃→데몬/세션 불안정)**
+
+   * NVIDIA 쪽 멀티캠 이슈에서 타임아웃 관련 워크어라운드(무한 타임아웃 모드) 언급도 나옵니다. ([NVIDIA Developer Forums][4])
+5. **전원/발열/스로틀링**
+
+   * 1day+ 구간에서 터지는 패턴이면 “열/전원/리소스 누수”도 강하게 의심됩니다.
+
+## 바로 할 수 있는 “원인 분리” 체크 (가장 효율 좋은 순서)
+
+### A) “CAM3”가 **항상 같은 물리 카메라**인지, **항상 같은 포트**인지 분리
+
+* 카메라 4대를 **서로 포트 교차**해 연결해서 24시간 내 재현을 봅니다.
+
+  * 문제가 **포트를 따라가면** → 캡처카드 채널/커넥터/리본/보드 쪽
+  * 문제가 **카메라를 따라가면** → 해당 카메라/해당 GMSL 케이블 불량 가능성 큼
+
+### B) 부하를 확 낮춰서 “과부하/대역폭/Argus 타임아웃”인지 확인
+
+* `zed_wrapper/config/zedx.yaml`에서
+
+  * `grab_resolution`: `HD1200` → `HD1080` 또는 `SVGA`
+  * `grab_frame_rate`: 30 → 15 (테스트용)
+* Depth도 가능하면 한 단계 가볍게(NEURAL LIGHT가 이미 가벼운 편이지만, 테스트 목적이면 depth/pointcloud/odometry/objects 등을 최대한 끄고 “이미지 스트림만”으로 24h 테스트 권장)
+
+### C) 실패 직후에 아래 로그를 꼭 확보 (원인이 Argus/VI/CSI인지 바로 갈립니다)
+
+* Argus 데몬:
+
+  * `sudo journalctl -u nvargus-daemon -n 300 --no-pager`
+* 커널(카메라/CSI/VI/MAX96712 관련):
+
+  * `dmesg -T | egrep -i "argus|nvargus|nvcsi|vi|camrtc|max967|max929|timeout|corr|error" | tail -n 200`
+
+## “재발 시 즉시 복구”를 위한 현실적인 워크어라운드
+
+장시간 안정성 테스트 목적이면, **완전 무정지보다 ‘자동 복구’까지 포함한 안정성**을 보는 게 실무적으로 유효합니다.
+
+1. Argus 데몬 재시작(가장 흔한 복구 루트)
+
+* `sudo systemctl restart nvargus-daemon` (또는 배포판에 따라 `sudo service nvargus-daemon restart`)
+* 그 다음 zed 관련 데몬/노드 재기동
+
+2. JetPack 6.x에서 타임아웃 완화용 “infinite timeout” 모드(실험적)
+
+* NVIDIA 포럼에서 아래 형태로 **무한 타임아웃 모드로 nvargus-daemon을 띄우는 방법**이 언급됩니다. ([NVIDIA Developer Forums][4])
+
+  * `sudo service nvargus-daemon stop`
+  * `sudo enableCamInfiniteTimeout=1 nvargus-daemon`
+* 다만, 스레드 맥락상 **첨부된 라이브러리/패치와 함께 테스트**하는 흐름이라, “그냥 옵션만으로 100% 해결”을 보장하긴 어렵습니다(하지만 방향성은 동일: *Argus timeout이 시스템 전체를 무너뜨리지 않게*).
+
+## 결론적으로 “뭐가 문제인가?”
+
+현상 자체는 **ZED SDK/ROS2 wrapper가 죽은 게 1차가 아니라**, **Jetson Argus(또는 GMSL 링크/캡처카드 채널)에서 프레임 타임아웃이 먼저 발생**했고, 그 여파로 **카메라 리부팅/세션 붕괴가 연쇄 발생**한 케이스로 보는 게 가장 타당합니다. (Stereolabs/NVIDIA 양쪽에서 비슷한 “장시간 후 Argus timeout → 복구 어려움” 패턴이 보고됨) ([Stereolabs Forums][1])
+
+원하면, 네 환경 기준으로 **(1) zedx.yaml에서 안정성 테스트용 저부하 프리셋**, **(2) failure 감지 → nvargus-daemon/zed 노드 자동 재기동하는 systemd watchdog 스크립트**까지 바로 만들어줄게.
+
+[1]: https://community.stereolabs.com/t/zedx-argus-socket-failing-after-period-of-use-and-unable-to-recover/7004 "Zedx argus socket failing after period of use and unable to recover - Stereolabs Forums"
+[2]: https://forums.developer.nvidia.com/t/argus-timeout-when-capturing-frames-followed-by-unrecoverable-state/344997 "Argus timeout when capturing frames followed by unrecoverable state - Jetson Orin Nano - NVIDIA Developer Forums"
+[3]: https://community.stereolabs.com/t/zed-x-connection-argus-issues/10348 "ZED X Connection/Argus issues - Stereolabs Forums"
+[4]: https://forums.developer.nvidia.com/t/nvarguscamerasrc-failed-for-8-cameras-simultaneously/337618 "Nvarguscamerasrc failed for 8 cameras simultaneously - Jetson AGX Orin - NVIDIA Developer Forums"
+#########################  
+##########################  
+#############################  
+전문가 관점에서 분석해 드리겠습니다. **JetPack 6.2.1 (L4T 36.4.7)** 환경에서 **ZED X 4대**를 동시에 구동하다가 약 42시간(1일 18시간) 시점에 **동시 타임아웃**이 발생한 현상은, 개별 카메라의 불량보다는 **시스템 리소스, 발열, 또는 PCIe 대역폭/전력 관리**와 관련된 중앙 병목(Central Bottleneck) 문제일 가능성이 매우 높습니다.
+
+로그 내용(`[ZED-Argus]{produceDualV4} CAM 3 has timeout`)은 Orin의 ISP(Image Signal Processor)가 GMSL2 Capture Card로부터 프레임 데이터를 제때 받지 못했음을 의미합니다.
+
+다음은 가장 유력한 원인들과 해결책을 순서대로 정리한 것입니다.
+
+---
+
+### 1. 원인 분석: GMSL2 캡처 카드 및 PCIe 과열 (가장 유력)
+
+ZED X 4대를 구동할 때, 카메라 자체의 발열도 있지만 데이터를 모아서 Orin으로 보내주는 **Quad GMSL2 Capture Card의 발열**이 상당합니다.
+
+* **증상:** 42시간 동안 열이 서서히 축적되다가 캡처 카드의 Deserializer 칩셋(주로 Maxim 칩)이 과열로 인해 일시적인 'Thermal Shutdown' 또는 클럭 저하를 일으켰을 가능성이 큽니다.
+* **이유:** 4개의 카메라가 동시에 죽었다는 점은 개별 케이블 문제가 아니라 이들이 연결된 **허브(PCIe 카드)**가 멈췄다는 강력한 증거입니다.
+* **해결책:**
+* Capture Card에 **별도의 쿨링 팬**이 장착되어 있는지 확인하십시오. (Orin 케이스 내부 공기 순환만으로는 부족할 수 있습니다.)
+* 테스트 중 `jtop`이나 센서를 통해 온도를 모니터링해야 합니다.
+
+
+
+### 2. PCIe ASPM (Active State Power Management) 문제
+
+Jetson 환경에서 장시간 구동 시 가장 흔한 불안정 원인 중 하나입니다. 시스템이 절전 모드를 위해 PCIe 링크 전력을 줄이려고 시도하다가, 다시 활성화될 때 타이밍을 놓쳐 연결이 끊기는 현상입니다.
+
+* **증상:** 랜덤한 시간(주로 장시간 유휴 혹은 부하 변동 시)에 장치 연결이 끊김.
+* **해결책:** PCIe 절전 모드를 강제로 꺼야 합니다.
+1. 터미널에서 다음 스크립트를 실행하여 ASPM을 비활성화합니다.
+```bash
+sudo /usr/bin/jetson_clocks
+
+```
+
+
+2. 영구적으로 적용하기 위해 부트로더 설정을 확인하거나, 서비스로 등록하여 부팅 시마다 `performance` 모드가 되도록 설정하십시오.
+3. `/boot/extlinux/extlinux.conf` 파일의 `APPEND` 라인 끝에 `pcie_aspm=off`를 추가하고 재부팅해 보십시오.
+
+
+
+### 3. NvArgus Daemon 메모리 누수 또는 불안정
+
+JetPack 6.x (L4T 36.x) 대의 Argus 데몬은 이전 버전보다 개선되었으나, 4개의 4K/QHD급 스트림을 장시간 처리할 때 **buffer pool** 문제가 발생할 수 있습니다.
+
+* **증상:** `Argus` 관련 타임아웃 로그가 발생하며, 재부팅 전까지는 카메라가 다시 잡히지 않거나 `nvargus-daemon`을 재시작해야 함.
+* **진단:**
+* 문제가 발생했을 때 `sudo systemctl status nvargus-daemon`을 확인해 보셨나요?
+
+
+* **해결책:**
+* ZED SDK 5.1.1은 최신이지만, 혹시 모를 데몬 충돌을 방지하기 위해 테스트 스크립트에 **주기적인 리셋 로직**을 넣기보다, 시스템 레벨에서 `nvargus-daemon`의 리소스 사용량(메모리)이 시간이 지남에 따라 선형적으로 증가하는지 확인해야 합니다.
+
+
+
+### 4. 전원 공급 부족 (Voltage Drop)
+
+Orin AGX Dev Kit의 전원 어댑터는 강력하지만, USB나 PCIe를 통해 공급되는 전력이 순간적으로 출렁일 경우(Transient voltage drop), GMSL2 링크가 끊어질 수 있습니다.
+
+* **상황:** 4대의 카메라가 동시에 Depth 연산을 수행하며 GPU/CPU 부하가 피크를 칠 때 전압 강하 발생.
+* **해결책:**
+* 전원 모드가 **MAXN**으로 설정되어 있는지 확인하십시오 (`sudo nvpmodel -m 0`).
+* ZED X 4대는 GMSL2 카드를 통해 외부 전원을 별도로 공급받나요, 아니면 PCIe 슬롯 파워만 사용하나요? 4대라면 **Capture Card에 별도 6-pin/SATA 전원 공급**이 필수적입니다. PCIe 슬롯 전력만으로는 4대 구동 시 불안정할 수 있습니다.
+
+
+
+### 5. ZED SDK/ROS 2 Wrapper 설정 (Data Bandwidth)
+
+ZED X 4대에서 들어오는 데이터 양이 PCIe 대역폭이나 Orin의 메모리 대역폭 한계치에 근접했을 수 있습니다.
+
+* **체크:** `grab_frame_rate`나 `pub_frame_rate`가 너무 높게 설정되어 있지 않은지 확인하십시오. (예: 4대 모두 60fps 등)
+* **제안:** 안정성 테스트를 위해 FPS를 15~30 정도로 낮추고 해상도를 조절하여 5일 테스트를 통과하는지 먼저 확인하십시오.
+
+---
+
+### 추천하는 조치 순서
+
+가장 의심스러운 부분부터 검증하기 위해 다음 단계를 제안합니다.
+
+1. **하드웨어 쿨링 보강:** Capture Card에 직접 바람을 불어주는 팬을 설치하고 다시 테스트를 시작하십시오.
+2. **PCIe ASPM 비활성화:** `pcie_aspm=off` 커널 파라미터 적용.
+3. **Argus 데몬 재시작 스크립트 준비:** 만약 소프트웨어적 버그라면, `CAMERA REBOOTING` 에러 감지 시 ZED 노드만 죽는 게 아니라 `sudo systemctl restart nvargus-daemon`을 수행하도록 래퍼 스크립트를 작성하는 것이 현장에서는 유효한 회피책입니다.
+
+**다음 단계:**
+현재 4대의 카메라 설정(해상도, FPS, Depth Mode)과 사용 중인 GMSL2 캡처 카드의 제조사(Stereolabs 오리지널인지, Connect Tech 등 타사 제품인지)를 알려주시면, 해당 하드웨어에 맞는 더 구체적인 PCIe 설정법을 알려드릴 수 있습니다.
+  
