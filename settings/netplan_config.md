@@ -256,3 +256,76 @@ ip addr show enp2s0  # 본인 인터페이스 이름
 #####################  
 #######################  
 ########################  
+Jetson (JetPack) 환경은 Ubuntu 기반이지만, 데스크탑 환경의 특성상 **Netplan 대신 `NetworkManager`를 직접 사용하여 네트워크를 관리**하는 경우가 많습니다. 그래서 `/etc/netplan` 폴더가 비어있거나 없을 수 있습니다.
+
+이 경우, 억지로 Netplan을 설치하기보다는 Jetson의 기본 관리 도구인 **`nmcli` (Network Manager Command Line Interface)** 명령어를 사용하는 것이 가장 안전하고 영구적입니다.
+
+아래 절차대로 터미널에 입력하시면 됩니다.
+
+### 1단계: 네트워크 연결 이름 확인
+
+먼저 현재 사용 중인 유선 네트워크의 "Connection Name(연결 이름)"을 찾아야 합니다.
+
+```bash
+nmcli connection show
+
+```
+
+**출력 예시:**
+
+```
+NAME                UUID                                  TYPE      DEVICE
+Wired connection 1  5688d091-xxxx-xxxx-xxxx-xxxxxxxxxxxx  ethernet  eth0
+
+```
+
+위 예시에서 `NAME`에 해당하는 부분(예: `Wired connection 1`)을 기억해두세요. (보통 한글로 `유선 연결 1`일 수도 있고 영어일 수도 있습니다.)
+
+---
+
+### 2단계: MTU 9000 및 고정 IP 설정 (영구 적용)
+
+위에서 찾은 이름이 `"Wired connection 1"`이고, 실제 인터페이스가 `eth0`, Jetson의 IP를 `30.30.0.16`으로 설정한다고 가정하고 명령어를 드립니다. **(이름과 IP는 본인 환경에 맞춰 수정하세요)**
+
+터미널에 아래 명령어를 한 줄씩 입력하세요.
+
+```bash
+# 1. MTU 9000 설정
+sudo nmcli connection modify "Wired connection 1" 802-3-ethernet.mtu 9000
+
+# 2. IPv4 방식을 수동(Manual)으로 변경
+sudo nmcli connection modify "Wired connection 1" ipv4.method manual
+
+# 3. IP 주소 및 서브넷 마스크 설정 (30.30.0.16 과 /16)
+# 주의: Gateway가 없으므로 ip만 적습니다.
+sudo nmcli connection modify "Wired connection 1" ipv4.addresses 30.30.0.16/16
+
+# 4. (선택사항) 기존에 입력된 게이트웨이나 DNS가 있다면 삭제 (폐쇄망이므로)
+sudo nmcli connection modify "Wired connection 1" ipv4.gateway ""
+sudo nmcli connection modify "Wired connection 1" ipv4.dns ""
+
+```
+
+---
+
+### 3단계: 변경 사항 적용 및 확인
+
+설정을 변경했으면 연결을 껐다 켜서 적용합니다.
+
+```bash
+# 연결 재시작
+sudo nmcli connection up "Wired connection 1"
+
+```
+
+**확인:**
+
+```bash
+ip addr show eth0
+
+```
+
+* `mtu 9000` 확인
+* `inet 30.30.0.16/16` 확인
+
+이제 Jetson 재부팅 후에도 이 설정은 NetworkManager에 의해 영구적으로 유지됩니다.
