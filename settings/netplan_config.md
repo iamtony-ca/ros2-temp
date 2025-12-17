@@ -116,3 +116,81 @@ SUBSYSTEM=="net", ACTION=="add|change", KERNEL=="eno1", ATTR{tx_queue_len}="1000
 *(Jetson의 경우 `KERNEL=="eth0"`로 변경)*
 
 저장 후 재부팅하면 자동으로 적용됩니다.
+##################################  
+전혀 당황할 필요 없습니다! Ubuntu 버전이나 설치 방식(Server vs Desktop, Cloud-init 사용 여부)에 따라 파일 이름은 다를 수 있습니다.
+
+Netplan은 파일 이름의 **숫자 순서대로(Lexical order)** 설정을 읽어 들입니다. (예: `50-xxx.yaml`을 먼저 읽고, `90-xxx.yaml`을 나중에 읽음). 뒤에 읽힌 파일의 설정이 앞의 설정을 덮어씁니다.
+
+따라서, 기존 파일(`50`이나 `90`)을 건드리지 말고, **가장 숫자가 높은 새 파일을 만들어서 적용**하는 것이 가장 안전하고 깔끔한 방법입니다.
+
+---
+
+### 해결 방법: `99-custom-mtu.yaml` 생성
+
+가장 마지막에 읽히도록 `99`로 시작하는 파일을 새로 만들겠습니다.
+
+**1. 새 설정 파일 생성**
+터미널에 다음 명령어를 입력하세요. (`eno1` 기준)
+
+```bash
+sudo nano /etc/netplan/99-custom-mtu.yaml
+
+```
+
+**2. 내용 작성**
+아래 내용을 복사해서 붙여넣으세요.
+*주의: `eno1` 부분은 실제 랜카드 이름에 맞춰야 합니다. (Jetson은 `eth0`일 수 있음)*
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    eno1:
+      mtu: 9000
+      # 주의: 기존에 DHCP를 쓰고 있었다면 true, 고정 IP라면 false 및 주소 설정 필요
+      # 대부분의 공유기 환경에서는 true가 기본입니다.
+      dhcp4: true 
+
+```
+
+**※ 중요 체크 (고정 IP 사용자라면?)**
+만약 현재 IP를 수동으로 잡아서 쓰고 계시다면(`dhcp4: false`인 경우), 위 내용 대신 아래처럼 기존 IP 설정을 같이 적어줘야 안전합니다. (DHCP 사용자라면 위 코드로 충분합니다.)
+
+```yaml
+# 고정 IP 사용자용 예시 (필요시에만 사용)
+network:
+  version: 2
+  ethernets:
+    eno1:
+      mtu: 9000
+      dhcp4: false
+      addresses:
+        - 30.30.0.15/24  # 본인 IP
+      routes:
+        - to: default
+          via: 30.30.0.1 # 게이트웨이
+      nameservers:
+        addresses: [8.8.8.8, 8.8.4.4]
+
+```
+
+**3. 저장 및 적용**
+
+* 저장: `Ctrl + O`, `Enter`
+* 종료: `Ctrl + X`
+* 적용 명령어 실행:
+
+```bash
+sudo netplan apply
+
+```
+
+**4. 확인**
+적용이 끝났으면 확인해 봅니다.
+
+```bash
+ip link show eno1 | grep mtu
+
+```
+
+`mtu 9000`이라고 나오면 성공적으로 영구 적용된 것입니다. 이제 재부팅 해도 9000으로 유지됩니다.
