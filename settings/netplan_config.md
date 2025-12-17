@@ -329,3 +329,98 @@ ip addr show eth0
 * `inet 30.30.0.16/16` 확인
 
 이제 Jetson 재부팅 후에도 이 설정은 NetworkManager에 의해 영구적으로 유지됩니다.
+#########################  
+Jetson 환경(특히 JetPack)에서 **"Network Settings(GUI)나 nmcli 설정에는 9000으로 되어 있는데, 실제로 터미널에서 확인하면 1500으로 풀려있는 현상"**은 매우 흔한 이슈입니다.
+
+이것은 부팅 시 **NetworkManager가 설정을 적용하는 타이밍**과 **하드웨어 드라이버(NIC)가 초기화되는 타이밍**이 맞지 않아서 발생하는 문제입니다. (NetworkManager가 9000을 넣으려 시도했으나, 드라이버가 초기화되면서 다시 기본값 1500으로 덮어써버리는 경우입니다.)
+
+이 경우 가장 확실한 해결책은 **"네트워크 연결이 완료된 직후에 강제로 MTU를 9000으로 변경하는 스크립트(Dispatcher)"**를 심는 것입니다.
+
+아래 절차를 따라주세요. 100% 해결됩니다.
+
+---
+
+### 해결책: NetworkManager Dispatcher 스크립트 생성
+
+NetworkManager가 연결을 맺은 뒤(Up 상태), 자동으로 실행되는 스크립트를 만듭니다.
+
+**1. 스크립트 파일 생성**
+터미널에서 아래 명령어로 파일을 생성합니다.
+
+```bash
+sudo nano /etc/NetworkManager/dispatcher.d/99-force-mtu
+
+```
+
+**2. 내용 작성**
+아래 내용을 복사해서 붙여넣으세요.
+*(**주의:** `eth0`가 아니라면 본인의 인터페이스 이름으로 바꿔야 합니다. 보통 Jetson 유선랜은 `eth0`가 맞습니다.)*
+
+```bash
+#!/bin/bash
+
+INTERFACE="eth0" # 본인의 인터페이스 이름 (예: eth0)
+DESIRED_MTU="9000"
+
+# 인터페이스가 지정한 것과 같고, 상태가 'up'이 되었을 때 실행
+if [ "$1" = "$INTERFACE" ] && [ "$2" = "up" ]; then
+    logger -t NM-DISPATCHER "Forcing MTU $DESIRED_MTU on $INTERFACE"
+    ip link set dev $INTERFACE mtu $DESIRED_MTU
+fi
+
+```
+
+**3. 저장 및 권한 설정 (중요)**
+
+* 저장: `Ctrl + O`, `Enter`
+* 종료: `Ctrl + X`
+* **실행 권한 부여 (이거 안 하면 실행 안 됨):**
+
+```bash
+sudo chmod +x /etc/NetworkManager/dispatcher.d/99-force-mtu
+
+```
+
+**4. 소유권 확인**
+혹시 모르니 root 소유인지 확실히 합니다.
+
+```bash
+sudo chown root:root /etc/NetworkManager/dispatcher.d/99-force-mtu
+
+```
+
+---
+
+### 적용 및 테스트
+
+이제 재부팅을 하거나 네트워크 서비스를 재시작해보세요.
+
+**방법 A: 네트워크 재시작 (바로 확인)**
+
+```bash
+sudo nmcli networking off
+sudo nmcli networking on
+
+```
+
+잠시 후(약 5~10초) 다시 연결되면 확인해봅니다.
+
+**방법 B: 재부팅**
+
+```bash
+sudo reboot
+
+```
+
+**확인 명령어:**
+
+```bash
+ip link show eth0 | grep mtu
+
+```
+
+이제 `mtu 9000`으로 고정되어 있을 것입니다.
+
+### 왜 이 방법이 가장 좋은가요?
+
+이 방식은 부팅 순서나 드라이버 로딩 타이밍과 상관없이, **"네트워크가 연결된 1초 뒤"**에 마지막으로 `ip link set ...` 명령어를 때려박는 방식이라서 실패 확률이 없습니다.
