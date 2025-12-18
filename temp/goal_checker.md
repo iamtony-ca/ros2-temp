@@ -78,3 +78,119 @@ Nav2에서 제공하는 3가지 Goal Checker 플러그인은 **"로봇이 목표
 3. **`SimpleGoalChecker`**: **가장 적합합니다.** 특히 `stateful: true` 옵션 덕분에, "위치 도착 -> 제자리 회전 중 위치 밀림 -> 그래도 각도만 맞으면 성공"이라는 로직이 가능하여 현재 상황에서 가장 안정적인 결과를 줄 것입니다.
 
 **추천:** 현재 `SimpleGoalChecker`를 사용 중이신 것으로 보이며, 앞서 제안드린 **Graceful Controller 코드 수정(XY Latch 강화)**과 함께 사용하면 가장 좋은 퍼포먼스를 낼 것입니다.
+#####################  
+######################  
+#####################  
+Nav2 스택에서 **Controller Server**, **Goal Checker**, **Controller (Graceful Controller)** 세 가지 요소가 어떻게 얽혀서 돌아가는지, 그 **상호작용의 흐름(Interaction Flow)**을 코드 레벨과 로직 레벨에서 명확히 설명해 드리겠습니다.
+
+핵심은 **"Controller Server가 중재자(Mediator)이고, Graceful Controller는 Goal Checker의 '값'만 빌려 쓴다"**는 점입니다.
+
+---
+
+### 1. 전체 구조 (Big Picture)
+
+이들은 수직적인 **계층 구조**를 가집니다.
+
+1. **Boss (Controller Server):** 메인 루프를 돌며 로봇을 제어합니다.
+2. **Inspector (Goal Checker):** "목표에 도착했나?"를 판단합니다 (`isGoalReached`).
+3. **Driver (Graceful Controller):** "어떻게 움직일까?"를 계산합니다 (`computeVelocityCommands`).
+
+> **중요:** Graceful Controller가 Goal Checker에게 "나 도착했어?"라고 직접 묻지 않습니다. 그건 Boss(Server)가 합니다. Graceful Controller는 단지 Goal Checker에게 **"기준(Tolerance)이 얼마야?"**라고만 물어봅니다.
+
+---
+
+### 2. 코드 레벨 상호작용 (Code Level)
+
+Graceful Controller의 소스코드(`computeVelocityCommands`)를 보면 `goal_checker` 포인터를 인자로 받아오는 것을 볼 수 있습니다.
+
+#### [nav2_controller::ControllerServer (The Boss)]
+
+Server는 매 주기(Tick)마다 대략 이런 순서로 일을 시킵니다.
+
+```cpp
+// (의사 코드) Controller Server의 메인 루프
+void computeControl() {
+    // 1. Inspector에게 물어봄: "우리 도착했어?"
+    if (goal_checker_->isGoalReached(current_pose, velocity, ...)) {
+        publishZeroVelocity(); // 정지 명령
+        return; // 종료
+    }
+
+    // 2. 도착 안 했으면 Driver에게 시킴: "계속 운전해. 여기 Inspector 정보도 줄게."
+    cmd_vel = controller_->computeVelocityCommands(current_pose, velocity, goal_checker_);
+    
+    // 3. 속도 명령 발행
+    publishVelocity(cmd_vel);
+}
+
+```
+
+#### [nav2_graceful_controller::GracefulController (The Driver)]
+
+사용자님이 제공해주신 코드의 핵심 부분입니다.
+
+```cpp
+geometry_msgs::msg::TwistStamped GracefulController::computeVelocityCommands(
+  const geometry_msgs::msg::PoseStamped & pose,
+  const geometry_msgs::msg::Twist & velocity,
+  nav2_core::GoalChecker * goal_checker) // <--- [연결 고리] Server가 Checker 포인터를 넘겨줌
+{
+  // 1. Checker에게 "너의 기준(Tolerance)이 몇이야?"라고 물어봄 (값만 가져옴)
+  geometry_msgs::msg::Pose pose_tolerance;
+  geometry_msgs::msg::Twist velocity_tolerance;
+  
+  // 여기서 Checker는 자신의 설정값(0.1m 등)을 리턴함.
+  // [문제점]: Checker가 내부적으로 XY를 통과했는지(Stateful) 여부는 여기서 안 알려줌!
+  if (!goal_checker->getTolerances(pose_tolerance, velocity_tolerance)) {
+     // 에러 처리
+  } else {
+     goal_dist_tolerance_ = pose_tolerance.position.x; // 값 저장 (예: 0.1)
+  }
+
+  // 2. Driver(Controller)가 독자적으로 거리를 재봄
+  double dist_to_goal = calculate_path_length(...);
+
+  // 3. Driver의 판단
+  // "Inspector 기준은 0.1인데, 내가 재보니 0.11이네? 아직 멀었군. 주행 모드 유지!"
+  if (dist_to_goal < goal_dist_tolerance_ || goal_reached_) {
+      // 제자리 회전 모드
+  } else {
+      // 주행 모드 (XY 보정 시도) -> 여기서 진동 발생
+  }
+}
+
+```
+
+---
+
+### 3. 상호작용 로직의 허점 (The Gap)
+
+여기서 사용자님이 겪으신 문제의 **근본적인 원인**이 드러납니다.
+
+#### A. Goal Checker (SimpleGoalChecker)의 입장
+
+* `isGoalReached()` 함수에서: "어? XY 오차(0.1m) 안에 들어왔네? `check_xy_ = false`로 바꿈! 이제 위치 신경 안 씀!" (**Stateful Latch**)
+* 하지만 `getTolerances()` 함수에서: "내 XY 허용 오차는 **0.1m**야." (그냥 설정값을 그대로 줌. "이미 통과했음"이라는 정보는 안 줌)
+
+#### B. Graceful Controller의 입장
+
+* `computeVelocityCommands()`에서 `goal_checker->getTolerances()`를 호출.
+* 받은 값: **0.1m**.
+* Controller의 생각: "아, 목표까지 0.1m 이내여야 하는구나."
+* 현재 상황: 로봇이 회전하다가 0.11m로 밀려남.
+* Controller의 판단: **"내부 계산 결과 0.11m > 0.1m 이므로 아직 도착 안 함. XY 위치 맞춰야 함!"**
+
+#### C. 결과
+
+* **Boss (Server):** `isGoalReached`를 호출하면 Checker는 (XY 무시하므로) **"각도만 맞으면 도착이야"**라고 할 준비가 되어 있음.
+* **Driver (Controller):** 하지만 Driver는 Checker의 속마음(Stateful 상태)을 모르고, **"거리 0.1m 넘었으니 후진해서라도 위치 맞춰!"**라고 하며 이상한 `cmd_vel`을 보냄.
+* 이로 인해 로봇은 덜덜 떨게 되고, 속도가 안정되지 않으니(혹은 각도가 계속 흔들리니) Boss는 "아직 도착 안 했네"라며 루프를 계속 돌림.
+
+---
+
+### 4. 요약: 왜 코드를 수정해야 했나?
+
+`Graceful Controller`와 `Goal Checker`는 **느슨하게 연결(Loosely Coupled)**되어 있습니다.
+Controller는 Checker의 **"현재 상태(XY 통과했음)"**를 공유받는 게 아니라, **"설정값(0.1m)"**만 공유받습니다.
+
+그렇기 때문에 **Controller 내부 코드(`computeVelocityCommands`)**에다가 **"한 번 가까워졌으면(Tolerance 근처), 네가 알아서 눈치껏 위치 무시해라(Hysteresis)"**라는 로직을 심어주어야 비로소 Goal Checker의 `Stateful` 동작과 합이 맞게 되는 것입니다.
