@@ -2580,3 +2580,62 @@ ZED X 4대에서 들어오는 데이터 양이 PCIe 대역폭이나 Orin의 메�
 **다음 단계:**
 현재 4대의 카메라 설정(해상도, FPS, Depth Mode)과 사용 중인 GMSL2 캡처 카드의 제조사(Stereolabs 오리지널인지, Connect Tech 등 타사 제품인지)를 알려주시면, 해당 하드웨어에 맞는 더 구체적인 PCIe 설정법을 알려드릴 수 있습니다.
   
+########################  
+#############################  
+################################  
+응, **그건 “문제 직후(가능하면 수 초~수 분 이내)”에 해야 잡힐 확률이 훨씬 높아.**
+30분 지나서 안 나오는 건 충분히 정상이고, 이유가 몇 가지 있어.
+
+## 왜 지금은 안 나올 수 있나
+
+1. **커널 로그는 계속 누적되지만, 네가 `tail -n 200`로 “마지막 200줄”만 보니까**
+   문제가 30분 전에 한 번 터지고 그 뒤로 다른 로그가 많이 찍혔으면, 에러 줄이 이미 tail 범위 밖으로 밀려났을 수 있어.
+
+2. **Argus(SCF/Fusa) 에러는 user-space(nvargus-daemon)에서만 남고, 커널 dmesg에는 안 남는 케이스도 있음**
+   네가 보여준 에러는 “SCF / fusaViHandler / CaptureScheduler”라서, 커널이 조용할 때가 종종 있어.
+
+3. (드물게) **로그 레벨/드라이버가 해당 에러를 dmesg로 안 뿌리는 설정**일 수도 있어.
+
+## 지금 당장 할 수 있는 “30분 전 이벤트” 찾는 방법
+
+tail 말고, dmesg 전체에서 필터링해봐:
+
+```bash
+sudo dmesg -T | egrep -i "nvcsi|vi|max967|max929|zedx|corr|error|timeout"
+```
+
+또는 “해당 시각(21:56 전후)” 기준으로 주변을 보려면:
+
+```bash
+sudo dmesg -T | grep -n "Dec 18 21:56" -n
+```
+
+(시간 문자열이 dmesg 출력 포맷에 따라 조금 다를 수 있어요)
+
+그리고 이미 **nvargus-daemon 로그에 정확히 Dec 18 21:56:36**이 찍혀 있으니까, 커널 로그도 journalctl로 커널 링버퍼 쪽을 같이 훑는 게 더 확실할 때도 있어요:
+
+```bash
+sudo journalctl -k --since "2025-12-18 21:55:00" --until "2025-12-18 22:00:30" | egrep -i "nvcsi|vi|max967|max929|corr|error|timeout"
+```
+
+## 다음 재발을 대비해서 “놓치지 않는” 방법
+
+문제 재현되면 바로 아래 2개를 **즉시** 떠두는 걸 추천해:
+
+```bash
+# 1) 커널 로그 (충분히 길게)
+sudo dmesg -T | egrep -i "nvcsi|vi|max967|max929|zedx|corr|error|timeout" | tail -n 500
+
+# 2) Argus 로그 (이미 하고 있는 것)
+sudo journalctl -u nvargus-daemon --since "5 min ago" --no-pager
+```
+
+더 확실하게 하려면, 아예 커널 로그를 파일로 계속 저장해두는 것도 좋아요(장시간 테스트용):
+
+```bash
+sudo journalctl -k -f | tee -a /var/log/kernel_follow.log
+```
+
+이렇게 해두면, 터지는 순간을 놓쳐도 파일에 남습니다.
+
+원하면 네 환경에 맞춰서 **“에러 감지 → nvargus-daemon + zed_x_daemon + ros2 노드 자동 재시작”**까지 한 번에 돌아가는 systemd 서비스/스크립트 형태로 바로 써줄게.
