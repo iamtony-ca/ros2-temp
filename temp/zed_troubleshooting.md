@@ -2639,3 +2639,94 @@ sudo journalctl -k -f | tee -a /var/log/kernel_follow.log
 이렇게 해두면, 터지는 순간을 놓쳐도 파일에 남습니다.
 
 원하면 네 환경에 맞춰서 **“에러 감지 → nvargus-daemon + zed_x_daemon + ros2 노드 자동 재시작”**까지 한 번에 돌아가는 systemd 서비스/스크립트 형태로 바로 써줄게.
+###########################  
+###########################  
+##############################  
+좋아, 이 결과는 **“커널(dmesg / journalctl -k) 레벨에서는 카메라(vi/nvcsi/max967xx) 에러가 안 찍혔고, 문제는 `nvargus-daemon`(유저스페이스 Argus/SCF) 안에서만 터졌다”**는 뜻이야. 이 패턴 **꽤 흔해.** (특히 네가 보여준 건 SCF/Fusa 쪽 스케줄러가 죽는 케이스라 커널이 조용할 때가 있음)
+
+그리고 `Dec 18 21:56`에 나온 `cpufreq` 로그는 **단순히 CPU 클럭이 오르내린 기록**이라, 그 자체가 카메라 문제의 “증거”는 아니야. 다만 **그 시점에 부하 스파이크가 있었다**는 힌트 정도로는 볼 수 있어.
+
+---
+
+## 1) 왜 네 grep에 “아무것도 안 나왔을까?”
+
+네가 찾는 키워드( `nvcsi|vi|max967|...` )로는 **안 찍히는 타입의 커널 로그**였거나, **아예 커널에는 안 찍혔던** 거야.
+
+그래서 다음엔 키워드를 더 넓혀서 “Jetson 카메라 스택에서 실제로 자주 찍히는 태그”까지 같이 보는 게 좋아.
+
+### 커널 로그에서 더 잘 잡히는 키워드로 다시 보기
+
+(이번엔 **시간 범위로** 뽑아서 확인)
+
+```bash
+sudo journalctl -k --since "2025-12-18 21:54:30" --until "2025-12-18 21:58:30" --no-pager \
+ | egrep -i "csi|nvcsi|vi|isp|capture|argus|scf|fusa|camrtc|rtcpu|tegra|i2c|max9|max96|serdes|gmsl|timeout|error|corr"
+```
+
+그리고 dmesg도 tail 말고 통째로:
+
+```bash
+sudo dmesg -T | egrep -i "csi|nvcsi|vi|isp|capture|camrtc|rtcpu|i2c|max9|max96|serdes|gmsl|timeout|error|corr"
+```
+
+> 지금 네 출력에서 `Dec 18 21:56`에 cpufreq 말고는 안 보인다는 건, **“커널은 조용했고 Argus만 죽었다”** 쪽에 더 무게가 실려.
+
+---
+
+## 2) 이 상황에서 다음으로 가장 유력한 원인 “두 갈래”
+
+### (A) Argus가 장시간/부하 스파이크에서 스케줄러가 꼬여서 다운 (커널은 조용할 수 있음)
+
+네가 준 Argus 로그에 **`Capture Scheduler not running`**, **`All captures are already pending`**가 딱 이 케이스야.
+
+➡️ 이 가설을 빠르게 검증하려면:
+
+* **클럭을 고정**해서 프레임 지연(deadline miss)을 줄여보기
+
+```bash
+sudo nvpmodel -m 0
+sudo jetson_clocks
+```
+
+이 상태로 다시 장시간 테스트해서 재현이 확 줄면 “부하/클럭/스파이크” 계열이 맞을 확률이 확 올라가.
+
+### (B) 특정 채널(CAM3)의 링크 글리치가 트리거 → Argus가 연쇄 다운
+
+이건 커널에 안 찍힐 수도 있고, Argus에서만 “Corr Error”로 보일 때도 있어.
+
+➡️ 검증은 **스왑 테스트**가 제일 빨라:
+
+* CAM3에 물린 **카메라/케이블을 다른 포트로 옮겨서** “에러가 포트를 따라가는지, 카메라를 따라가는지” 보기
+
+---
+
+## 3) 다음 재발 때 “증거를 확실히 남기는” 최소 로그 세트
+
+터진 직후(가능하면 1~2분 내)에 아래 4개만 확보하면 원인 분리가 훨씬 빨라져.
+
+```bash
+# 1) Argus 로그 (가장 중요)
+sudo journalctl -u nvargus-daemon --since "10 min ago" --no-pager > argus.log
+
+# 2) 커널 로그 (키워드 넓게)
+sudo journalctl -k --since "10 min ago" --no-pager > kernel.log
+
+# 3) zed_x_daemon 로그 (있으면)
+sudo journalctl -u zed_x_daemon --since "10 min ago" --no-pager > zedx_daemon.log
+
+# 4) 당시 리소스/온도 (부하 스파이크 증거)
+sudo tegrastats --interval 1000 --logfile tegrastats.log &
+```
+
+(tegrastats는 수동으로 중지: `sudo pkill tegrastats`)
+
+---
+
+## 4) 지금 로그만으로 내 결론
+
+* **커널 레벨에서 VI/CSI 에러가 안 보이는 건 이상한 게 아님.**
+* 지금까지 확보된 증거로는 **Argus(nvargus-daemon) 쪽 스케줄러 다운이 1차 원인**이고, ZED 쪽 “CAMERA REBOOTING”은 **2차(결과)**로 보는 게 맞아.
+
+원하면, 네가 지금 쓰는 **(1) 4대 각각 해상도/FPS/depth/AI 설정**, **(2) zed_x_daemon 사용 여부**, **(3) jetson_clocks/nvpmodel 설정 상태**만 알려주면, “5일 켜두기” 목표로 **안정성 우선 프로파일 + 자동복구(daemon 재시작 + ros2 respawn)**까지 한 번에 구성해줄게.
+
+
