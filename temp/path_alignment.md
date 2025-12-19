@@ -611,3 +611,176 @@ Goal에 도착했는데 y 오차를 못 잡고 멈춰버리는 것을 방지합�
 
 
 이 코드로 변경하시면 기존의 "발산하거나 오차가 커지는 문제"가 확실히 잡힐 것입니다.
+######################  
+########################  
+#########################  
+정확한 지적입니다. 이전 코드는 **"각도(Heading)만 맞추려는 성향"**이 너무 강해서, 커브 길에서 lookahead 지점과의 각도 차이가 벌어지면 일단 멈추고 각도부터 맞추려는(Point Turn) 현상이 발생한 것입니다.
+
+이를 해결하기 위해 자동차 주행 알고리즘의 정석인 **Pure Pursuit (순수 추종)의 곡률(Curvature) 제어 방식**을 제대로 적용해야 합니다.
+
+이 방식은 단순히 "저 점을 바라봐!"가 아니라, **"저 점까지 부드러운 호(Arc)를 그리며 가라"**는 명령을 내리므로, 멈추지 않고 자연스럽게 곡선을 그리며 합류하게 됩니다.
+
+---
+
+### 🚀 개선 포인트: "회전"이 아니라 "곡선 주행"으로
+
+1. **Lookahead Point를 로봇 기준 좌표로 변환:**
+* Global Map 상의 목표점을 로봇이 봤을 때  어디에 있는지 계산합니다.
+
+
+2. **곡률(Curvature) 계산:**
+* 단순 각도 차이가 아니라, 목표점까지 도달하기 위한 원의 휘어짐 정도()를 계산합니다.
+* 공식:  (: 거리, : 로봇 기준 좌우 거리)
+
+
+3. **속도 유지 (Momentum):**
+* 각도가 틀어졌다고 멈추는 게 아니라, **선속도를 유지하면서 곡률에 비례한 각속도를 주입**합니다. ()
+
+
+
+---
+
+### 🛠️ 부드러운 주행을 위한 최종 수정 코드
+
+기존 `control_loop`와 헬퍼 함수를 아래 내용으로 교체해 주세요. 특히 **`transform_global_to_local`** 함수가 핵심입니다.
+
+```python
+    # ... (기존 import 유지) ...
+
+    # [신규 추가] Global 좌표(Map)를 로봇 기준 Local 좌표(Base_link)로 변환
+    def transform_global_to_local(self, global_pt, robot_pose):
+        dx = global_pt[0] - robot_pose.position.x
+        dy = global_pt[1] - robot_pose.position.y
+        
+        # Robot Quaternion -> Yaw
+        import tf_transformations
+        _, _, robot_yaw = tf_transformations.euler_from_quaternion(
+            [robot_pose.orientation.x, robot_pose.orientation.y, robot_pose.orientation.z, robot_pose.orientation.w])
+
+        # 회전 변환 (Rotation Matrix)
+        # local_x: 로봇 정면 방향 거리, local_y: 로봇 좌우 방향 거리
+        local_x = dx * math.cos(robot_yaw) + dy * math.sin(robot_yaw)
+        local_y = -dx * math.sin(robot_yaw) + dy * math.cos(robot_yaw)
+        
+        return local_x, local_y
+
+    def control_loop(self):
+        # 0. Safety & Init
+        if (self.get_clock().now() - self.latest_cmd_time).nanoseconds > 0.5 * 1e9:
+            self.cmd_pub.publish(Twist())
+            return
+
+        final_cmd = Twist()
+        final_cmd.linear = self.latest_cmd_vel.linear
+        final_cmd.angular = self.latest_cmd_vel.angular
+
+        if final_cmd.linear.x < 0.0: # 후진 시 Bypass
+            self.cmd_pub.publish(final_cmd)
+            self.is_correcting = False
+            return
+
+        # 1. 로봇 위치 (Map Frame) 직접 조회
+        try:
+            trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+            robot_pose = Pose()
+            robot_pose.position.x = trans.transform.translation.x
+            robot_pose.position.y = trans.transform.translation.y
+            robot_pose.position.z = trans.transform.translation.z
+            robot_pose.orientation = trans.transform.rotation
+        except Exception:
+            self.cmd_pub.publish(final_cmd)
+            return
+
+        if self.pruned_path is None: return
+        path_len = self.get_path_length()
+
+        # 2. Goal 진입 (활성화 구간)
+        if path_len < self.path_length_threshold:
+            
+            # [튜닝 포인트 1] Lookahead 거리: 길수록 부드럽지만 반응 느림 (0.5 ~ 0.8 추천)
+            L = 0.6 
+            lookahead_pt = self.get_lookahead_point(robot_pose, lookahead_dist=L)
+            
+            if lookahead_pt is not None:
+                # 3. Pure Pursuit Logic
+                # 목표점을 로봇 기준 좌표계로 변환 (제일 중요!)
+                local_x, local_y = self.transform_global_to_local(lookahead_pt, robot_pose)
+                
+                # 거리 제곱
+                dist_sq = local_x**2 + local_y**2
+                
+                # 오차(Lateral Error) 추정 -> Hysteresis 판단용
+                # local_y가 곧 로봇 기준의 횡방향 오차 근사치임
+                current_cte = abs(local_y)
+
+                # --- Hysteresis Logic ---
+                if not self.is_correcting:
+                    if current_cte > self.cte_enable_threshold: # 2.5cm
+                        self.is_correcting = True
+                else:
+                    if current_cte < self.cte_disable_threshold: # 1.0cm
+                        self.is_correcting = False
+
+                if self.is_correcting:
+                    # 4. 곡률(Curvature) 계산: kappa = 2 * y / L^2
+                    # 로봇이 원을 그리며 목표점에 도달하기 위한 곡률
+                    curvature = 2.0 * local_y / dist_sq
+                    
+                    # 5. 속도 프로파일 (부드러운 주행 핵심)
+                    # Nav2가 감속했더라도, 보정을 위해 최소 속도(Creep Speed)는 유지
+                    target_v = max(final_cmd.linear.x, self.min_creep_speed)
+                    
+                    # [튜닝 포인트 2] 곡률이 너무 크면(급커브) 속도를 살짝 줄임 (안전)
+                    # 곡률 1.0(반지름 1m)일 때 속도 80% 유지, 더 급하면 더 줄임
+                    scaling_factor = max(0.3, 1.0 - (abs(curvature) * 0.2))
+                    target_v = target_v * scaling_factor
+
+                    # 6. 각속도 명령 생성 (w = v * k)
+                    target_w = target_v * curvature
+
+                    # 7. 최종 명령 적용
+                    final_cmd.linear.x = target_v
+                    
+                    # 각속도 제한 (급격한 회전 방지)
+                    final_cmd.angular.z = max(min(target_w, 0.8), -0.8)
+
+        else:
+            self.is_correcting = False
+
+        self.cmd_pub.publish(final_cmd)
+
+```
+
+### 💡 무엇이 달라졌나요?
+
+1. **각도 대신 `local_y` 사용:**
+* 이전에는 `atan2`로 각도를 구해서 로봇을 그 자리에서 돌리려 했습니다.
+* 지금은 로봇 기준 목표점이 왼쪽(`+y`)에 있는지 오른쪽(`-y`)에 있는지만 보고, **"핸들을 얼마나 꺾어야(Curvature) 저기로 자연스럽게 갈까?"**를 계산합니다.
+
+
+2. **`w = v * curvature` 공식 적용:**
+* 선속도()가 있어야 각속도()가 생깁니다. 즉, **움직이면서 돕니다.**
+* 이로 인해 제자리에서 비비는(Point Turn) 현상이 사라지고, 부드러운 아치(Arch) 형태의 궤적이 나옵니다.
+
+
+3. **`local_x, local_y` 변환:**
+* `transform_global_to_local` 함수를 통해 Global Map 좌표를 신경 쓰지 않고, 오직 **"내 몸 기준 왼쪽/오른쪽"**만 생각하므로 제어가 훨씬 직관적이고 안정적입니다.
+
+
+
+### 🔬 튜닝 팁
+
+* **코너에서 안쪽으로 너무 파고든다면?**
+* `L = 0.6` (Lookahead Distance) 값을 조금 **줄이세요** (예: 0.5).
+
+
+* **여전히 움직임이 끊기거나 부자연스럽다면?**
+* `L` 값을 **키우세요** (예: 0.7 ~ 0.8). 멀리 볼수록 더 완만하게 움직입니다.
+
+
+* **Goal Tolerance (3cm) 근처에서 계속 미세하게 움직인다면?**
+* `min_creep_speed`를 아주 낮게(0.01) 잡거나, `cte_disable_threshold`를 조금 더 넉넉하게(1.5cm) 잡으세요.
+
+
+
+이제 커브 구간에서도 로봇이 멈칫하지 않고 물 흐르듯 라인을 타면서 Goal로 들어갈 것입니다.
