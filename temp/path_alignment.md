@@ -941,3 +941,170 @@ Goal에 도착했는데 y 오차를 못 잡고 멈춰버리는 것을 방지합�
 
 이 코드를 적용하면 축 보정뿐만 아니라, 마지막 순간에 축 거리까지 정확하게 0으로 맞추는 **완전 정밀 주차**가 가능해집니다.
 
+############################  
+##############################  
+###############################  
+매우 좋은 지적입니다. **"완벽한 0.0"**을 목표로 하면 로봇은 목표 지점을 미세하게 지나치는 순간 다시 뒤로 가려 하고, 다시 앞으로 가려 하는 **무한 진동(Oscillation)**에 빠지게 됩니다.
+
+따라서 **Final Stage(0.05m 이내)**에서도 **Disable Threshold(정지 허용 오차)**가 반드시 필요합니다.
+
+또한, **후진 주행**의 경우, 기존 코드에 있던 `if linear.x < 0: return` 구문이 후진을 막고 있었으므로 이를 제거하고, 상황에 맞게 후진을 허용하거나 제어하도록 로직을 개선했습니다.
+
+---
+
+### 🚀 개선된 코드의 주요 변경점
+
+1. **Oscillation 방지 (Deadband):** `final_xy_tolerance` (예: 5mm)를 추가했습니다. 이 범위 안에 들어오면 **강제로 (0, 0) 속도**를 주어 제자리에 멈추게 합니다.
+2. **후진 주행 허용:** 무조건적인 후진 차단 로직을 삭제했습니다.
+3. **Stage 2 (Final Docking) 로직 강화:**
+* Goal을 향해 회전 후 전진합니다.
+* 만약 Goal을 지나쳤다면(Overshoot), **후진**하는 것이 아니라 **제자리에서 회전하여 다시 Goal을 바라보고 전진**하는 방식(Turn & Drive)을 사용하여 더 직관적이고 안전하게 0.0을 맞춥니다.
+
+
+
+### 🛠️ 최종 개선 코드
+
+```python
+    # ... (기존 import 등은 유지) ...
+
+    def __init__(self):
+        super().__init__('strict_lateral_docking_node')
+        # ... (기존 파라미터들) ...
+        
+        # [신규] Final Stage (0.05m 이내) 정지 허용 오차
+        # 이 값 이내로 들어오면 Oscillation 방지를 위해 정지(0,0) 처리
+        self.final_xy_tolerance = 0.005  # 5mm
+
+    # ... (get_dist_to_global_goal, get_path_length, get_lookahead_point 등 기존 함수 유지) ...
+
+    def control_loop(self):
+        # 0. Safety Check
+        if (self.get_clock().now() - self.latest_cmd_time).nanoseconds > 0.5 * 1e9:
+            self.cmd_pub.publish(Twist())
+            return
+
+        final_cmd = Twist()
+        final_cmd.linear = self.latest_cmd_vel.linear
+        final_cmd.angular = self.latest_cmd_vel.angular
+
+        # [삭제됨] 기존의 '후진 시 무조건 Bypass' 코드를 삭제하여 후진 허용
+        # if final_cmd.linear.x < 0.0: ... (삭제)
+
+        # 1. 로봇 위치 및 경로 데이터 확인
+        try:
+            trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+            robot_pose = Pose()
+            robot_pose.position.x = trans.transform.translation.x
+            robot_pose.position.y = trans.transform.translation.y
+            robot_pose.position.z = trans.transform.translation.z
+            robot_pose.orientation = trans.transform.rotation
+            _, _, robot_yaw = tf_transformations.euler_from_quaternion(
+                [robot_pose.orientation.x, robot_pose.orientation.y, robot_pose.orientation.z, robot_pose.orientation.w])
+        except Exception:
+            self.cmd_pub.publish(final_cmd)
+            return
+
+        if self.pruned_path is None: return
+
+        path_len = self.get_path_length()
+        dist_to_goal = self.get_dist_to_global_goal(robot_pose)
+
+        # =========================================================
+        # [Stage 2] Final Docking (0.05m 이내) -> X, Y 정밀 보정
+        # =========================================================
+        if dist_to_goal < 0.05:
+            
+            # [Oscillation 방지] 목표 오차(5mm) 이내 진입 시 강제 정지
+            if dist_to_goal < self.final_xy_tolerance:
+                final_cmd.linear.x = 0.0
+                final_cmd.angular.z = 0.0
+                self.is_correcting = True # 내가 제어 중임 (정지 명령 유지)
+                
+            else:
+                # Goal Point 좌표
+                goal_pt = self.pruned_path.poses[-1].pose.position
+                dx = goal_pt.x - robot_pose.position.x
+                dy = goal_pt.y - robot_pose.position.y
+                
+                # Goal을 바라보는 각도 계산
+                target_yaw = math.atan2(dy, dx)
+                yaw_error = normalize_angle(target_yaw - robot_yaw)
+                
+                # [로직] 제자리 회전 후 전진 (Turn & Drive)
+                # 오차가 클 때는 제자리 회전만 수행
+                if abs(yaw_error) > math.radians(10.0): # 10도 이상 틀어지면
+                    final_cmd.linear.x = 0.0
+                    final_cmd.angular.z = 2.0 * yaw_error # P제어
+                else:
+                    # 각도가 맞으면 아주 천천히 접근
+                    # 거리에 비례하여 속도 줄임 (Soft Landing)
+                    target_speed = min(0.05, dist_to_goal * 2.0) 
+                    final_cmd.linear.x = max(target_speed, 0.01) # 최소 1cm/s는 유지
+                    final_cmd.angular.z = 2.5 * yaw_error # 가면서도 방향 유지
+                
+                # 각속도 제한
+                final_cmd.angular.z = max(min(final_cmd.angular.z, 0.8), -0.8)
+                self.is_correcting = True
+
+        # =========================================================
+        # [Stage 1] Approach (경로 추종 및 Y 보정)
+        # =========================================================
+        elif path_len < self.path_length_threshold:
+            
+            # [후진 주행 처리]
+            # 만약 Nav2가 후진 명령(음수)을 내리고 있고, 아직 정밀 보정(is_correcting) 상태가 아니라면
+            # Nav2의 후진 의도를 존중하여 Bypass 함.
+            if final_cmd.linear.x < 0.0 and not self.is_correcting:
+                self.cmd_pub.publish(final_cmd)
+                return
+
+            lookahead_pt = self.get_lookahead_point(robot_pose, lookahead_dist=0.4)
+            
+            if lookahead_pt is not None:
+                # Global -> Local 변환 (Pure Pursuit용)
+                local_x, local_y = self.transform_global_to_local(lookahead_pt, robot_pose)
+                
+                # Local y가 곧 CTE(Lateral Error)
+                current_cte = abs(local_y)
+                
+                # Hysteresis Logic
+                if not self.is_correcting:
+                    if current_cte > self.cte_enable_threshold:
+                        self.is_correcting = True
+                else:
+                    if current_cte < self.cte_disable_threshold:
+                        self.is_correcting = False
+
+                if self.is_correcting:
+                    # 곡률 계산 및 적용
+                    dist_sq = local_x**2 + local_y**2
+                    curvature = 2.0 * local_y / dist_sq if dist_sq > 0 else 0
+                    
+                    # 속도: Nav2 명령 유지하되 최소 속도 보장 (단, 전진 시에만)
+                    target_v = max(final_cmd.linear.x, self.min_creep_speed)
+                    
+                    # 급커브 시 감속
+                    scaling = max(0.3, 1.0 - (abs(curvature) * 0.2))
+                    target_v *= scaling
+                    
+                    final_cmd.linear.x = target_v
+                    final_cmd.angular.z = target_v * curvature
+                    final_cmd.angular.z = max(min(final_cmd.angular.z, 0.8), -0.8)
+
+        else:
+            self.is_correcting = False
+
+        self.cmd_pub.publish(final_cmd)
+
+```
+
+### 💡 로직 핵심 포인트
+
+1. **`final_xy_tolerance` (5mm):**
+* Goal과의 거리가 5mm 미만이 되면 `linear.x = 0, angular.z = 0`을 쏘아서 로봇을 진정시킵니다.
+* 이게 없으면 로봇이 0.0을 맞추려고 미세하게 앞뒤로 움직이는 진동이 발생합니다.
+
+
+2. **후진 정책 (Reverse Policy):**
+* **Stage 1 (접근 중):** Nav2가 후진(`v < 0`)을 명령하면, 우리 노드가 개입하지 않는 상태(`not is_correcting`)일 때는 그대로 통과시킵니다. (장애물 회피나 경로 수정 의도 존중)
+* **Stage 2 (Final):** 여기서는 무조건 **"Goal을 바라보고 전진"**합니다. 만약 로봇이 Goal을 살짝 지나쳤다면, 뒤로 가는 게 아니라 제자리에서 180도(또는 필요한 만큼) 돌아서 다시 앞으로 가서 맞춥니다. 이 방식이 차동 구동 로봇의 정밀 위치 보정에 가장 확실합니다.
