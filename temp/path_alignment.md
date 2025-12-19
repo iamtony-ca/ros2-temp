@@ -1627,3 +1627,170 @@ class StrictLateralDockingNode(Node):
 * 기존: `scaling = 1.0 - curvature...` 로직 때문에 커브에서 무조건 감속했습니다.
 * **변경:** `target_v = final_cmd.linear.x`로 설정하여 **Nav2(Velocity Smoother)가 계산한 속도를 그대로 사용**합니다.
 * 단, `is_correcting` 상태인데 속도가 너무 느리면(0.02 미만), 보정을 수행하기 위해 **최소 속도(Creep Speed)로만 올려주는(Floor)** 역할만 수행합니다. 이제 훨씬 시원하게 주행할 것입니다.
+
+#############################  
+##############################  
+###############################  
+사용자님의 요구사항을 반영하여 코드의 논리를 다음과 같이 구체화했습니다.
+
+1. **XY 안정화 후 바이패스:** X, Y 오차가 허용 범위 내에서 특정 시간(예: 1.0초) 유지되면, `xy_completed` 상태가 되어 더 이상 개입하지 않고 Nav2(Graceful Controller)가 나머지 Yaw 제어를 하도록 둡니다.
+2. **완전 정지 조건:** X, Y, Yaw가 모두 만족되면 강제로 `0.0`을 보냅니다.
+3. **급격한 변동 방지 (Clamping):** 보정 로직이 계산한 속도가 Nav2가 원래 주려던 속도와 너무 큰 차이가 나지 않도록 제한(Clamp)을 겁니다.
+
+수정이 필요한 **`__init__`** 부분과 **`control_loop` 내부의 Stage 2 (Final Docking)** 부분만 보여드립니다.
+
+---
+
+### 1. `__init__` 부분 (변수 추가)
+
+```python
+    def __init__(self):
+        super().__init__('strict_lateral_docking_node')
+
+        # --- Parameters ---
+        self.path_length_threshold = 2.0
+        self.cte_enable_threshold = 0.025
+        self.cte_disable_threshold = 0.010
+        
+        # Tolerance
+        self.final_xy_tolerance = 0.01      # 1cm
+        self.final_yaw_tolerance = 0.05     # 약 2.8도
+        
+        # [신규] XY 안정화 판단 파라미터
+        self.xy_stable_duration = 1.0       # 1초 동안 XY 오차 없으면 Bypass
+        
+        # [신규] 급격한 제어 변경 방지 (Nav2 명령과의 최대 차이 허용치)
+        self.max_linear_diff = 0.05         # 5cm/s 이상 차이나게 급가속/감속 금지
+        self.max_angular_diff = 0.5         # 0.5 rad/s 이상 급회전 차이 금지
+
+        self.min_creep_speed = 0.02
+
+        # --- State ---
+        self.is_correcting = False
+        
+        # [신규] 안정화 타이머 상태 변수
+        self.xy_stable_start_time = None    # XY 만족 시작 시각
+        self.xy_completed = False           # XY 안정화 완료 여부 플래그
+
+        # ... (나머지 초기화 코드는 동일) ...
+
+```
+
+---
+
+### 2. `control_loop` 내부 (Stage 2 로직 전면 수정)
+
+`control_loop` 함수 내에서 `if dist_to_goal < 0.05:` 블록을 아래 코드로 완전히 교체해 주세요.
+
+```python
+        # =========================================================
+        # [Stage 2] Final Docking (0.05m 이내)
+        # =========================================================
+        if dist_to_goal < 0.05:
+            
+            # Goal Pose 및 Yaw 오차 계산
+            goal_pose_global = self.pruned_path.poses[-1].pose
+            _, _, goal_yaw = tf_transformations.euler_from_quaternion(
+                [goal_pose_global.orientation.x, goal_pose_global.orientation.y, goal_pose_global.orientation.z, goal_pose_global.orientation.w])
+            
+            _, _, current_yaw = tf_transformations.euler_from_quaternion(
+                [robot_pose.orientation.x, robot_pose.orientation.y, robot_pose.orientation.z, robot_pose.orientation.w])
+            
+            yaw_error = normalize_angle(goal_yaw - current_yaw)
+
+            # 현재 상태 확인
+            xy_satisfied = dist_to_goal < self.final_xy_tolerance
+            yaw_satisfied = abs(yaw_error) < self.final_yaw_tolerance
+
+            # -----------------------------------------------------
+            # 조건 1: 모든 조건 만족 시 완전 정지 (cmd_vel = 0)
+            # -----------------------------------------------------
+            if xy_satisfied and yaw_satisfied:
+                final_cmd.linear.x = 0.0
+                final_cmd.angular.z = 0.0
+                self.cmd_pub.publish(final_cmd)
+                self.is_correcting = True # 정지 명령 강제 유지를 위해 True
+                return
+
+            # -----------------------------------------------------
+            # 조건 2: XY Tolerance가 일정 시간 만족되면 Bypass (제어권 넘김)
+            # -----------------------------------------------------
+            if xy_satisfied:
+                if self.xy_stable_start_time is None:
+                    self.xy_stable_start_time = self.get_clock().now()
+                
+                # 경과 시간 계산
+                elapsed = (self.get_clock().now() - self.xy_stable_start_time).nanoseconds / 1e9
+                
+                if elapsed > self.xy_stable_duration:
+                    self.xy_completed = True
+            else:
+                # XY 오차가 다시 커지면 타이머 및 완료 플래그 리셋
+                self.xy_stable_start_time = None
+                self.xy_completed = False
+
+            # XY 안정화가 완료되었다면 -> Nav2 명령 그대로 통과 (Bypass)
+            if self.xy_completed:
+                self.is_correcting = False 
+                self.cmd_pub.publish(final_cmd) # Nav2 원래 명령 전송
+                return
+
+            # -----------------------------------------------------
+            # 보정 로직 (XY가 아직 불안정하거나 만족 시간이 짧을 때)
+            # -----------------------------------------------------
+            
+            # 1. 보정값 계산 (P-Control)
+            goal_pt_global = [goal_pose_global.position.x, goal_pose_global.position.y]
+            local_x, local_y, _ = self.transform_global_to_local(goal_pt_global, robot_pose)
+            
+            # Linear Velocity Calculation
+            kp_dist = 1.5 
+            calc_vx = kp_dist * local_x 
+            
+            # Limit & Creep Speed
+            speed_limit = 0.1 
+            if abs(calc_vx) > speed_limit:
+                calc_vx = math.copysign(speed_limit, calc_vx)
+            if abs(calc_vx) < self.min_creep_speed:
+                 calc_vx = math.copysign(self.min_creep_speed, calc_vx)
+
+            # Angular Velocity Calculation
+            target_yaw_local = math.atan2(local_y, local_x)
+            if local_x < 0:
+                steering_error = normalize_angle(target_yaw_local - math.pi)
+            else:
+                steering_error = target_yaw_local
+
+            calc_w = 2.5 * steering_error
+            calc_w = max(min(calc_w, 0.8), -0.8)
+
+            # -----------------------------------------------------
+            # 조건 3: Clamp (Nav2 명령과 보정값의 차이 제한)
+            # -----------------------------------------------------
+            # Nav2가 주려는 값(final_cmd)과 내가 계산한 값(calc)의 차이 계산
+            
+            # Linear Clamping
+            lin_diff = calc_vx - final_cmd.linear.x
+            # 차이를 max_linear_diff 안으로 자름
+            lin_diff = max(min(lin_diff, self.max_linear_diff), -self.max_linear_diff)
+            final_cmd.linear.x = final_cmd.linear.x + lin_diff
+
+            # Angular Clamping
+            ang_diff = calc_w - final_cmd.angular.z
+            # 차이를 max_angular_diff 안으로 자름
+            ang_diff = max(min(ang_diff, self.max_angular_diff), -self.max_angular_diff)
+            final_cmd.angular.z = final_cmd.angular.z + ang_diff
+
+            self.is_correcting = True
+
+```
+
+### ✨ 변경된 로직 요약
+
+1. **XY Stable Bypass:** `xy_satisfied` 상태가 1초(`xy_stable_duration`) 이상 지속되면 `xy_completed`가 `True`가 되며, 이후 로직은 `return` 되어 Nav2의 원본 명령(`final_cmd`)이 그대로 나갑니다.
+2. **All Satisfied Stop:** XY와 Yaw가 모두 만족되면 `0.0`을 강제로 내보냅니다.
+3. **Difference Clamping:**
+* `calc_vx`(내 계산값) - `final_cmd.linear.x`(Nav2값) = `diff`
+* 이 `diff`를 `±max_linear_diff` 범위로 자릅니다.
+* `최종 출력 = Nav2값 + 잘린 diff`
+* 이렇게 하면 Nav2가 0.1m/s를 주고 내가 0.3m/s를 주고 싶어도, 차이가 허용치(0.05)보다 크면 0.15m/s까지만 변경되어 **급발진을 방지**합니다.
