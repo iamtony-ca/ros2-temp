@@ -1108,3 +1108,260 @@ Goal에 도착했는데 y 오차를 못 잡고 멈춰버리는 것을 방지합�
 2. **후진 정책 (Reverse Policy):**
 * **Stage 1 (접근 중):** Nav2가 후진(`v < 0`)을 명령하면, 우리 노드가 개입하지 않는 상태(`not is_correcting`)일 때는 그대로 통과시킵니다. (장애물 회피나 경로 수정 의도 존중)
 * **Stage 2 (Final):** 여기서는 무조건 **"Goal을 바라보고 전진"**합니다. 만약 로봇이 Goal을 살짝 지나쳤다면, 뒤로 가는 게 아니라 제자리에서 180도(또는 필요한 만큼) 돌아서 다시 앞으로 가서 맞춥니다. 이 방식이 차동 구동 로봇의 정밀 위치 보정에 가장 확실합니다.
+########################
+##########################
+##########################
+사용자님의 요구사항을 완벽하게 이해했습니다. 핵심 변경 사항은 다음과 같습니다.
+
+1. **후진 허용:** Goal을 지나쳤거나(Overshoot), 애초에 후진으로 진입하는 경로라면 **축 속도를 음수(`-`)로 주어 후진**합니다. (제자리 회전 금지)
+2. **성공 조건(Tolerance) 우선:** Goal을 지나쳤더라도, 직선 거리상 `final_xy_tolerance` 안이면 멈춥니다.
+3. **통합 제어:** 전진/후진을 별도 로직으로 분리하지 않고, **Local 좌표계의 값**을 기준으로 속도의 부호를 결정하여 자연스럽게 동작하게 합니다.
+
+이를 위해 **Stage 2 (Final Docking)** 로직을 **"Local Coordinate P-Control"** 방식으로 전면 수정했습니다.
+
+---
+
+### 🛠️ 최종 완성 코드 (후진 지원 & 오버슈트 대응)
+
+```python
+import rclpy
+from rclpy.node import Node
+from rclpy.duration import Duration
+from geometry_msgs.msg import Twist, Pose, PoseStamped
+from nav_msgs.msg import Path, Odometry
+import tf2_ros
+from tf2_geometry_msgs import do_transform_pose
+import math
+import numpy as np
+import tf_transformations
+
+def normalize_angle(angle):
+    while angle > math.pi: angle -= 2.0 * math.pi
+    while angle < -math.pi: angle += 2.0 * math.pi
+    return angle
+
+class StrictLateralDockingNode(Node):
+    def __init__(self):
+        super().__init__('strict_lateral_docking_node')
+
+        # --- Parameters ---
+        self.path_length_threshold = 2.0    # 접근 제어 시작 거리
+        self.cte_enable_threshold = 0.025   # Y오차 2.5cm 이상 시 개입
+        self.cte_disable_threshold = 0.010  # Y오차 1.0cm 이하 시 해제
+        self.final_xy_tolerance = 0.01      # [중요] 1cm 이내면 성공으로 간주하고 정지
+        
+        self.min_creep_speed = 0.02         # 최소 기동 속도
+        
+        # --- State ---
+        self.is_correcting = False
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        
+        self.latest_cmd_vel = Twist()
+        self.latest_cmd_time = self.get_clock().now()
+        self.pruned_path = None
+        
+        # --- Pub/Sub ---
+        self.create_subscription(Path, '/plan_pruned', self.pruned_path_callback, 10)
+        self.create_subscription(Twist, '/cmd_vel_smoothed', self.cmd_callback, 10)
+        self.create_subscription(Odometry, '/odom', lambda msg: None, 10) # TF 조회하므로 더미 처리
+        
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel_input_monitor', 10)
+        self.create_timer(0.05, self.control_loop)
+
+    def pruned_path_callback(self, msg): self.pruned_path = msg
+    def cmd_callback(self, msg): 
+        self.latest_cmd_vel = msg
+        self.latest_cmd_time = self.get_clock().now()
+
+    def get_path_length(self):
+        if not self.pruned_path or len(self.pruned_path.poses) < 2: return 0.0
+        coords = np.array([(p.pose.position.x, p.pose.position.y) for p in self.pruned_path.poses])
+        return np.sum(np.linalg.norm(coords[1:] - coords[:-1], axis=1))
+
+    def get_dist_to_global_goal(self, robot_pose):
+        if not self.pruned_path or len(self.pruned_path.poses) == 0: return float('inf')
+        goal_pt = self.pruned_path.poses[-1].pose.position
+        return math.hypot(goal_pt.x - robot_pose.position.x, goal_pt.y - robot_pose.position.y)
+
+    # [핵심 1] Global 좌표 -> Robot Base 좌표로 변환
+    def transform_global_to_local(self, global_pt, robot_pose):
+        dx = global_pt[0] - robot_pose.position.x
+        dy = global_pt[1] - robot_pose.position.y
+        
+        import tf_transformations
+        _, _, robot_yaw = tf_transformations.euler_from_quaternion(
+            [robot_pose.orientation.x, robot_pose.orientation.y, robot_pose.orientation.z, robot_pose.orientation.w])
+
+        # 회전 변환 (Rotation Matrix)
+        # local_x가 양수면 전방, 음수면 후방에 위치
+        local_x = dx * math.cos(robot_yaw) + dy * math.sin(robot_yaw)
+        local_y = -dx * math.sin(robot_yaw) + dy * math.cos(robot_yaw)
+        
+        return local_x, local_y
+
+    def get_lookahead_point(self, robot_pose, lookahead_dist=0.4):
+        # (기존 코드와 동일하므로 생략 - 위에서 제공한 보간 로직 그대로 사용)
+        if not self.pruned_path or len(self.pruned_path.poses) < 2: return None
+        path_arr = np.array([(p.pose.position.x, p.pose.position.y) for p in self.pruned_path.poses])
+        robot_xy = np.array([robot_pose.position.x, robot_pose.position.y])
+        dists = np.linalg.norm(path_arr - robot_xy, axis=1)
+        min_idx = np.argmin(dists)
+        curr_dist = 0.0
+        target_pt = path_arr[min_idx]
+        for i in range(min_idx, len(path_arr) - 1):
+            p1 = path_arr[i]; p2 = path_arr[i+1]
+            seg_len = np.linalg.norm(p2 - p1)
+            if curr_dist + seg_len >= lookahead_dist:
+                ratio = (lookahead_dist - curr_dist) / seg_len
+                return p1 + (p2 - p1) * ratio
+            curr_dist += seg_len
+            target_pt = p2
+        return target_pt
+
+    def control_loop(self):
+        # Safety Check
+        if (self.get_clock().now() - self.latest_cmd_time).nanoseconds > 0.5 * 1e9:
+            self.cmd_pub.publish(Twist()); return
+
+        final_cmd = Twist()
+        final_cmd.linear = self.latest_cmd_vel.linear
+        final_cmd.angular = self.latest_cmd_vel.angular
+
+        # 1. 로봇 위치 (Map Frame)
+        try:
+            trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+            robot_pose = Pose()
+            robot_pose.position.x = trans.transform.translation.x
+            robot_pose.position.y = trans.transform.translation.y
+            robot_pose.position.z = trans.transform.translation.z
+            robot_pose.orientation = trans.transform.rotation
+            _, _, robot_yaw = tf_transformations.euler_from_quaternion(
+                [robot_pose.orientation.x, robot_pose.orientation.y, robot_pose.orientation.z, robot_pose.orientation.w])
+        except Exception:
+            self.cmd_pub.publish(final_cmd); return
+
+        if self.pruned_path is None: return
+
+        path_len = self.get_path_length()
+        dist_to_goal = self.get_dist_to_global_goal(robot_pose)
+
+        # =========================================================
+        # [Stage 2] Final Docking (0.05m 이내) -> X, Y 정밀 보정
+        # =========================================================
+        if dist_to_goal < 0.05:
+            
+            # 1. Tolerance Check (성공 시 정지)
+            if dist_to_goal < self.final_xy_tolerance:
+                final_cmd.linear.x = 0.0
+                final_cmd.angular.z = 0.0
+                self.is_correcting = True
+            
+            else:
+                # 2. Goal 좌표를 로봇 기준(Local)으로 변환
+                goal_pt_global = [self.pruned_path.poses[-1].pose.position.x, 
+                                  self.pruned_path.poses[-1].pose.position.y]
+                
+                local_x, local_y = self.transform_global_to_local(goal_pt_global, robot_pose)
+                
+                # 3. X축 제어 (전진/후진 결정)
+                # local_x가 양수면 전진, 음수면(지나쳤으면) 후진
+                # 거리에 비례하여 속도 조절 (P 제어)
+                kp_dist = 1.5 
+                target_vx = kp_dist * local_x 
+                
+                # 속도 제한 (최대 0.05 m/s, 최소 creep speed)
+                # 방향(Sign) 유지하면서 min/max 적용
+                speed_limit = 0.05
+                if abs(target_vx) > speed_limit:
+                    target_vx = math.copysign(speed_limit, target_vx)
+                
+                # 너무 느리면 최소 속도 보장 (방향 유지)
+                if abs(target_vx) < self.min_creep_speed:
+                     target_vx = math.copysign(self.min_creep_speed, target_vx)
+                
+                final_cmd.linear.x = target_vx
+
+                # 4. 각도 제어 (Steering)
+                # 후진 중일 때는 조향 로직이 달라져야 함
+                # atan2(y, x)는 후진 시(x<0) +-pi에 가까워짐 -> 후방을 타겟으로 맞춤
+                
+                # 타겟 지점을 향하는 각도
+                target_yaw_local = math.atan2(local_y, local_x)
+                
+                # 후진 시(local_x < 0)에는, 로봇의 "뒤쪽"이 타겟을 향해야 함.
+                # atan2 결과가 pi 근처이므로, pi를 빼거나 더해서 0 근처로 만듦 (후방 기준 오차)
+                if local_x < 0:
+                    yaw_error = normalize_angle(target_yaw_local - math.pi)
+                else:
+                    yaw_error = target_yaw_local
+
+                final_cmd.angular.z = 2.5 * yaw_error
+                final_cmd.angular.z = max(min(final_cmd.angular.z, 0.8), -0.8)
+
+                self.is_correcting = True
+
+        # =========================================================
+        # [Stage 1] Approach (Look-ahead)
+        # =========================================================
+        elif path_len < self.path_length_threshold:
+            
+            lookahead_pt = self.get_lookahead_point(robot_pose, lookahead_dist=0.4)
+            
+            if lookahead_pt is not None:
+                local_x, local_y = self.transform_global_to_local(lookahead_pt, robot_pose)
+                current_cte = abs(local_y)
+                
+                # Hysteresis
+                if not self.is_correcting:
+                    if current_cte > self.cte_enable_threshold: self.is_correcting = True
+                else:
+                    if current_cte < self.cte_disable_threshold: self.is_correcting = False
+
+                if self.is_correcting:
+                    # 곡률 제어
+                    dist_sq = local_x**2 + local_y**2
+                    curvature = 2.0 * local_y / dist_sq if dist_sq > 0 else 0
+                    
+                    # 속도: Nav2 명령 기반 (후진 명령이면 그대로 후진)
+                    # 만약 Nav2가 멈췄는데 보정이 필요하면 -> 전진으로 가정하고 Creep Speed
+                    if abs(final_cmd.linear.x) < 0.001:
+                        target_v = self.min_creep_speed
+                    else:
+                        target_v = final_cmd.linear.x 
+                        # 너무 느리면 최소 속도 보장 (부호 유지)
+                        if abs(target_v) < self.min_creep_speed:
+                            target_v = math.copysign(self.min_creep_speed, target_v)
+
+                    # 급커브 감속
+                    scaling = max(0.3, 1.0 - (abs(curvature) * 0.2))
+                    target_v *= scaling
+                    
+                    final_cmd.linear.x = target_v
+                    final_cmd.angular.z = target_v * curvature
+                    final_cmd.angular.z = max(min(final_cmd.angular.z, 0.8), -0.8)
+        else:
+            self.is_correcting = False
+
+        self.cmd_pub.publish(final_cmd)
+
+```
+
+### 💡 로직 동작 설명 (Why this works)
+
+1. **후진 자동 감지 (`local_x`):**
+* `transform_global_to_local` 함수를 통해 Goal이 로봇의 **앞(`local_x > 0`)**에 있는지 **뒤(`local_x < 0`)**에 있는지 판단합니다.
+* Goal을 지나쳤다면 `local_x`는 음수가 되고, `target_vx`도 음수가 되어 **로봇은 자연스럽게 후진**합니다.
+
+
+2. **후진 조향 로직 (`yaw_error`):**
+* **전진 시:** 목표점이 약간 왼쪽에 있으면, 왼쪽으로 회전합니다.
+* **후진 시:** 목표점이 로봇 뒤편 기준 약간 왼쪽에 있다면? 로봇 뒷꽁무니를 왼쪽으로 보내야 합니다. 이를 위해 `math.atan2` 값에서 `pi`를 빼주어 **"로봇 뒷면 기준 각도 오차"**를 계산합니다. 이로 인해 후진 중에도 엉뚱한 방향으로 돌지 않고 Goal을 향해 정확히 뒷걸음질 칩니다.
+
+
+3. **Tolerance 처리:**
+* 로봇이 Goal을 살짝 지나쳤더라도(Overshoot), 그 거리가 `final_xy_tolerance` 안이라면 `dist_to_goal < tolerance` 조건에 걸려 즉시 정지합니다. 불필요한 후진을 하지 않습니다.
+
+
+
+이 코드는 사용자의 "제자리 회전 금지", "후진 허용", "오버슈트 시 허용 범위 내 성공 처리" 요구사항을 모두 만족합니다.
