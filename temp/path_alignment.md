@@ -1365,3 +1365,265 @@ class StrictLateralDockingNode(Node):
 
 
 이 코드는 사용자의 "제자리 회전 금지", "후진 허용", "오버슈트 시 허용 범위 내 성공 처리" 요구사항을 모두 만족합니다.
+############################  
+##############################  
+################################  
+사용자님의 피드백을 정확히 이해했습니다. 수정해야 할 핵심 포인트는 두 가지입니다.
+
+1. **정지 조건 (Stop Condition) 수정:**
+* 기존:  오차만 작으면 정지.
+* **수정:** ** 오차**와 ** 오차**가 **모두** 허용 범위(Tolerance) 내에 들어왔을 때만 `cmd_vel`을 0.0으로 만듭니다.
+* **제어 방식:** Yaw를 맞추기 위해 강제로 제자리 회전을 시키지는 않되(사용자 요청), 주행하면서 자연스럽게 조건이 만족되기를 기다립니다.
+
+
+2. **속도 저하 문제 (Speed Issue) 해결:**
+* 기존: 곡률(Curvature)이 크면 안전을 위해 속도를 강제로 줄이는 로직(`scaling`)이 있었습니다. 이 때문에 Nav2가 0.5m/s를 줘도 제 노드가 0.2m/s로 깎아버리는 현상이 발생했습니다.
+* **수정:** Nav2가 생성한 속도(`cmd_vel_smoothed`)를 **최대한 그대로 사용**합니다. 단, 정밀 제어를 위해 **'최소 속도(Creep Speed)'보다 느릴 때만** 속도를 올려줍니다. (감속 로직 제거)
+
+
+
+---
+
+### 🛠️ 최종 개선된 코드
+
+이 코드는 **Yaw Tolerance를 체크**하며, **Nav2의 속도를 깎지 않고** 그대로 활용하여 부드럽고 빠르게 진입합니다.
+
+```python
+import rclpy
+from rclpy.node import Node
+from rclpy.duration import Duration
+from geometry_msgs.msg import Twist, Pose
+from nav_msgs.msg import Path, Odometry
+import tf2_ros
+import math
+import numpy as np
+import tf_transformations
+
+def normalize_angle(angle):
+    while angle > math.pi: angle -= 2.0 * math.pi
+    while angle < -math.pi: angle += 2.0 * math.pi
+    return angle
+
+class StrictLateralDockingNode(Node):
+    def __init__(self):
+        super().__init__('strict_lateral_docking_node')
+
+        # --- Parameters ---
+        self.path_length_threshold = 2.0    # 접근 제어 시작 거리
+        self.cte_enable_threshold = 0.025   # Y오차 2.5cm 이상 시 개입
+        self.cte_disable_threshold = 0.010  # Y오차 1.0cm 이하 시 해제
+        
+        # [수정 1] 정지 조건 파라미터 (XY와 Yaw 모두 만족해야 정지)
+        self.final_xy_tolerance = 0.01      # 1cm
+        self.final_yaw_tolerance = 0.05     # 약 2.8도 (라디안)
+        
+        # [수정 2] 속도 관련 파라미터
+        self.min_creep_speed = 0.02         # 보정을 위한 최소 속도
+        
+        # --- State ---
+        self.is_correcting = False
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        
+        self.latest_cmd_vel = Twist()
+        self.latest_cmd_time = self.get_clock().now()
+        self.pruned_path = None
+        
+        # --- Pub/Sub ---
+        self.create_subscription(Path, '/plan_pruned', self.pruned_path_callback, 10)
+        self.create_subscription(Twist, '/cmd_vel_smoothed', self.cmd_callback, 10)
+        self.create_subscription(Odometry, '/odom', lambda msg: None, 10) 
+        
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel_input_monitor', 10)
+        self.create_timer(0.05, self.control_loop)
+
+    def pruned_path_callback(self, msg): self.pruned_path = msg
+    def cmd_callback(self, msg): 
+        self.latest_cmd_vel = msg
+        self.latest_cmd_time = self.get_clock().now()
+
+    def get_path_length(self):
+        if not self.pruned_path or len(self.pruned_path.poses) < 2: return 0.0
+        coords = np.array([(p.pose.position.x, p.pose.position.y) for p in self.pruned_path.poses])
+        return np.sum(np.linalg.norm(coords[1:] - coords[:-1], axis=1))
+
+    def get_dist_to_global_goal(self, robot_pose):
+        if not self.pruned_path or len(self.pruned_path.poses) == 0: return float('inf')
+        goal_pt = self.pruned_path.poses[-1].pose.position
+        return math.hypot(goal_pt.x - robot_pose.position.x, goal_pt.y - robot_pose.position.y)
+
+    def transform_global_to_local(self, global_pt, robot_pose):
+        dx = global_pt[0] - robot_pose.position.x
+        dy = global_pt[1] - robot_pose.position.y
+        
+        import tf_transformations
+        _, _, robot_yaw = tf_transformations.euler_from_quaternion(
+            [robot_pose.orientation.x, robot_pose.orientation.y, robot_pose.orientation.z, robot_pose.orientation.w])
+
+        local_x = dx * math.cos(robot_yaw) + dy * math.sin(robot_yaw)
+        local_y = -dx * math.sin(robot_yaw) + dy * math.cos(robot_yaw)
+        return local_x, local_y, robot_yaw
+
+    def get_lookahead_point(self, robot_pose, lookahead_dist=0.4):
+        if not self.pruned_path or len(self.pruned_path.poses) < 2: return None
+        path_arr = np.array([(p.pose.position.x, p.pose.position.y) for p in self.pruned_path.poses])
+        robot_xy = np.array([robot_pose.position.x, robot_pose.position.y])
+        dists = np.linalg.norm(path_arr - robot_xy, axis=1)
+        min_idx = np.argmin(dists)
+        curr_dist = 0.0
+        target_pt = path_arr[min_idx]
+        for i in range(min_idx, len(path_arr) - 1):
+            p1 = path_arr[i]; p2 = path_arr[i+1]
+            seg_len = np.linalg.norm(p2 - p1)
+            if curr_dist + seg_len >= lookahead_dist:
+                ratio = (lookahead_dist - curr_dist) / seg_len
+                return p1 + (p2 - p1) * ratio
+            curr_dist += seg_len
+            target_pt = p2
+        return target_pt
+
+    def control_loop(self):
+        # Safety Check
+        if (self.get_clock().now() - self.latest_cmd_time).nanoseconds > 0.5 * 1e9:
+            self.cmd_pub.publish(Twist()); return
+
+        # Nav2에서 오는 명령을 기본으로 사용
+        final_cmd = Twist()
+        final_cmd.linear = self.latest_cmd_vel.linear
+        final_cmd.angular = self.latest_cmd_vel.angular
+
+        # Robot Pose Lookup
+        try:
+            trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+            robot_pose = Pose()
+            robot_pose.position.x = trans.transform.translation.x
+            robot_pose.position.y = trans.transform.translation.y
+            robot_pose.position.z = trans.transform.translation.z
+            robot_pose.orientation = trans.transform.rotation
+        except Exception:
+            self.cmd_pub.publish(final_cmd); return
+
+        if self.pruned_path is None: return
+
+        path_len = self.get_path_length()
+        dist_to_goal = self.get_dist_to_global_goal(robot_pose)
+
+        # =========================================================
+        # [Stage 2] Final Docking (0.05m 이내)
+        # =========================================================
+        if dist_to_goal < 0.05:
+            
+            # Goal Pose 계산 (Yaw 오차 확인용)
+            goal_pose_global = self.pruned_path.poses[-1].pose
+            _, _, goal_yaw = tf_transformations.euler_from_quaternion(
+                [goal_pose_global.orientation.x, goal_pose_global.orientation.y, goal_pose_global.orientation.z, goal_pose_global.orientation.w])
+            
+            _, _, current_yaw = tf_transformations.euler_from_quaternion(
+                [robot_pose.orientation.x, robot_pose.orientation.y, robot_pose.orientation.z, robot_pose.orientation.w])
+            
+            yaw_error = normalize_angle(goal_yaw - current_yaw)
+
+            # [수정 1] 정지 조건 강화: XY 와 Yaw 모두 만족해야 0.0 전송
+            xy_ok = dist_to_goal < self.final_xy_tolerance
+            yaw_ok = abs(yaw_error) < self.final_yaw_tolerance
+
+            if xy_ok and yaw_ok:
+                final_cmd.linear.x = 0.0
+                final_cmd.angular.z = 0.0
+                self.is_correcting = True
+            
+            else:
+                # 둘 중 하나라도 만족 못하면 계속 미세 조정 (X,Y 타겟으로 이동)
+                goal_pt_global = [goal_pose_global.position.x, goal_pose_global.position.y]
+                local_x, local_y, _ = self.transform_global_to_local(goal_pt_global, robot_pose)
+                
+                # P-Control for Linear Velocity (Local X)
+                kp_dist = 1.5 
+                target_vx = kp_dist * local_x 
+                
+                # 속도 제한 (최대 0.1 m/s - Final 단계이므로 너무 빠르면 안됨)
+                speed_limit = 0.1 
+                if abs(target_vx) > speed_limit:
+                    target_vx = math.copysign(speed_limit, target_vx)
+                
+                # 최소 기동 속도 보장 (이동해야 보정이 되므로)
+                if abs(target_vx) < self.min_creep_speed:
+                     target_vx = math.copysign(self.min_creep_speed, target_vx)
+                
+                final_cmd.linear.x = target_vx
+
+                # Steering Control (Target Point를 향해 조향)
+                target_yaw_local = math.atan2(local_y, local_x)
+                
+                # 후진 시 조향 보정
+                if local_x < 0:
+                    steering_error = normalize_angle(target_yaw_local - math.pi)
+                else:
+                    steering_error = target_yaw_local
+
+                final_cmd.angular.z = 2.5 * steering_error
+                final_cmd.angular.z = max(min(final_cmd.angular.z, 0.8), -0.8)
+
+                self.is_correcting = True
+
+        # =========================================================
+        # [Stage 1] Approach (Look-ahead)
+        # =========================================================
+        elif path_len < self.path_length_threshold:
+            
+            lookahead_pt = self.get_lookahead_point(robot_pose, lookahead_dist=0.4)
+            
+            if lookahead_pt is not None:
+                local_x, local_y, _ = self.transform_global_to_local(lookahead_pt, robot_pose)
+                current_cte = abs(local_y)
+                
+                # Hysteresis
+                if not self.is_correcting:
+                    if current_cte > self.cte_enable_threshold: self.is_correcting = True
+                else:
+                    if current_cte < self.cte_disable_threshold: self.is_correcting = False
+
+                if self.is_correcting:
+                    # [수정 2] 속도 로직 개선
+                    # 곡률에 따른 강제 감속(Scaling) 삭제.
+                    # Nav2가 주는 속도(final_cmd.linear.x)를 최대한 신뢰함.
+                    
+                    target_v = final_cmd.linear.x
+                    
+                    # 단, 보정 중인데 Nav2가 정지 명령(0)에 가깝게 주면 
+                    # 로봇이 멈춰서 보정을 못하므로 '최소 속도'만 부여함 (Floor)
+                    if abs(target_v) < self.min_creep_speed:
+                         # Nav2가 멈추라고 했어도, 내가 보정 중이면 움직여야 함
+                         # 원래 명령의 부호가 있으면 그 부호를 따르고, 없으면 전진으로 가정
+                         if abs(target_v) < 0.001:
+                             target_v = self.min_creep_speed # 기본 전진
+                         else:
+                             target_v = math.copysign(self.min_creep_speed, target_v)
+
+                    # Pure Pursuit Steering
+                    dist_sq = local_x**2 + local_y**2
+                    curvature = 2.0 * local_y / dist_sq if dist_sq > 0 else 0
+                    
+                    final_cmd.linear.x = target_v
+                    final_cmd.angular.z = target_v * curvature
+                    final_cmd.angular.z = max(min(final_cmd.angular.z, 0.8), -0.8)
+
+        else:
+            self.is_correcting = False
+
+        self.cmd_pub.publish(final_cmd)
+
+```
+
+### 🧐 주요 변경 사항 요약
+
+**1. Stop Condition: "X, Y, Yaw 모두 만족해야 멈춤"**
+
+* `if xy_ok and yaw_ok:` 조건을 사용하여, 목표 지점에 도달했더라도 각도가 틀어져 있다면 멈추지 않고 계속 미세 주행(Local X, Y 제어)을 합니다.
+* 사용자 요청대로 각도 보정을 위한 별도의 `angular_z` 제어 로직을 넣지는 않았습니다. 대신 로봇이 목표점(Local 0,0)을 향해 계속 움직이면, 차동 구동 로봇 특성상 Yaw도 자연스럽게 맞춰집니다.
+
+**2. 속도 개선: "Nav2 속도 신뢰"**
+
+* 기존: `scaling = 1.0 - curvature...` 로직 때문에 커브에서 무조건 감속했습니다.
+* **변경:** `target_v = final_cmd.linear.x`로 설정하여 **Nav2(Velocity Smoother)가 계산한 속도를 그대로 사용**합니다.
+* 단, `is_correcting` 상태인데 속도가 너무 느리면(0.02 미만), 보정을 수행하기 위해 **최소 속도(Creep Speed)로만 올려주는(Floor)** 역할만 수행합니다. 이제 훨씬 시원하게 주행할 것입니다.
