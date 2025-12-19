@@ -1793,3 +1793,320 @@ class StrictLateralDockingNode(Node):
 * 이 `diff`를 `±max_linear_diff` 범위로 자릅니다.
 * `최종 출력 = Nav2값 + 잘린 diff`
 * 이렇게 하면 Nav2가 0.1m/s를 주고 내가 0.3m/s를 주고 싶어도, 차이가 허용치(0.05)보다 크면 0.15m/s까지만 변경되어 **급발진을 방지**합니다.
+##################
+#######################
+#########################
+네, ROS 2에서 여러 토픽을 동시에 원활하게 처리하고, 특히 `control_loop`와 데이터 수신(Callback)이 서로를 막지 않게 하려면 **`MultiThreadedExecutor`**와 **`ReentrantCallbackGroup`**을 사용하는 것이 정석입니다.
+
+제안하신 대로 멀티스레딩을 적용하여 **"모든 콜백이 병렬로 막힘없이 실행되도록"** 개선한 전체 코드를 드립니다.
+
+### 🚀 개선된 점
+
+1. **`ReentrantCallbackGroup` 적용:** 모든 Subscriber와 Timer가 이 그룹을 공유하게 하여, 하나의 콜백이 실행 중이어도 다른 콜백(예: TF 업데이트, Path 수신)이 기다리지 않고 별도 스레드에서 즉시 실행됩니다.
+2. **`MultiThreadedExecutor` 사용:** `main` 함수에서 노드를 실행할 때 여러 스레드 풀을 사용하여 병렬 처리를 수행합니다.
+
+---
+
+### 🛠️ 최종 완성 코드 (Multi-Thread 적용)
+
+```python
+import rclpy
+from rclpy.node import Node
+from rclpy.duration import Duration
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from geometry_msgs.msg import Twist, Pose
+from nav_msgs.msg import Path, Odometry
+import tf2_ros
+import math
+import numpy as np
+import tf_transformations
+
+def normalize_angle(angle):
+    while angle > math.pi: angle -= 2.0 * math.pi
+    while angle < -math.pi: angle += 2.0 * math.pi
+    return angle
+
+class StrictLateralDockingNode(Node):
+    def __init__(self):
+        super().__init__('strict_lateral_docking_node')
+
+        # --- [New] Callback Group for Multi-threading ---
+        # Reentrant: 이 그룹 내의 콜백들은 서로 병렬 실행 가능
+        self.callback_group = ReentrantCallbackGroup()
+
+        # --- Parameters ---
+        self.path_length_threshold = 2.0
+        self.cte_enable_threshold = 0.025
+        self.cte_disable_threshold = 0.010
+        
+        # Tolerance
+        self.final_xy_tolerance = 0.01      
+        self.final_yaw_tolerance = 0.05     
+        
+        # Stability & Clamping
+        self.xy_stable_duration = 1.0       
+        self.max_linear_diff = 0.05         
+        self.max_angular_diff = 0.5         
+        self.min_creep_speed = 0.02
+
+        # --- State ---
+        self.is_correcting = False
+        self.xy_stable_start_time = None
+        self.xy_completed = False
+
+        self.latest_cmd_vel = Twist()
+        self.latest_cmd_time = self.get_clock().now()
+        self.pruned_path = None
+        
+        # --- TF Buffer ---
+        self.tf_buffer = tf2_ros.Buffer()
+        # TF Listener는 내부적으로 노드의 Executor를 사용하므로 MultiThreadedExecutor의 혜택을 받음
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        
+        # --- Subscribers (Callback Group 적용) ---
+        self.create_subscription(
+            Path, 
+            '/plan_pruned', 
+            self.pruned_path_callback, 
+            10,
+            callback_group=self.callback_group # 병렬 처리
+        )
+        self.create_subscription(
+            Twist, 
+            '/cmd_vel_smoothed', 
+            self.cmd_callback, 
+            10,
+            callback_group=self.callback_group # 병렬 처리
+        )
+        # Odom은 TF 조회를 위해 필요할 수 있으나, 여기서는 더미로만 사용
+        self.create_subscription(
+            Odometry, 
+            '/odom', 
+            lambda msg: None, 
+            10,
+            callback_group=self.callback_group
+        )
+        
+        # --- Publisher ---
+        self.cmd_pub = self.create_publisher(
+            Twist, 
+            '/cmd_vel_input_monitor', 
+            10,
+            callback_group=self.callback_group
+        )
+        
+        # --- Timer (Control Loop) ---
+        # 제어 루프도 별도 스레드에서 돌 수 있도록 설정
+        self.create_timer(
+            0.05, 
+            self.control_loop, 
+            callback_group=self.callback_group
+        )
+
+    def pruned_path_callback(self, msg): 
+        self.pruned_path = msg
+
+    def cmd_callback(self, msg): 
+        self.latest_cmd_vel = msg
+        self.latest_cmd_time = self.get_clock().now()
+
+    def get_path_length(self):
+        if not self.pruned_path or len(self.pruned_path.poses) < 2: return 0.0
+        coords = np.array([(p.pose.position.x, p.pose.position.y) for p in self.pruned_path.poses])
+        return np.sum(np.linalg.norm(coords[1:] - coords[:-1], axis=1))
+
+    def get_dist_to_global_goal(self, robot_pose):
+        if not self.pruned_path or len(self.pruned_path.poses) == 0: return float('inf')
+        goal_pt = self.pruned_path.poses[-1].pose.position
+        return math.hypot(goal_pt.x - robot_pose.position.x, goal_pt.y - robot_pose.position.y)
+
+    def transform_global_to_local(self, global_pt, robot_pose):
+        dx = global_pt[0] - robot_pose.position.x
+        dy = global_pt[1] - robot_pose.position.y
+        
+        import tf_transformations
+        _, _, robot_yaw = tf_transformations.euler_from_quaternion(
+            [robot_pose.orientation.x, robot_pose.orientation.y, robot_pose.orientation.z, robot_pose.orientation.w])
+
+        local_x = dx * math.cos(robot_yaw) + dy * math.sin(robot_yaw)
+        local_y = -dx * math.sin(robot_yaw) + dy * math.cos(robot_yaw)
+        return local_x, local_y, robot_yaw
+
+    def get_lookahead_point(self, robot_pose, lookahead_dist=0.4):
+        if not self.pruned_path or len(self.pruned_path.poses) < 2: return None
+        path_arr = np.array([(p.pose.position.x, p.pose.position.y) for p in self.pruned_path.poses])
+        robot_xy = np.array([robot_pose.position.x, robot_pose.position.y])
+        dists = np.linalg.norm(path_arr - robot_xy, axis=1)
+        min_idx = np.argmin(dists)
+        curr_dist = 0.0
+        target_pt = path_arr[min_idx]
+        for i in range(min_idx, len(path_arr) - 1):
+            p1 = path_arr[i]; p2 = path_arr[i+1]
+            seg_len = np.linalg.norm(p2 - p1)
+            if curr_dist + seg_len >= lookahead_dist:
+                ratio = (lookahead_dist - curr_dist) / seg_len
+                return p1 + (p2 - p1) * ratio
+            curr_dist += seg_len
+            target_pt = p2
+        return target_pt
+
+    def control_loop(self):
+        # Safety Check
+        if (self.get_clock().now() - self.latest_cmd_time).nanoseconds > 0.5 * 1e9:
+            self.cmd_pub.publish(Twist()); return
+
+        final_cmd = Twist()
+        final_cmd.linear = self.latest_cmd_vel.linear
+        final_cmd.angular = self.latest_cmd_vel.angular
+
+        # Robot Pose Lookup
+        try:
+            trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+            robot_pose = Pose()
+            robot_pose.position.x = trans.transform.translation.x
+            robot_pose.position.y = trans.transform.translation.y
+            robot_pose.position.z = trans.transform.translation.z
+            robot_pose.orientation = trans.transform.rotation
+        except Exception:
+            self.cmd_pub.publish(final_cmd); return
+
+        if self.pruned_path is None: return
+
+        path_len = self.get_path_length()
+        dist_to_goal = self.get_dist_to_global_goal(robot_pose)
+
+        # =========================================================
+        # [Stage 2] Final Docking (0.05m 이내)
+        # =========================================================
+        if dist_to_goal < 0.05:
+            
+            # Goal Pose & Yaw Error
+            goal_pose_global = self.pruned_path.poses[-1].pose
+            _, _, goal_yaw = tf_transformations.euler_from_quaternion(
+                [goal_pose_global.orientation.x, goal_pose_global.orientation.y, goal_pose_global.orientation.z, goal_pose_global.orientation.w])
+            
+            _, _, current_yaw = tf_transformations.euler_from_quaternion(
+                [robot_pose.orientation.x, robot_pose.orientation.y, robot_pose.orientation.z, robot_pose.orientation.w])
+            
+            yaw_error = normalize_angle(goal_yaw - current_yaw)
+            
+            xy_satisfied = dist_to_goal < self.final_xy_tolerance
+            yaw_satisfied = abs(yaw_error) < self.final_yaw_tolerance
+
+            # 1. Complete Stop (All satisfied)
+            if xy_satisfied and yaw_satisfied:
+                final_cmd.linear.x = 0.0
+                final_cmd.angular.z = 0.0
+                self.cmd_pub.publish(final_cmd)
+                self.is_correcting = True
+                return
+
+            # 2. Bypass Check (XY Stable)
+            if xy_satisfied:
+                if self.xy_stable_start_time is None:
+                    self.xy_stable_start_time = self.get_clock().now()
+                
+                elapsed = (self.get_clock().now() - self.xy_stable_start_time).nanoseconds / 1e9
+                if elapsed > self.xy_stable_duration:
+                    self.xy_completed = True
+            else:
+                self.xy_stable_start_time = None
+                self.xy_completed = False
+
+            if self.xy_completed:
+                self.is_correcting = False
+                self.cmd_pub.publish(final_cmd) # Bypass
+                return
+
+            # 3. Correction & Clamping
+            goal_pt_global = [goal_pose_global.position.x, goal_pose_global.position.y]
+            local_x, local_y, _ = self.transform_global_to_local(goal_pt_global, robot_pose)
+            
+            # Calc Linear
+            kp_dist = 1.5 
+            calc_vx = kp_dist * local_x 
+            speed_limit = 0.1 
+            if abs(calc_vx) > speed_limit:
+                calc_vx = math.copysign(speed_limit, calc_vx)
+            if abs(calc_vx) < self.min_creep_speed:
+                 calc_vx = math.copysign(self.min_creep_speed, calc_vx)
+
+            # Calc Angular
+            target_yaw_local = math.atan2(local_y, local_x)
+            if local_x < 0:
+                steering_error = normalize_angle(target_yaw_local - math.pi)
+            else:
+                steering_error = target_yaw_local
+
+            calc_w = 2.5 * steering_error
+            calc_w = max(min(calc_w, 0.8), -0.8)
+
+            # [Clamping Logic]
+            lin_diff = calc_vx - final_cmd.linear.x
+            lin_diff = max(min(lin_diff, self.max_linear_diff), -self.max_linear_diff)
+            final_cmd.linear.x = final_cmd.linear.x + lin_diff
+
+            ang_diff = calc_w - final_cmd.angular.z
+            ang_diff = max(min(ang_diff, self.max_angular_diff), -self.max_angular_diff)
+            final_cmd.angular.z = final_cmd.angular.z + ang_diff
+
+            self.is_correcting = True
+
+        # =========================================================
+        # [Stage 1] Approach (Look-ahead)
+        # =========================================================
+        elif path_len < self.path_length_threshold:
+            
+            lookahead_pt = self.get_lookahead_point(robot_pose, lookahead_dist=0.4)
+            
+            if lookahead_pt is not None:
+                local_x, local_y, _ = self.transform_global_to_local(lookahead_pt, robot_pose)
+                current_cte = abs(local_y)
+                
+                if not self.is_correcting:
+                    if current_cte > self.cte_enable_threshold: self.is_correcting = True
+                else:
+                    if current_cte < self.cte_disable_threshold: self.is_correcting = False
+
+                if self.is_correcting:
+                    target_v = final_cmd.linear.x
+                    
+                    if abs(target_v) < self.min_creep_speed:
+                         if abs(target_v) < 0.001:
+                             target_v = self.min_creep_speed 
+                         else:
+                             target_v = math.copysign(self.min_creep_speed, target_v)
+
+                    dist_sq = local_x**2 + local_y**2
+                    curvature = 2.0 * local_y / dist_sq if dist_sq > 0 else 0
+                    
+                    final_cmd.linear.x = target_v
+                    final_cmd.angular.z = target_v * curvature
+                    final_cmd.angular.z = max(min(final_cmd.angular.z, 0.8), -0.8)
+
+        else:
+            self.is_correcting = False
+
+        self.cmd_pub.publish(final_cmd)
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = StrictLateralDockingNode()
+    
+    # [New] MultiThreadedExecutor 사용
+    # 여러 스레드를 사용하여 CallbackGroup에 등록된 작업들을 병렬로 처리함
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    
+    try:
+        executor.spin()
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+```
