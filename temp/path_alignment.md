@@ -443,3 +443,171 @@ Goal에 도착했는데 y 오차를 못 잡고 멈춰버리는 것을 방지합�
 3. **계산된 CTE 값** (로그로 찍어서 확인)
 
 이제 이 가이드를 바탕으로 실제 로봇에서 파라미터를 조금씩 만지면서 "쫀득한" 주행감을 찾아보시기 바랍니다!
+
+###########################  
+################################  
+#################################  
+`target_yaw` 부호를 바꿨더니 발산했다면, 원래의 부호(`-`)가 방향 자체는 맞았던 것입니다. 그런데도 **"원래 코드를 써도 오차가 더 커진다"**는 것은 **"제어 방식" 자체에 구조적인 문제**가 있다는 뜻입니다.
+
+가장 유력한 원인은 **"가장 가까운 점(Nearest Point)만 보고 제어했기 때문"**입니다.
+
+### 🔴 문제의 원인: "너무 가까운 곳을 보고 있다"
+
+기존 코드는 로봇 바로 옆에 있는 **가장 가까운 경로점**을 기준으로 CTE를 계산하고 핸들을 꺾습니다.
+
+* 이렇게 되면 로봇이 조금만 방향을 틀어도 CTE가 급격하게 변하고, 로봇은 **S자로 휘청거리거나(Oscillation)** 경로에 수렴하지 못하고 **밀려나는 현상**이 발생합니다.
+* 사람이 운전할 때 범퍼 바로 밑을 보고 운전하면 차가 비틀거리는 것과 같습니다. **약간 앞(Look-ahead)**을 보고 운전해야 부드럽게 라인을 탑니다.
+
+---
+
+### 🟢 해결책: "Look-ahead (전방 주시) 방식"으로 변경
+
+복잡한 Stanley(CTE 계산) 방식 대신, 훨씬 직관적이고 강력한 **Pure Pursuit 스타일의 Look-ahead 로직**으로 변경합시다.
+
+1. **로직:** 경로 상에서 로봇보다 **약 0.3m ~ 0.5m 앞에 있는 점(Look-ahead Point)**을 찾습니다.
+2. **제어:** 로봇이 **그 점을 바라보도록** 회전시킵니다.
+3. **장점:** 이렇게 하면 자연스럽게 경로(y=0)로 부드럽게 빨려 들어갑니다. 수학적으로 수렴성이 훨씬 좋습니다.
+
+### 🛠️ 개선된 코드 (Look-ahead 적용)
+
+기존 `StrictLateralDockingNode` 클래스 내부의 메소드들을 아래 코드로 **완전히 교체**해 주세요.
+(import 부분은 기존과 동일하게 유지하시면 됩니다.)
+
+```python
+    # ... (기존 import 및 __init__ 등은 유지) ...
+
+    # [수정됨] Nearest Point가 아니라, 앞서 있는 점(Look-ahead)을 찾음
+    def get_lookahead_point(self, robot_pose, lookahead_dist=0.4):
+        """
+        로봇 위치에서 경로상 전방 lookahead_dist 만큼 떨어진 점을 반환
+        """
+        if not self.pruned_path or len(self.pruned_path.poses) < 2:
+            return None
+
+        path_arr = np.array([(p.pose.position.x, p.pose.position.y) for p in self.pruned_path.poses])
+        robot_xy = np.array([robot_pose.position.x, robot_pose.position.y])
+        
+        # 1. 가장 가까운 점 인덱스 찾기
+        dists = np.linalg.norm(path_arr - robot_xy, axis=1)
+        min_idx = np.argmin(dists)
+        
+        # 2. 거기서부터 경로를 따라가며 lookahead 거리만큼 떨어진 점 찾기
+        curr_dist = 0.0
+        target_pt = path_arr[min_idx] # Default: nearest
+        
+        for i in range(min_idx, len(path_arr) - 1):
+            p1 = path_arr[i]
+            p2 = path_arr[i+1]
+            segment_len = np.linalg.norm(p2 - p1)
+            
+            if curr_dist + segment_len >= lookahead_dist:
+                # 이 세그먼트 위에 타겟이 있음 (보간)
+                ratio = (lookahead_dist - curr_dist) / segment_len
+                target_pt = p1 + (p2 - p1) * ratio
+                return target_pt # [x, y] 반환
+            
+            curr_dist += segment_len
+            target_pt = p2 # 끝까지 못 찾으면 마지막 점
+
+        return target_pt
+
+    # [수정됨] 제어 루프: CTE 대신 Look-ahead 각도 추종
+    def control_loop(self):
+        # 0. Safety Check
+        if (self.get_clock().now() - self.latest_cmd_time).nanoseconds > 0.5 * 1e9:
+            self.cmd_pub.publish(Twist())
+            return
+
+        final_cmd = Twist()
+        final_cmd.linear = self.latest_cmd_vel.linear
+        final_cmd.angular = self.latest_cmd_vel.angular
+
+        # 후진 시 Bypass
+        if final_cmd.linear.x < 0.0:
+            self.cmd_pub.publish(final_cmd)
+            self.is_correcting = False
+            return
+
+        # 1. 로봇 위치 (Map Frame) 구하기
+        try:
+            trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+            robot_pose = Pose()
+            robot_pose.position.x = trans.transform.translation.x
+            robot_pose.position.y = trans.transform.translation.y
+            robot_pose.position.z = trans.transform.translation.z
+            robot_pose.orientation = trans.transform.rotation
+            _, _, robot_yaw = tf_transformations.euler_from_quaternion(
+                [robot_pose.orientation.x, robot_pose.orientation.y, robot_pose.orientation.z, robot_pose.orientation.w])
+        except Exception:
+            self.cmd_pub.publish(final_cmd)
+            return
+
+        if self.pruned_path is None: return
+
+        path_len = self.get_path_length()
+
+        # 2. Goal 진입 (2.5m 이내)
+        if path_len < self.path_length_threshold:
+            
+            # --- Look-ahead Logic 적용 ---
+            # 전방 0.4m 지점을 바라보게 함 (속도에 따라 가변적으로 해도 좋음)
+            lookahead_pt = self.get_lookahead_point(robot_pose, lookahead_dist=0.4)
+            
+            if lookahead_pt is not None:
+                # 타겟 점까지의 각도 계산
+                dy = lookahead_pt[1] - robot_pose.position.y
+                dx = lookahead_pt[0] - robot_pose.position.x
+                target_yaw = math.atan2(dy, dx)
+                
+                # Yaw Error 계산
+                yaw_error = normalize_angle(target_yaw - robot_yaw)
+                
+                # Y 오차 추정 (활성화 여부 판단용 - 근사치)
+                # 현재 로봇이 타겟 벡터에서 얼마나 떨어져 있나 체크
+                # 간단하게는 path 상의 nearest point와의 거리 사용
+                path_arr = np.array([(p.pose.position.x, p.pose.position.y) for p in self.pruned_path.poses])
+                robot_xy = np.array([robot_pose.position.x, robot_pose.position.y])
+                min_dist = np.min(np.linalg.norm(path_arr - robot_xy, axis=1)) # 이것이 대략적인 y 오차
+                
+                # --- Hysteresis Logic ---
+                if not self.is_correcting:
+                    if min_dist > self.cte_enable_threshold: # 2.5cm
+                        self.is_correcting = True
+                else:
+                    if min_dist < self.cte_disable_threshold: # 1.0cm
+                        self.is_correcting = False
+
+                # --- Control Execution ---
+                if self.is_correcting:
+                    # 1. 회전 제어 (Look-ahead point를 향해 돌기)
+                    # P Gain을 적절히 조절 (너무 크면 흔들림)
+                    final_cmd.angular.z = 2.0 * yaw_error 
+                    
+                    # 2. 최대 회전 속도 제한 (안전)
+                    final_cmd.angular.z = max(min(final_cmd.angular.z, 0.6), -0.6)
+
+                    # 3. Creep Speed (최소 속도 유지)
+                    # 오차(yaw error)가 크면 속도를 줄이고, 방향이 맞으면 속도를 냄
+                    if abs(yaw_error) > 0.2: # 각도가 많이 틀어졌으면 천천히
+                        final_cmd.linear.x = self.min_creep_speed # 0.02
+                    else:
+                        # 각도가 대충 맞으면 조금 더 속도를 냄 (y축 수렴 가속화)
+                        final_cmd.linear.x = max(final_cmd.linear.x, 0.05)
+
+        else:
+            self.is_correcting = False
+
+        self.cmd_pub.publish(final_cmd)
+
+```
+
+### 💡 왜 이 방식이 더 좋을까요?
+
+1. **자연스러운 수렴:** "내 옆에 있는 선(CTE)에 맞춰라!"라고 하면 로봇이 게걸음(Sway)을 칠 수 없어서 비틀거리지만, "저기 앞에 있는 점(Look-ahead)을 보고 가라!"라고 하면 자동차가 차선을 변경하듯 **자연스러운 곡선**을 그리며 합류합니다.
+2. **부호 문제 없음:** `atan2(dy, dx)`를 사용하므로 좌표계나 방향 부호가 틀릴 일이 거의 없습니다. 무조건 타겟 점을 향해 돕니다.
+3. **튜닝 포인트:**
+* `lookahead_dist=0.4`: 이 값을 **늘리면(0.6)** 반응은 느리지만 주행이 부드러워지고, **줄이면(0.2)** 반응은 빠르지만 흔들릴 수 있습니다. **0.4m** 정도가 실내 주행로봇에 적당합니다.
+
+
+
+이 코드로 변경하시면 기존의 "발산하거나 오차가 커지는 문제"가 확실히 잡힐 것입니다.
