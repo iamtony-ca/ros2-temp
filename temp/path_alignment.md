@@ -784,3 +784,160 @@ Goal에 도착했는데 y 오차를 못 잡고 멈춰버리는 것을 방지합�
 
 
 이제 커브 구간에서도 로봇이 멈칫하지 않고 물 흐르듯 라인을 타면서 Goal로 들어갈 것입니다.
+##########################  
+############################  
+###############################  
+사용자님의 요구사항은 **"Goal 5cm 이내(Last Inch)에 진입하면 를 모두 완벽하게 맞추는 정밀 주차 모드(Final Adjustment)를 추가"**하는 것입니다.
+
+기존 코드는 `is_correcting` 플래그 하나로 축 보정만 담당했습니다. 이제 이를 확장하여 **두 단계(2-Stage) 제어 전략**을 적용해야 합니다.
+
+1. **Stage 1 (접근 단계):** 기존 로직 유지. Look-ahead로 부드럽게 경로()를 맞추며 접근.
+2. **Stage 2 (초근접 단계):** Goal 기준 거리 0.05m 이내 진입 시 발동.  오차를 모두 0으로 수렴시킴.
+
+---
+
+### 🛠️ 기능 추가 및 개선된 코드
+
+기존 코드를 바탕으로 **`control_loop`** 내부에 **Stage 2 (Final Docking)** 로직을 추가했습니다.
+
+```python
+    # ... (기존 메소드들: get_lookahead_point, get_path_length 등은 그대로 사용) ...
+
+    # [신규 추가] Goal까지 남은 유클리드 거리 계산
+    def get_dist_to_global_goal(self, robot_pose):
+        if not self.pruned_path or len(self.pruned_path.poses) == 0:
+            return float('inf')
+        # Pruned Path의 마지막 점이 곧 현재의 Global Goal Target임
+        goal_pt = self.pruned_path.poses[-1].pose.position
+        dx = goal_pt.x - robot_pose.position.x
+        dy = goal_pt.y - robot_pose.position.y
+        return math.hypot(dx, dy)
+
+    def control_loop(self):
+        # 0. Safety Check & Init
+        current_time = self.get_clock().now()
+        if (current_time - self.latest_cmd_time).nanoseconds > 0.5 * 1e9:
+            self.cmd_pub.publish(Twist())
+            return
+
+        final_cmd = Twist()
+        final_cmd.linear = self.latest_cmd_vel.linear
+        final_cmd.angular = self.latest_cmd_vel.angular
+
+        # 후진 시 Bypass
+        if final_cmd.linear.x < 0.0:
+            self.cmd_pub.publish(final_cmd)
+            self.is_correcting = False
+            return
+
+        # 1. 로봇 위치 (Map Frame) 구하기
+        try:
+            trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+            robot_pose = Pose()
+            robot_pose.position.x = trans.transform.translation.x
+            robot_pose.position.y = trans.transform.translation.y
+            robot_pose.position.z = trans.transform.translation.z
+            robot_pose.orientation = trans.transform.rotation
+            _, _, robot_yaw = tf_transformations.euler_from_quaternion(
+                [robot_pose.orientation.x, robot_pose.orientation.y, robot_pose.orientation.z, robot_pose.orientation.w])
+        except Exception:
+            self.cmd_pub.publish(final_cmd)
+            return
+
+        if self.pruned_path is None: return
+
+        # 거리 측정
+        path_len = self.get_path_length()
+        dist_to_goal = self.get_dist_to_global_goal(robot_pose)
+
+        # =========================================================
+        # [Stage 2] 초근접 정밀 보정 (0.05m 이내) -> X, Y 모두 보정
+        # =========================================================
+        if dist_to_goal < 0.05:
+            # 여기서는 Lookahead 안 씀. 바로 Goal 점을 향해 감.
+            goal_pt = self.pruned_path.poses[-1].pose.position
+            dx = goal_pt.x - robot_pose.position.x
+            dy = goal_pt.y - robot_pose.position.y
+            
+            # Goal 방향 각도
+            target_yaw = math.atan2(dy, dx)
+            yaw_error = normalize_angle(target_yaw - robot_yaw)
+            
+            # Yaw Tolerance Check (ex: 20도 이상 틀어져 있으면 회전만 함)
+            if abs(yaw_error) > math.radians(20.0):
+                final_cmd.linear.x = 0.0
+                final_cmd.angular.z = 1.5 * yaw_error # 제자리 회전
+            else:
+                # 각도가 대충 맞으면 아주 천천히 전진하며 미세 조정
+                # 남은 거리(dist_to_goal)가 0이 될 때까지 감
+                final_cmd.linear.x = min(0.02, dist_to_goal) # 최대 0.02m/s, 가까워지면 더 감속
+                final_cmd.angular.z = 2.0 * yaw_error # 가면서도 계속 방향 맞춤
+            
+            # Safety Clamp
+            final_cmd.angular.z = max(min(final_cmd.angular.z, 0.5), -0.5)
+            
+            # [중요] 이 단계에서는 무조건 Custom 제어가 Nav2 명령을 덮어씀
+            # Nav2가 멈추라고(0) 해도, 내가 0.05m 안에 있으면 밀고 들어감.
+            self.is_correcting = True 
+
+        # =========================================================
+        # [Stage 1] 접근 단계 보정 (2.5m 이내 ~ 0.05m 이상) -> Y 위주 보정
+        # =========================================================
+        elif path_len < self.path_length_threshold:
+            
+            lookahead_pt = self.get_lookahead_point(robot_pose, lookahead_dist=0.4)
+            
+            if lookahead_pt is not None:
+                dy = lookahead_pt[1] - robot_pose.position.y
+                dx = lookahead_pt[0] - robot_pose.position.x
+                target_yaw = math.atan2(dy, dx)
+                yaw_error = normalize_angle(target_yaw - robot_yaw)
+                
+                # Y 오차(CTE) 추정
+                path_arr = np.array([(p.pose.position.x, p.pose.position.y) for p in self.pruned_path.poses])
+                robot_xy = np.array([robot_pose.position.x, robot_pose.position.y])
+                min_dist = np.min(np.linalg.norm(path_arr - robot_xy, axis=1))
+
+                # Hysteresis Logic
+                if not self.is_correcting:
+                    if min_dist > self.cte_enable_threshold: 
+                        self.is_correcting = True
+                else:
+                    if min_dist < self.cte_disable_threshold: 
+                        self.is_correcting = False
+
+                if self.is_correcting:
+                    final_cmd.angular.z = 2.0 * yaw_error 
+                    final_cmd.angular.z = max(min(final_cmd.angular.z, 0.6), -0.6)
+
+                    if abs(yaw_error) > 0.2: 
+                        final_cmd.linear.x = self.min_creep_speed 
+                    else:
+                        final_cmd.linear.x = max(final_cmd.linear.x, 0.05)
+        
+        else:
+            self.is_correcting = False
+
+        self.cmd_pub.publish(final_cmd)
+
+```
+
+### 🧠 로직 상세 설명
+
+1. **우선순위 역전 (Priority Inversion):**
+* `if dist_to_goal < 0.05:` 조건을 가장 먼저 체크합니다. Goal 바로 앞에서는 기존의 Lookahead나 Path Length 조건보다 **"Goal 점으로의 직행"**이 최우선이기 때문입니다.
+
+
+2. **Stage 2 (0.05m 이내) 동작 방식:**
+* **Goal Point Tracking:** 더 이상 경로(Path)를 따라가는 게 아니라, 마지막 점(Target Point) 좌표 자체를 타겟으로 잡습니다.
+* **제자리 회전 허용:** 만약 진입 각도가 너무 틀어져 있다면(20도 이상), `linear.x = 0`으로 두고 제자리에서 회전하여 Goal을 바라봅니다.
+* **Micro Approach:** 각도가 맞으면 `0.02 m/s`라는 아주 느린 속도로 Goal 좌표에 겹칠 때까지( 오차 0 수렴) 밀고 들어갑니다.
+
+
+3. **Nav2와의 관계:**
+* 이 로직이 추가됨으로써, Nav2가 0.03m(Tolerance)에서 멈추려고 해도, 이 노드가 **"아직 0.05m 안쪽이니까 내가 마무리할게"** 하고 제어권을 가져와서 0.00m가 될 때까지 주차를 완료합니다.
+
+
+
+이 코드를 적용하면 축 보정뿐만 아니라, 마지막 순간에 축 거리까지 정확하게 0으로 맞추는 **완전 정밀 주차**가 가능해집니다.
+
