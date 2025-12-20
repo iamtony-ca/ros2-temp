@@ -756,3 +756,136 @@ dynamicParametersCallback(const std::vector<rclcpp::Parameter> & parameters);
 
 [1]: https://robotics.stackexchange.com/questions/102107/exporting-plugins-to-nav2-how-to "ros - Exporting plugins to nav2. How to? - Robotics Stack Exchange"
 [2]: https://docs.nav2.org/configuration/packages/configuring-controller-server.html?utm_source=chatgpt.com "Controller Server — Nav2 1.0.0 documentation"
+
+######################################  
+###########################################  
+#############################################  
+아래는 **Nav2 Jazzy 기준으로 “그대로 복붙해서 빌드/설치/플러그인 로딩까지”**를 목표로 한 `CMakeLists.txt` 완성본이야.
+(전제: `.cpp`의 include를 `#include "nav2_stable_stopped_goal_checker/stable_stopped_goal_checker.hpp"` 로 바꿔둔 상태)
+
+```cmake
+cmake_minimum_required(VERSION 3.8)
+project(nav2_stable_stopped_goal_checker)
+
+# -----------------------
+# Compile options
+# -----------------------
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+# Optional but recommended for plugins
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# -----------------------
+# Dependencies
+# -----------------------
+find_package(ament_cmake REQUIRED)
+
+find_package(rclcpp REQUIRED)
+find_package(rclcpp_lifecycle REQUIRED)
+
+find_package(nav2_core REQUIRED)
+find_package(nav2_util REQUIRED)
+find_package(nav2_costmap_2d REQUIRED)
+
+find_package(geometry_msgs REQUIRED)
+
+find_package(pluginlib REQUIRED)
+find_package(angles REQUIRED)
+find_package(tf2 REQUIRED)
+
+# tf2_geometry_msgs는 현재 코드에서 직접 사용하지 않으므로 생략 가능.
+# 필요하면 아래 2줄 주석 해제하고 ament_target_dependencies에도 추가해도 됨.
+# find_package(tf2_geometry_msgs REQUIRED)
+
+# -----------------------
+# Library (plugin)
+# -----------------------
+add_library(${PROJECT_NAME} SHARED
+  src/stable_stopped_goal_checker.cpp
+)
+
+target_include_directories(${PROJECT_NAME}
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
+# ament 방식으로 의존성 연결 (target_link_libraries 대신 권장)
+ament_target_dependencies(${PROJECT_NAME}
+  rclcpp
+  rclcpp_lifecycle
+  nav2_core
+  nav2_util
+  nav2_costmap_2d
+  geometry_msgs
+  pluginlib
+  angles
+  tf2
+  # tf2_geometry_msgs
+)
+
+# -----------------------
+# pluginlib export
+# -----------------------
+# plugins.xml을 ament index에 등록해 런타임 플러그인 로딩이 안정적
+pluginlib_export_plugin_description_file(nav2_core plugins.xml)
+
+# -----------------------
+# Install
+# -----------------------
+install(TARGETS ${PROJECT_NAME}
+  EXPORT export_${PROJECT_NAME}
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
+
+install(DIRECTORY include/
+  DESTINATION include
+)
+
+install(FILES plugins.xml
+  DESTINATION share/${PROJECT_NAME}
+)
+
+# -----------------------
+# Export for downstream packages
+# -----------------------
+ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
+ament_export_include_directories(include)
+ament_export_libraries(${PROJECT_NAME})
+ament_export_dependencies(
+  rclcpp
+  rclcpp_lifecycle
+  nav2_core
+  nav2_util
+  nav2_costmap_2d
+  geometry_msgs
+  pluginlib
+  angles
+  tf2
+  # tf2_geometry_msgs
+)
+
+ament_package()
+```
+
+### 체크 포인트 (딱 2개만)
+
+* `.cpp` include 경로가 패키지명 기준으로 되어 있어야 함:
+
+  ```cpp
+  #include "nav2_stable_stopped_goal_checker/stable_stopped_goal_checker.hpp"
+  ```
+* `plugins.xml`의 `<library path="...">`는 보통 **라이브러리 파일의 basename**(lib 접두어 제외)으로 맞추는데, 위 CMake면 `libnav2_stable_stopped_goal_checker.so`가 설치되므로:
+
+  ```xml
+  <library path="nav2_stable_stopped_goal_checker">
+  ```
+
+  이렇게 두면 OK.
+
+원하면, 내가 **Nav2에서 실제로 로딩되는지 확인하는 최소 테스트 커맨드**(pluginlib로 클래스 목록 확인 / controller_server 로그 체크 포인트)까지 같이 정리해줄게.
