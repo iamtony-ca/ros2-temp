@@ -557,3 +557,202 @@ plugin: "nav2_controller::StableStoppedGoalChecker"
 
 
 이제 완벽하게 독립된 패키지로 커스텀 플러그인을 관리하실 수 있습니다! 추가적으로 Dockerfile 설정이나 의존성 관련 팁이 필요하시면 말씀해 주세요.
+##############################  
+#################################  
+##################################  
+전체 구조/클래스 설계 자체는 **Nav2 Jazzy의 `nav2_core::GoalChecker` 인터페이스 형태**와 잘 맞습니다. (initialize/reset/isGoalReached/getTolerances 구성도 정상 흐름이에요.)
+다만 지금 상태 그대로면 **“컴파일/링크에서 터질 확률이 매우 큰 부분”**이 몇 군데 있습니다. 아래만 고치면 꽤 깔끔하게 동작할 가능성이 높습니다.
+
+---
+
+## 1) (치명) `.cpp`에서 헤더 include 경로가 패키지 구조랑 불일치
+
+현재 패키지 구조:
+
+* `include/nav2_stable_stopped_goal_checker/stable_stopped_goal_checker.hpp`
+
+그런데 `.cpp`는:
+
+```cpp
+#include "nav2_controller/plugins/stable_stopped_goal_checker.hpp"
+```
+
+➡️ 이건 **그 경로에 파일이 없어서 컴파일 에러** 납니다.
+
+### 해결안 (추천)
+
+`.cpp`를 아래처럼 바꾸세요.
+
+```cpp
+#include "nav2_stable_stopped_goal_checker/stable_stopped_goal_checker.hpp"
+```
+
+또는 반대로, include 디렉토리를 `include/nav2_controller/plugins/...`로 바꾸고 파일도 그 위치로 옮기면 지금 include를 유지할 수 있어요(하지만 패키지명이 nav2_controller가 아니므로 보통은 비추천).
+
+---
+
+## 2) (치명) CMake에서 `target_link_libraries()`에 “없는 타겟”을 링크하고 있을 가능성 큼
+
+지금 CMake:
+
+```cmake
+target_link_libraries(${PROJECT_NAME}
+  rclcpp::rclcpp
+  ...
+  geometry_msgs::geometry_msgs
+  ...
+  nav2_core::nav2_core
+)
+```
+
+ROS2 ament 패키지들 중 상당수는 `pkg::pkg` 형태의 **imported target을 제공하지 않습니다**.
+그래서 Jazzy 환경/빌드 방식에 따라 `"Target ... not found"` 류로 터질 수 있어요.
+
+Nav2/ROS2 플러그인 예시들은 보통 **`ament_target_dependencies()`** 패턴을 씁니다. (Nav2 플러그인 export 예시에서도 그렇게 합니다. ([Robotics Stack Exchange][1]))
+
+### 해결안 (추천 CMake 형태)
+
+```cmake
+add_library(${PROJECT_NAME} SHARED
+  src/stable_stopped_goal_checker.cpp
+)
+
+target_include_directories(${PROJECT_NAME}
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
+ament_target_dependencies(${PROJECT_NAME}
+  rclcpp
+  rclcpp_lifecycle
+  nav2_core
+  nav2_util
+  nav2_costmap_2d
+  geometry_msgs
+  pluginlib
+  angles
+  tf2
+)
+
+# (중요) pluginlib export (아래 3번 참고)
+pluginlib_export_plugin_description_file(nav2_core plugins.xml)
+
+install(TARGETS ${PROJECT_NAME}
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
+
+install(DIRECTORY include/
+  DESTINATION include
+)
+
+install(FILES plugins.xml
+  DESTINATION share/${PROJECT_NAME}
+)
+
+ament_export_include_directories(include)
+ament_export_libraries(${PROJECT_NAME})
+ament_export_dependencies(
+  rclcpp rclcpp_lifecycle nav2_core nav2_util nav2_costmap_2d
+  geometry_msgs pluginlib angles tf2
+)
+
+ament_package()
+```
+
+> `tf2_geometry_msgs`는 현재 코드에서 사실상 안 쓰고 있어서 의존성에서 빼도 됩니다(있어도 큰 문제는 없지만요).
+
+---
+
+## 3) (강력 권장) `pluginlib_export_plugin_description_file()` 추가
+
+지금은 package.xml에
+
+```xml
+<nav2_core plugin="${prefix}/plugins.xml" />
+```
+
+를 넣어둬서 “설명 파일 위치”는 알려주고 있지만, Nav2 플러그인 패턴에선 CMake에서 아래 매크로를 같이 쓰는 게 일반적입니다. ([Robotics Stack Exchange][1])
+
+```cmake
+pluginlib_export_plugin_description_file(nav2_core plugins.xml)
+```
+
+이게 있으면 ament index 쪽에 플러그인 description이 잘 등록되어 **런타임 로딩 이슈**를 줄이는 데 도움이 됩니다.
+
+---
+
+## 4) `plugins.xml` 포맷: 지금 형태도 보통 동작하지만 더 안전한 표준형으로 감싸기 권장
+
+현재:
+
+```xml
+<library path="nav2_stable_stopped_goal_checker">
+  <class ...>
+```
+
+pluginlib은 환경에 따라 `<class_libraries>` 루트로 감싼 예시가 널리 쓰입니다. ([Robotics Stack Exchange][1])
+아래처럼 바꾸면 호환성 면에서 더 안전합니다.
+
+```xml
+<class_libraries>
+  <library path="nav2_stable_stopped_goal_checker">
+    <class name="nav2_controller::StableStoppedGoalChecker"
+           type="nav2_controller::StableStoppedGoalChecker"
+           base_class_type="nav2_core::GoalChecker">
+      <description>...</description>
+    </class>
+  </library>
+</class_libraries>
+```
+
+---
+
+## 5) 코드 로직 측면에서 “오류”는 아니지만, 운영 시 흔히 겪는 함정들
+
+### (A) `reset()`에서 타이머도 같이 초기화하면 더 명확
+
+지금은 `in_pose_tolerance_ = false;`만 해서도 동작은 하지만, 가독성/안전성 측면에서 타임스탬프도 초기화하면 디버깅이 쉬워요.
+
+```cpp
+void StableStoppedGoalChecker::reset()
+{
+  in_pose_tolerance_ = false;
+  first_tolerance_time_ = rclcpp::Time(0, 0, clock_->get_clock_type());
+}
+```
+
+### (B) `dynamicParametersCallback`는 `const std::vector<...>&`가 복사 줄여줌
+
+성능/스타일 개선:
+
+```cpp
+dynamicParametersCallback(const std::vector<rclcpp::Parameter> & parameters);
+```
+
+### (C) Tolerance의 의미
+
+`dx <= x_tol && dy <= y_tol` 은 “사각형 영역”입니다.
+원형 범위(유클리드)로 하고 싶으면 `hypot(dx,dy) <= xy_tol` 로 바꿔야 해요.
+지금이 의도(축별 tolerance)라면 문제 없습니다.
+
+---
+
+## 6) YAML 사용 예시는 Nav2 방식과 잘 맞음
+
+`controller_server.ros__parameters.goal_checker_plugins` 와 각 플러그인 네임스페이스 아래 파라미터를 두는 방식은 Nav2 문서 패턴과 일치합니다. ([Nav2 Documentation][2])
+
+---
+
+# 결론: “지금 당장 고쳐야 할 것” 3개
+
+1. **cpp include 경로 수정** (`nav2_stable_stopped_goal_checker/...`)
+2. **CMake의 target_link_libraries → ament_target_dependencies로 변경** (imported target 문제 방지) ([Robotics Stack Exchange][1])
+3. **`pluginlib_export_plugin_description_file(nav2_core plugins.xml)` 추가** ([Robotics Stack Exchange][1])
+
+원하면, 내가 위 수정사항을 반영한 **최종 CMakeLists.txt / plugins.xml / include 경로까지 완전히 일관된 패키지 템플릿**으로 “그대로 복붙하면 빌드되는 버전”을 통째로 정리해서 줄게.
+
+[1]: https://robotics.stackexchange.com/questions/102107/exporting-plugins-to-nav2-how-to "ros - Exporting plugins to nav2. How to? - Robotics Stack Exchange"
+[2]: https://docs.nav2.org/configuration/packages/configuring-controller-server.html?utm_source=chatgpt.com "Controller Server — Nav2 1.0.0 documentation"
