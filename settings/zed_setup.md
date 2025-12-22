@@ -495,3 +495,295 @@ ZED X는 해상도가 높기 때문에(FHD or 1200p), 모든 이미지를 다 �
 1.  **해상도(Resolution) 낮추기:** `common.yaml` 다른 부분에 있는 해상도 설정을 한 단계 낮춥니다.
 2.  **FPS 낮추기:** 프레임 레이트를 30fps에서 15fps 정도로 낮춥니다.
 3.  **필요한 것만 켜기:** 만약 알고리즘이 Gray 이미지만 쓴다면, `publish_rgb`와 `publish_left_right`를 끄고 Gray만 켤 수도 있습니다.
+##############################################3
+###############################################
+###################################################
+결론부터 말씀드리면, **아니요. 재부팅하면 설정은 초기화됩니다.**
+
+`sudo jetson_clocks`는 현재 실행 중인 OS 커널의 파라미터를 실시간으로 변경하는 명령어이기 때문에, 전원을 껐다 켜면 다시 **기본 모드(가변 클럭 상태)**로 돌아갑니다.
+
+따라서 매번 부팅할 때마다 다시 명령어를 입력하거나, 자동으로 실행되도록 설정을 해줘야 합니다. 이를 해결하는 가장 깔끔한 방법 2가지를 알려드릴게요.
+
+---
+
+### 방법 1: `jtop` (jetson-stats) 사용하기 (가장 추천)
+
+개발자이시니 이미 `jtop`을 쓰고 계실 확률이 높습니다. 이 툴을 쓰면 버튼 하나로 "부팅 시 자동 적용"을 설정할 수 있습니다.
+
+1. **설치 (안 되어 있다면):**
+```bash
+sudo pip3 install -U jetson-stats
+sudo systemctl restart jtop.service
+
+```
+
+
+2. **설정:**
+* 터미널에서 `jtop` 실행
+* **5번 탭 (CTRL)** 이동
+* **Jetson Clocks** 항목을 선택하여 `Enable`로 변경
+* 그 바로 옆이나 아래에 있는 **`Boot` (Start on boot)** 옵션을 켜줍니다. (이게 핵심입니다)
+
+
+
+이렇게 해두면 재부팅 할 때마다 시스템이 알아서 `jetson_clocks`를 켜줍니다.
+
+### 방법 2: Systemd 서비스 등록 (수동 설정)
+
+`jtop` 없이 직접 리눅스 서비스로 만들고 싶다면 다음 명령어를 한 번만 실행하세요.
+
+```bash
+# 1. 서비스 파일 생성
+sudo tee /etc/systemd/system/jetson_clocks.service > /dev/null <<EOF
+[Unit]
+Description=Maximize Jetson Performance
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/jetson_clocks
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 2. 서비스 활성화 (부팅 시 자동 실행)
+sudo systemctl enable jetson_clocks.service
+
+```
+
+### 요약
+
+* **1회성 실행:** 재부팅 시 풀림.
+* **영구 적용:** `jtop`에서 **Boot** 옵션을 켜거나, `systemd` 서비스를 등록해야 함.
+
+보통 로봇 개발 환경에서는 현장에서 매번 명령어를 칠 수 없으므로 **방법 1(jtop)**을 사용하여 설정을 고정해두는 것이 국룰(Best Practice)입니다.
+
+... [A Smarter First Boot: Jetson Orin Setup with Script + LLM Help](https://www.youtube.com/watch?v=3LWgrN3m2pY)
+
+이 영상은 Jetson Orin 초기 세팅 시 성능 최적화를 포함한 스크립트 활용법을 다루고 있어, `jetson_clocks`와 같은 설정을 자동화하는 흐름을 이해하는 데 도움이 됩니다.
+#########################################  
+#############################################3  
+################################################33  
+기존의 `launch` 파일을 전혀 수정하지 않고, **로그 파일도 남기지 않으며**, 오직 **정상 여부(Exit Code)**만 판단해서 실행 흐름을 제어하고 싶다면 **Bash 쉘 스크립트**를 사용하는 것이 가장 깔끔하고 정석적인 방법입니다.
+
+ZED X(GMSL2) 환경에 맞춰 작성한 스크립트입니다.
+
+### 해결 방법: Bash Wrapper Script (`run_zedx.sh`)
+
+이 스크립트는 `ZED_Diagnostic`의 **종료 코드(Exit Code)**를 감지합니다. 리눅스에서 명령어 실행이 성공하면 `0`을 반환하는 원리를 이용합니다.
+
+파일을 하나 생성하세요 (예: `run_zedx.sh`).
+
+```bash
+#!/bin/bash
+
+echo "[INFO] ZED X (GMSL2) 시스템 진단을 시작합니다..."
+
+# 1. ZED_Diagnostic 실행
+# > /dev/null 2>&1 : 로그를 파일로 저장하지 않고, 화면에도 출력하지 않으며 전부 버립니다 (Black Hole).
+# if 문은 이 명령어가 성공(Exit Code 0)했는지만 체크합니다.
+if sudo ZED_Diagnostic --dmesg > /dev/null 2>&1; then
+    
+    echo "[SUCCESS] 진단 완료. 하드웨어가 정상입니다."
+    echo "[INFO] ZED X ROS 2 노드를 실행합니다..."
+    
+    # 2. 기존에 완성된 Launch 파일 실행
+    # (본인의 패키지명과 런치 파일명으로 수정하세요)
+    ros2 launch zed_wrapper zed_camera.launch.py camera_model:=zedx
+
+else
+    
+    # 3. 진단 실패 시 실행 차단
+    echo "[ERROR] ZED X 진단 실패! (GMSL2 링크 또는 드라이버 문제)"
+    echo "[INFO] 노드 실행을 중단합니다."
+    exit 1
+
+fi
+
+```
+
+### 스크립트 실행 방법
+
+1. **실행 권한 부여:**
+```bash
+chmod +x run_zedx.sh
+
+```
+
+
+2. **실행:**
+```bash
+./run_zedx.sh
+
+```
+
+
+
+---
+
+### 핵심 포인트 설명
+
+1. **`> /dev/null 2>&1`의 역할**
+* 질문하신 **"로그 파일로 저장 안 해도 돼"**를 구현한 부분입니다.
+* 명령어의 모든 출력(표준 출력 + 에러 메시지)을 `/dev/null`이라는 리눅스의 쓰레기통으로 보내버립니다. 따라서 디스크에 아무것도 남지 않고, 터미널도 깨끗하게 유지됩니다.
+* 하지만 **성공/실패 여부(Return Value)**는 `if` 문이 정확하게 받아옵니다.
+
+
+2. **ZED X (GMSL2) 고려 사항**
+* GMSL2 방식인 ZED X는 USB 방식보다 연결이 견고하지만, **GMSL Deserializer 카드**나 **ZED X Daemon** 서비스 상태에 민감합니다.
+* `ZED_Diagnostic`은 이 GMSL 링크 상태까지 체크하므로, 이 스크립트를 통과했다면 물리적 연결과 드라이버는 확실히 정상이라고 믿고 `launch`를 해도 안전합니다.
+
+
+3. **Launch 파일 보존**
+* 기존의 `zed_camera.launch.py`를 전혀 건드리지 않았으므로, 나중에 로직을 분리하거나 테스트할 때도 원본이 유지되어 관리가 편합니다.
+
+
+
+### (옵션) 더 간단한 "한 줄 명령어" (One-liner)
+
+스크립트 파일조차 만들기 귀찮고, 터미널에서 바로 치고 싶다면 이렇게 입력하세요.
+
+```bash
+sudo ZED_Diagnostic --dmesg > /dev/null 2>&1 && ros2 launch zed_wrapper zed_camera.launch.py camera_model:=zedx
+
+```
+
+* **`&&` (AND 연산자):** 앞의 명령어(`Diagnostic`)가 **성공했을 때만** 뒤의 명령어(`ros2 launch`)를 실행합니다. 실패하면 뒤에는 아예 실행되지 않습니다.
+
+######################################  
+##########################################  
+#############################################3  
+`sudo ZED_Diagnostic --dmesg`의 **출력 내용(텍스트)**이나 **성공/실패 여부(Exit Code)**를 분석해서, 상황에 따라 다른 ROS 2 Launch 파일을 실행하는 것은 아주 좋은 접근입니다.
+
+예를 들어, **"진단 성공 시 → 실제 ZED X 실행"**, **"진단 실패 시 → 시뮬레이션 모드 실행"** 또는 **"카메라가 1대만 감지됨 → 싱글 모드", "2대 감지됨 → 멀티 모드"** 등으로 분기할 수 있습니다.
+
+**Python**과 **Bash** 두 가지 방식으로 정리해 드릴게요. 로직이 복잡하면 Python, 단순하면 Bash가 좋습니다.
+
+---
+
+### 방법 1. Python 스크립트 (추천: 복잡한 조건 처리에 유리)
+
+Python의 문자열 처리 기능을 활용하면 진단 로그에서 특정 키워드(예: "GMSL link lost", "Camera not found", "ZED-X detected")를 찾아내어 정교하게 분기할 수 있습니다.
+
+**파일명 예시:** `smart_launch.py`
+
+```python
+#!/usr/bin/env python3
+import subprocess
+import sys
+
+def main():
+    print("[INFO] ZED Diagnostics 실행 중...")
+
+    # 1. ZED_Diagnostic 실행 및 결과 캡처 (sudo 권한 필요)
+    # capture_output=True: 결과를 화면에 바로 뿌리지 않고 변수에 저장
+    # text=True: 바이너리가 아닌 문자열로 받음
+    try:
+        proc = subprocess.run(
+            ['sudo', 'ZED_Diagnostic', '--dmesg'],
+            capture_output=True,
+            text=True
+        )
+        
+        output = proc.stdout + proc.stderr # 표준 출력과 에러 로그를 합침
+        return_code = proc.returncode      # 0이면 정상, 아니면 에러
+
+    except Exception as e:
+        print(f"[CRITICAL] 진단 툴 실행 실패: {e}")
+        sys.exit(1)
+
+    # 2. 결과 분석 및 분기 (Branching Logic)
+    
+    # CASE A: 진단 통과 (Return Code 0)
+    if return_code == 0:
+        print("[SUCCESS] 하드웨어 정상. ZED X (Real) 노드를 실행합니다.")
+        cmd = "ros2 launch zed_wrapper zed_camera.launch.py camera_model:=zedx"
+
+    # CASE B: 특정 에러 발견 (예: GMSL 링크 에러 -> 재부팅 요청하거나 다른 노드 실행)
+    elif "GMSL link error" in output:
+        print("[WARNING] GMSL 링크 불안정 감지! 복구 모드 노드를 실행합니다.")
+        cmd = "ros2 launch my_robot_pkg recovery_mode.launch.py"
+
+    # CASE C: 카메라 미발견 (예: 케이블 빠짐 -> 시뮬레이션/SVO 모드 실행)
+    elif "Camera not found" in output or "No devices detected" in output:
+        print("[WARNING] 카메라 없음. SVO 녹화 파일을 재생합니다.")
+        cmd = "ros2 launch zed_wrapper zed_camera.launch.py svo_file:=/home/user/test.svo"
+
+    # CASE D: 그 외 알 수 없는 에러
+    else:
+        print("[ERROR] 알 수 없는 하드웨어 에러 발생.")
+        print("--- 진단 로그 요약 ---")
+        print(output[-500:]) # 로그의 마지막 500자만 출력해서 확인
+        sys.exit(1)
+
+    # 3. 선택된 명령어 실행
+    print(f"[EXEC] {cmd}")
+    # shell=True를 쓰면 ros2 명령어 전체를 문자열로 넘길 수 있어 편리함
+    subprocess.run(cmd, shell=True)
+
+if __name__ == "__main__":
+    main()
+
+```
+
+---
+
+### 방법 2. Bash Shell 스크립트 (추천: 단순 성공/실패 분기)
+
+`grep`을 사용하여 특정 단어가 포함되었는지를 빠르게 체크할 때 유용합니다.
+
+**파일명 예시:** `smart_launch.sh`
+
+```bash
+#!/bin/bash
+
+echo "[INFO] Starting ZED Hardware Check..."
+
+# 1. 진단 실행 및 결과를 변수에 저장 (화면 출력 억제)
+# 2>&1 : 에러 메시지도 변수에 담음
+DIAG_OUTPUT=$(sudo ZED_Diagnostic --dmesg 2>&1)
+EXIT_CODE=$?
+
+# 2. 조건문 분기
+
+# 조건 1: 정상 종료 (Exit Code 0)
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "[SUCCESS] System check passed."
+    # 정상적인 ZED X 런치 실행
+    ros2 launch zed_wrapper zed_camera.launch.py camera_model:=zedx
+
+# 조건 2: 로그 내용에 "ZED X"는 없고 "ZED 2i"가 감지된 경우 (예시)
+# grep -q: 조용히 찾기만 함 (있으면 true)
+elif echo "$DIAG_OUTPUT" | grep -q "ZED 2i detected"; then
+    echo "[INFO] ZED 2i detected instead of ZED X."
+    # 다른 모델용 런치 실행
+    ros2 launch zed_wrapper zed_camera.launch.py camera_model:=zed2i
+
+# 조건 3: 아예 카메라가 없는 경우 ("Camera not found" 키워드)
+elif echo "$DIAG_OUTPUT" | grep -q "Camera not found"; then
+    echo "[WARN] No Camera found. Launching Simulation Mode..."
+    # 시뮬레이션/가짜 노드 실행
+    ros2 launch my_robot_pkg simulation.launch.py
+
+# 조건 4: 그 외 실패
+else
+    echo "[FATAL] Diagnostic Failed with unknown error."
+    echo "--- LOG START ---"
+    echo "$DIAG_OUTPUT"
+    echo "--- LOG END ---"
+    exit 1
+fi
+
+```
+
+---
+
+### 핵심 팁: 무엇을 선택할까?
+
+1. **"성공하면 A, 실패하면 B"** 정도의 단순 로직이라면 **Bash**가 훨씬 짧고 간결합니다.
+2. **로그 텍스트를 파싱**해서 "에러 코드 102번이면 A, 500번이면 B"처럼 복잡하게 나누거나, ROS 2의 다른 파이썬 라이브러리와 연동해야 한다면 **Python**이 유지보수하기 좋습니다.
+
+**주의사항:**
+스크립트 내에서 `ros2` 명령어를 실행하려면, 해당 스크립트를 실행하기 전에 터미널에서 `source /opt/ros/jazzy/setup.bash` 등이 선행되어 있거나, 스크립트 맨 윗줄에 `source` 명령을 포함시켜야 합니다.
