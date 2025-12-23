@@ -2110,3 +2110,130 @@ if __name__ == '__main__':
     main()
 
 ```
+######################  
+########################  
+#########################  
+사용자님의 아이디어는 로봇 제어에서 **"Timeout-based Relaxation (시간 초과 시 조건 완화)"** 전략이라고 불리며, 무한 루프나 진동(Oscillation)에 빠지는 것을 막는 아주 실용적인 안전장치입니다.
+
+"3.5초 동안 노력했는데도 정밀한 목표(Strict)를 못 맞춘다면, 오실레이션이 발생하고 있다고 판단하고 허용 범위를 넓혀서(Relaxed) 일단 멈추게 하자"는 논리입니다.
+
+코드 수정이 필요한 부분은 **`__init__` (파라미터 추가)**과 **`control_loop` 내의 Stage 2 진입 부분**입니다.
+
+---
+
+### 🛠️ 수정 1: `__init__` 함수 (변수 추가)
+
+오실레이션 판단 기준 시간과, 완화된(Relaxed) 허용 오차 값을 정의합니다.
+
+```python
+    def __init__(self):
+        super().__init__('strict_lateral_docking_node')
+
+        # ... (기존 파라미터들 유지) ...
+        self.path_length_threshold = 2.0
+        self.cte_enable_threshold = 0.025
+        self.cte_disable_threshold = 0.010
+        
+        # [기존] 엄격한(Strict) 정지 조건
+        self.final_xy_tolerance = 0.01      # 1cm
+        self.final_yaw_tolerance = 0.05     # 약 2.8도
+        
+        # [신규] 오실레이션 방지용 파라미터
+        self.oscillation_timeout = 3.5      # 3.5초 이상 지체되면 조건 완화
+        self.relaxed_xy_tolerance = 0.03    # 완화된 XY 오차 (3cm)
+        self.relaxed_yaw_tolerance = 0.1    # 완화된 Yaw 오차 (약 5.7도)
+        
+        # [신규] Final Stage 진입 시간 기록용
+        self.final_approach_start_time = None 
+
+        # ... (나머지 초기화 유지) ...
+
+```
+
+---
+
+### 🛠️ 수정 2: `control_loop` 함수 (로직 변경)
+
+`control_loop` 함수 내부의 **`if dist_to_goal < 0.05:` (Stage 2)** 블록을 아래 코드로 교체해 주세요.
+
+```python
+        # =========================================================
+        # [Stage 2] Final Docking (0.05m 이내)
+        # =========================================================
+        if dist_to_goal < 0.05:
+            
+            # [1] 시간 측정 로직 (Oscillation Timer)
+            # Final Stage에 처음 진입했다면 시간 기록 시작
+            if self.final_approach_start_time is None:
+                self.final_approach_start_time = self.get_clock().now()
+            
+            # 경과 시간 계산
+            elapsed_time = (self.get_clock().now() - self.final_approach_start_time).nanoseconds / 1e9
+            
+            # [2] Tolerance 결정 로직 (Dynamic Tolerance)
+            # 3.5초가 지났다면? -> 완화된 기준(Relaxed) 적용
+            if elapsed_time > self.oscillation_timeout:
+                current_xy_tol = self.relaxed_xy_tolerance
+                current_yaw_tol = self.relaxed_yaw_tolerance
+                # (옵션) 로그 출력: 오실레이션 감지됨
+                # self.get_logger().warn("Oscillation detected! Relaxing tolerance...", throttle_duration_sec=1.0)
+            else:
+                # 3.5초 이내라면? -> 엄격한 기준(Strict) 적용
+                current_xy_tol = self.final_xy_tolerance
+                current_yaw_tol = self.final_yaw_tolerance
+
+            # [3] 목표 오차 계산 (기존 로직 유지)
+            goal_pose_global = self.pruned_path.poses[-1].pose
+            _, _, goal_yaw = tf_transformations.euler_from_quaternion(
+                [goal_pose_global.orientation.x, goal_pose_global.orientation.y, goal_pose_global.orientation.z, goal_pose_global.orientation.w])
+            
+            _, _, current_yaw = tf_transformations.euler_from_quaternion(
+                [robot_pose.orientation.x, robot_pose.orientation.y, robot_pose.orientation.z, robot_pose.orientation.w])
+            
+            yaw_error = normalize_angle(goal_yaw - current_yaw)
+
+            # [4] 정지 조건 확인 (동적으로 결정된 Tolerance 사용)
+            xy_satisfied = dist_to_goal < current_xy_tol
+            yaw_satisfied = abs(yaw_error) < current_yaw_tol
+
+            # [5] 조건 만족 시 정지
+            if xy_satisfied and yaw_satisfied:
+                final_cmd.linear.x = 0.0
+                final_cmd.angular.z = 0.0
+                self.cmd_pub.publish(final_cmd)
+                self.is_correcting = True 
+                
+                # 성공했으므로 타이머 리셋 (다음에 다시 쓸 수 있게)
+                self.final_approach_start_time = None 
+                return
+
+            # --- (Bypass 로직 및 보정 제어 로직은 기존과 동일) ---
+            # ... (아래 내용은 기존 코드의 XY Stable Check 및 P-Control 부분 유지) ...
+            
+            # (중략: XY Stable Check 로직)
+
+            # (중략: P-Control 계산 및 Clamping 로직)
+            
+            # ...
+            
+            self.is_correcting = True
+
+        # [중요] Final Stage를 벗어나면 타이머 리셋
+        # (예: 로봇이 밀려서 0.05m 밖으로 나갔다가 다시 들어오는 경우 대비)
+        elif path_len < self.path_length_threshold:
+            self.final_approach_start_time = None # 타이머 리셋
+            
+            # ... (Stage 1 로직 유지) ...
+        else:
+            self.final_approach_start_time = None # 타이머 리셋
+            self.is_correcting = False
+
+```
+
+### 🧠 로직 동작 설명
+
+1. **타이머 시작:** 로봇이 Goal 5cm 이내로 진입하는 순간 `self.final_approach_start_time`에 현재 시간을 찍습니다.
+2. **엄격 모드 (0.0s ~ 3.5s):** 처음 3.5초 동안은 `current_xy_tol`이 **0.01m(1cm)**입니다. 로봇은 이 정밀한 기준을 맞추기 위해 열심히 미세 조정을 시도합니다.
+3. **완화 모드 (3.5s 이후):** 만약 3.5초가 지났는데도 1cm를 못 맞춰서 계속 움직이고 있다면(Oscillation), `current_xy_tol`이 **0.03m(3cm)**로 변경됩니다.
+4. **탈출:** 이때 로봇의 오차가 2cm 정도였다면, 엄격 모드에서는 실패였지만 완화 모드에서는 **"성공"**으로 판정됩니다. 즉시 `0.0` 명령을 내리고 정지하여 진동을 멈춥니다.
+5. **리셋:** 만약 로봇이 다시 멀어지거나(Stage 1으로 복귀) 완전히 끝나면 타이머를 `None`으로 초기화합니다.
