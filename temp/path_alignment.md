@@ -2638,3 +2638,378 @@ P-Control 계산을 `if`문의 가장 위로 올렸습니다. 계산된 속도�
 
 
 이 방식은 사용자님이 원하시는 **"왔다 갔다(Sign Flip) 하는 현상이 지속될 때"**를 정확하게 잡아냅니다.
+#####################  
+########################  
+##########################  
+제공해주신 `RobustOscillationDetector` 클래스는 슬라이딩 윈도우와 상태 머신(State Machine)을 사용하여 단순 부호 변경보다 훨씬 **강건하게(Robust) 진동을 감지**하는 훌륭한 로직입니다. 노이즈를 무시하고 **"유의미한 크기의 왕복 운동"**만 잡아낼 수 있기 때문입니다.
+
+이 로직을 `StrictLateralDockingNode` 내부에 통합하여, **선속도나 각속도가 특정 임계값(예: Creep Speed) 이상으로 왔다 갔다 하는 현상**이 3.5초(또는 4초) 동안 지속되면 Goal Tolerance를 완화하도록 구현했습니다.
+
+### 📋 주요 변경 사항
+
+1. **`RobustOscillationDetector` 클래스 통합:** 노드 내부에서 사용할 수 있도록 헬퍼 클래스로 정의했습니다.
+2. **`__init__` 초기화:** 선속도용(`lin_detector`)과 각속도용(`ang_detector`) 감지기를 각각 생성합니다.
+3. **`control_loop` 로직:**
+* P-Control로 계산된 **의도된 속도(`calc_vx`, `calc_w`)**를 감지기에 넣습니다.
+* 감지기가 `True`를 반환하면(진동 감지), **Relaxed Tolerance**를 적용합니다.
+* 그렇지 않으면 **Strict Tolerance**를 유지합니다.
+
+
+
+---
+
+### 🛠️ 최종 완성 코드
+
+```python
+import rclpy
+from rclpy.node import Node
+from rclpy.duration import Duration
+from geometry_msgs.msg import Twist, Pose
+from nav_msgs.msg import Path, Odometry
+import tf2_ros
+import math
+import numpy as np
+import tf_transformations
+import collections  # [필수] deque 사용을 위해 추가
+
+def normalize_angle(angle):
+    """각도를 -pi ~ pi 사이로 정규화"""
+    while angle > math.pi: angle -= 2.0 * math.pi
+    while angle < -math.pi: angle += 2.0 * math.pi
+    return angle
+
+# =========================================================
+# [Helper Class] 강건한 진동 감지기 (제공된 로직 적용)
+# =========================================================
+class RobustOscillationDetector:
+    def __init__(self, hz: float = 20.0, duration: float = 4.0, threshold: float = 0.01, min_cycles: int = 3):
+        """
+        :param hz: 제어 루프 주파수 (Hz)
+        :param duration: 윈도우 시간 (초)
+        :param threshold: 진동 기준값 (예: creep_speed) -> +값과 -값 사이를 왕복해야 함
+        :param min_cycles: 윈도우 내 최소 왕복 횟수
+        """
+        self.threshold = threshold
+        self.min_cycles = min_cycles
+        self.window_size = int(hz * duration)
+        self.data_buffer = collections.deque(maxlen=self.window_size)
+
+    def process(self, value: float) -> bool:
+        """
+        값을 입력받고, 현재 진동 상태인지 반환
+        :return: True(진동 중), False(안정)
+        """
+        self.data_buffer.append(value)
+
+        # 데이터가 충분히 쌓이지 않았으면 판단 보류
+        if len(self.data_buffer) < self.window_size:
+            return False
+
+        # 사이클 계산
+        cycle_count = self._count_valid_cycles()
+
+        # 기준치 이상이면 진동으로 판단
+        return cycle_count >= self.min_cycles
+
+    def _count_valid_cycles(self) -> int:
+        """
+        +Threshold 와 -Threshold 사이를 확실하게 왕복한 횟수 계산
+        """
+        cycles = 0
+        state = 0 # 0: 중립, 1: High(>thresh), -1: Low(<-thresh)
+
+        for val in self.data_buffer:
+            if state == 0:
+                if val >= self.threshold:
+                    state = 1
+                elif val <= -self.threshold:
+                    state = -1
+            
+            elif state == 1:
+                # High -> Low 전환 (반파장)
+                if val <= -self.threshold:
+                    cycles += 1
+                    state = -1 
+            
+            elif state == -1:
+                # Low -> High 전환 (반파장)
+                if val >= self.threshold:
+                    cycles += 1
+                    state = 1 
+        
+        return cycles // 2  # 온전한 왕복 횟수 반환
+    
+    def reset(self):
+        self.data_buffer.clear()
+
+
+# =========================================================
+# [Main Node]
+# =========================================================
+class StrictLateralDockingNode(Node):
+    def __init__(self):
+        super().__init__('strict_lateral_docking_node')
+
+        # --- Parameters ---
+        self.path_length_threshold = 2.0
+        self.cte_enable_threshold = 0.025
+        self.cte_disable_threshold = 0.010
+        
+        # Tolerances
+        self.final_xy_tolerance = 0.01      # Strict (1cm)
+        self.final_yaw_tolerance = 0.05     # Strict (2.8deg)
+        self.relaxed_xy_tolerance = 0.03    # Relaxed (3cm)
+        self.relaxed_yaw_tolerance = 0.1    # Relaxed (5.7deg)
+        
+        # Oscillation Params
+        self.control_freq = 20.0            # 20Hz
+        self.oscillation_duration = 3.5     # 3.5초 윈도우
+        self.min_creep_speed = 0.02         # 최소 기동 속도
+        
+        self.max_linear_diff = 0.05         
+        self.max_angular_diff = 0.5         
+        
+        # --- [핵심] 진동 감지기 인스턴스 생성 ---
+        # Linear: min_creep_speed(0.02)의 +와 -를 3.5초 동안 3번 이상 왕복하면 진동
+        self.lin_osc_detector = RobustOscillationDetector(
+            hz=self.control_freq, 
+            duration=self.oscillation_duration, 
+            threshold=self.min_creep_speed, # 0.02
+            min_cycles=3
+        )
+        
+        # Angular: 0.1 rad/s (약 5.7도/s)의 +와 -를 3.5초 동안 3번 이상 왕복하면 진동
+        self.ang_osc_detector = RobustOscillationDetector(
+            hz=self.control_freq, 
+            duration=self.oscillation_duration, 
+            threshold=0.1,  # 회전 진동 기준
+            min_cycles=3
+        )
+
+        # --- State ---
+        self.is_correcting = False
+        self.xy_stable_start_time = None
+        self.xy_completed = False
+        self.xy_stable_duration = 1.0
+
+        self.latest_cmd_vel = Twist()
+        self.latest_cmd_time = self.get_clock().now()
+        self.pruned_path = None
+        
+        # --- ROS Interface ---
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        
+        self.create_subscription(Path, '/plan_pruned', self.pruned_path_callback, 10)
+        self.create_subscription(Twist, '/cmd_vel_smoothed', self.cmd_callback, 10)
+        self.create_subscription(Odometry, '/odom', lambda msg: None, 10)
+        
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel_input_monitor', 10)
+        self.create_timer(1.0 / self.control_freq, self.control_loop)
+
+    def pruned_path_callback(self, msg): self.pruned_path = msg
+    def cmd_callback(self, msg): 
+        self.latest_cmd_vel = msg
+        self.latest_cmd_time = self.get_clock().now()
+
+    # (Helper functions: get_path_length, get_dist, transform, lookahead... 기존 유지)
+    def get_path_length(self):
+        if not self.pruned_path or len(self.pruned_path.poses) < 2: return 0.0
+        coords = np.array([(p.pose.position.x, p.pose.position.y) for p in self.pruned_path.poses])
+        return np.sum(np.linalg.norm(coords[1:] - coords[:-1], axis=1))
+
+    def get_dist_to_global_goal(self, robot_pose):
+        if not self.pruned_path or len(self.pruned_path.poses) == 0: return float('inf')
+        goal_pt = self.pruned_path.poses[-1].pose.position
+        return math.hypot(goal_pt.x - robot_pose.position.x, goal_pt.y - robot_pose.position.y)
+
+    def transform_global_to_local(self, global_pt, robot_pose):
+        dx = global_pt[0] - robot_pose.position.x
+        dy = global_pt[1] - robot_pose.position.y
+        _, _, robot_yaw = tf_transformations.euler_from_quaternion(
+            [robot_pose.orientation.x, robot_pose.orientation.y, robot_pose.orientation.z, robot_pose.orientation.w])
+        local_x = dx * math.cos(robot_yaw) + dy * math.sin(robot_yaw)
+        local_y = -dx * math.sin(robot_yaw) + dy * math.cos(robot_yaw)
+        return local_x, local_y, robot_yaw
+
+    def get_lookahead_point(self, robot_pose, lookahead_dist=0.4):
+        if not self.pruned_path or len(self.pruned_path.poses) < 2: return None
+        path_arr = np.array([(p.pose.position.x, p.pose.position.y) for p in self.pruned_path.poses])
+        robot_xy = np.array([robot_pose.position.x, robot_pose.position.y])
+        dists = np.linalg.norm(path_arr - robot_xy, axis=1)
+        min_idx = np.argmin(dists)
+        curr_dist = 0.0
+        target_pt = path_arr[min_idx]
+        for i in range(min_idx, len(path_arr) - 1):
+            p1 = path_arr[i]; p2 = path_arr[i+1]
+            seg_len = np.linalg.norm(p2 - p1)
+            if curr_dist + seg_len >= lookahead_dist:
+                ratio = (lookahead_dist - curr_dist) / seg_len
+                return p1 + (p2 - p1) * ratio
+            curr_dist += seg_len
+            target_pt = p2
+        return target_pt
+
+    def control_loop(self):
+        if (self.get_clock().now() - self.latest_cmd_time).nanoseconds > 0.5 * 1e9:
+            self.cmd_pub.publish(Twist()); return
+
+        final_cmd = Twist()
+        final_cmd.linear = self.latest_cmd_vel.linear
+        final_cmd.angular = self.latest_cmd_vel.angular
+
+        try:
+            trans = self.tf_buffer.lookup_transform(
+                'map', 'base_link', rclpy.time.Time(), timeout=Duration(seconds=0.0))
+            robot_pose = Pose()
+            robot_pose.position.x = trans.transform.translation.x
+            robot_pose.position.y = trans.transform.translation.y
+            robot_pose.position.z = trans.transform.translation.z
+            robot_pose.orientation = trans.transform.rotation
+        except Exception:
+            self.cmd_pub.publish(final_cmd); return
+
+        if self.pruned_path is None: return
+
+        path_len = self.get_path_length()
+        dist_to_goal = self.get_dist_to_global_goal(robot_pose)
+
+        # =========================================================
+        # [Stage 2] Final Docking (0.05m 이내)
+        # =========================================================
+        if dist_to_goal < 0.05:
+            
+            # 1. P-Control 계산 (의도된 속도 산출)
+            goal_pose_global = self.pruned_path.poses[-1].pose
+            _, _, goal_yaw = tf_transformations.euler_from_quaternion(
+                [goal_pose_global.orientation.x, goal_pose_global.orientation.y, goal_pose_global.orientation.z, goal_pose_global.orientation.w])
+            _, _, current_yaw = tf_transformations.euler_from_quaternion(
+                [robot_pose.orientation.x, robot_pose.orientation.y, robot_pose.orientation.z, robot_pose.orientation.w])
+            yaw_error = normalize_angle(goal_yaw - current_yaw)
+
+            goal_pt_global = [goal_pose_global.position.x, goal_pose_global.position.y]
+            local_x, local_y, _ = self.transform_global_to_local(goal_pt_global, robot_pose)
+
+            # [Linear P-Control]
+            kp_dist = 1.5 
+            calc_vx = kp_dist * local_x
+            
+            # [Angular P-Control]
+            target_yaw_local = math.atan2(local_y, local_x)
+            if local_x < 0: steering_error = normalize_angle(target_yaw_local - math.pi)
+            else: steering_error = target_yaw_local
+            calc_w = 2.5 * steering_error
+
+            # 2. [핵심] 진동 감지 수행
+            # 계산된 속도(calc_vx, calc_w)를 감지기에 입력
+            # calc_vx가 +0.02 였다가 -0.02 였다가 반복하면 True 반환
+            is_lin_osc = self.lin_osc_detector.process(calc_vx)
+            is_ang_osc = self.ang_osc_detector.process(calc_w)
+            
+            is_oscillating = is_lin_osc or is_ang_osc
+
+            # 3. Tolerance 동적 결정
+            if is_oscillating:
+                # 진동 감지됨 -> 허용 오차 완화 (멈추게 유도)
+                current_xy_tol = self.relaxed_xy_tolerance
+                current_yaw_tol = self.relaxed_yaw_tolerance
+            else:
+                # 안정적임 -> 엄격한 오차 적용
+                current_xy_tol = self.final_xy_tolerance
+                current_yaw_tol = self.final_yaw_tolerance
+
+            # 4. 정지 판단
+            xy_satisfied = dist_to_goal < current_xy_tol
+            yaw_satisfied = abs(yaw_error) < current_yaw_tol
+
+            if xy_satisfied and yaw_satisfied:
+                final_cmd.linear.x = 0.0
+                final_cmd.angular.z = 0.0
+                self.cmd_pub.publish(final_cmd)
+                self.is_correcting = True 
+                
+                # 정지했으므로 버퍼 초기화 (다음을 위해)
+                self.lin_osc_detector.reset()
+                self.ang_osc_detector.reset()
+                return
+
+            # 5. 명령 적용 (Creep Speed & Clamping)
+            
+            # XY 안정화 Bypass 로직
+            if xy_satisfied:
+                if self.xy_stable_start_time is None: self.xy_stable_start_time = self.get_clock().now()
+                elif (self.get_clock().now() - self.xy_stable_start_time).nanoseconds / 1e9 > self.xy_stable_duration:
+                    self.xy_completed = True
+            else:
+                self.xy_stable_start_time = None; self.xy_completed = False
+
+            if self.xy_completed:
+                self.is_correcting = False; self.cmd_pub.publish(final_cmd); return
+
+            # 속도 스케줄링
+            speed_limit = 0.1
+            if abs(calc_vx) > speed_limit: calc_vx = math.copysign(speed_limit, calc_vx)
+            if abs(calc_vx) < self.min_creep_speed: calc_vx = math.copysign(self.min_creep_speed, calc_vx)
+            calc_w = max(min(calc_w, 0.8), -0.8)
+
+            lin_diff = max(min(calc_vx - final_cmd.linear.x, self.max_linear_diff), -self.max_linear_diff)
+            final_cmd.linear.x = final_cmd.linear.x + lin_diff
+            ang_diff = max(min(calc_w - final_cmd.angular.z, self.max_angular_diff), -self.max_angular_diff)
+            final_cmd.angular.z = final_cmd.angular.z + ang_diff
+
+            self.is_correcting = True
+
+        elif path_len < self.path_length_threshold:
+            # Stage 2 이탈 시 감지기 리셋
+            self.lin_osc_detector.reset()
+            self.ang_osc_detector.reset()
+
+            # (Stage 1 Logic...)
+            lookahead_pt = self.get_lookahead_point(robot_pose, lookahead_dist=0.4)
+            if lookahead_pt is not None:
+                local_x, local_y, _ = self.transform_global_to_local(lookahead_pt, robot_pose)
+                current_cte = abs(local_y)
+                if not self.is_correcting:
+                    if current_cte > self.cte_enable_threshold: self.is_correcting = True
+                else:
+                    if current_cte < self.cte_disable_threshold: self.is_correcting = False
+
+                if self.is_correcting:
+                    target_v = final_cmd.linear.x
+                    if abs(target_v) < self.min_creep_speed:
+                         if abs(target_v) < 0.001: target_v = self.min_creep_speed 
+                         else: target_v = math.copysign(self.min_creep_speed, target_v)
+
+                    dist_sq = local_x**2 + local_y**2
+                    curvature = 2.0 * local_y / dist_sq if dist_sq > 0 else 0
+                    final_cmd.linear.x = target_v
+                    final_cmd.angular.z = max(min(target_v * curvature, 0.8), -0.8)
+
+        else:
+            self.lin_osc_detector.reset()
+            self.ang_osc_detector.reset()
+            self.is_correcting = False
+
+        self.cmd_pub.publish(final_cmd)
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = StrictLateralDockingNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+```
+
+### 💡 로직 동작 설명
+
+1. **Linear Oscillation:** `calc_vx` 값이 `+0.02` (Creep Speed) 이상이었다가 `-0.02` 이하로 떨어지는 '완전한 왕복'이 3.5초(약 70프레임) 내에 3번 이상 발생하면 감지합니다.
+2. **Angular Oscillation:** `calc_w` 값이 `+0.1` rad/s 이상이었다가 `-0.1` rad/s 이하로 떨어지는 왕복이 발생하면 감지합니다.
+3. **동적 Tolerance:** 진동이 감지되는 즉시 `current_xy_tol`이 `0.03`(3cm)으로 늘어납니다. 이때 로봇이 이미 2cm 오차 범위에 있었다면 즉시 성공 판정을 내리고 정지(0.0)합니다.
