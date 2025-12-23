@@ -2237,3 +2237,201 @@ if __name__ == '__main__':
 3. **완화 모드 (3.5s 이후):** 만약 3.5초가 지났는데도 1cm를 못 맞춰서 계속 움직이고 있다면(Oscillation), `current_xy_tol`이 **0.03m(3cm)**로 변경됩니다.
 4. **탈출:** 이때 로봇의 오차가 2cm 정도였다면, 엄격 모드에서는 실패였지만 완화 모드에서는 **"성공"**으로 판정됩니다. 즉시 `0.0` 명령을 내리고 정지하여 진동을 멈춥니다.
 5. **리셋:** 만약 로봇이 다시 멀어지거나(Stage 1으로 복귀) 완전히 끝나면 타이머를 `None`으로 초기화합니다.
+####################
+#########################
+##########################
+사용자님의 의도는 **"단순히 목표 근처에 오래 머무는 것"**이 아니라, **"제어값(속도)의 부호가 바뀌는(Forward↔Backward, Left↔Right) 찐(Real) 오실레이션 현상이 지속될 때"**만 조건을 완화하고 싶다는 것이군요.
+
+이를 구현하려면 **'부호 반전(Zero Crossing)'**을 감지하는 로직과, 그 반전이 **'지속되는 시간'**을 측정하는 로직이 필요합니다.
+
+다음과 같은 알고리즘을 적용했습니다.
+
+1. **플립(Flip) 감지:** 현재 계산된 속도의 부호가 이전 부호와 다르면(`+` ↔ `-`) "플립"으로 간주합니다.
+2. **연속성 판단:** 마지막 플립 이후 **1.0초 이내**에 또 플립이 발생하면 "오실레이션 상태"가 유지되는 것으로 봅니다. (1초 이상 부호가 안 바뀌면 안정이 된 것으로 보고 타이머 리셋)
+3. **지속 시간 체크:** 이 "오실레이션 상태"가 **3.5초 이상** 이어지면, 그때 Tolerance를 완화합니다.
+
+수정이 필요한 코드 부분입니다.
+
+---
+
+### 🛠️ 1. `__init__` (변수 추가)
+
+이전 값(부호)을 저장할 변수와 타이머 변수들을 추가합니다.
+
+```python
+    def __init__(self):
+        super().__init__('strict_lateral_docking_node')
+
+        # ... (기존 파라미터들 유지) ...
+        
+        # [Tolerance 설정]
+        self.final_xy_tolerance = 0.01      # Strict
+        self.final_yaw_tolerance = 0.05
+        
+        self.relaxed_xy_tolerance = 0.03    # Relaxed
+        self.relaxed_yaw_tolerance = 0.1
+        
+        # [신규] 오실레이션 감지 설정
+        self.oscillation_duration_threshold = 3.5  # 3.5초 이상 지속 시 완화
+        self.flip_continuity_window = 1.0          # 1초 안에 다시 뒤집히면 연속된 오실레이션으로 간주
+        
+        # [신규] 상태 변수
+        self.prev_lin_sign = 0.0    # 이전 선속도 부호
+        self.prev_ang_sign = 0.0    # 이전 각속도 부호
+        
+        self.last_flip_time = None          # 가장 최근 부호가 바뀐 시각
+        self.oscillation_start_time = None  # 오실레이션(불안정)이 시작된 시각
+
+        # ... (나머지 초기화 유지) ...
+
+```
+
+---
+
+### 🛠️ 2. `control_loop` 내부 (오실레이션 감지 로직 구현)
+
+`control_loop` 내부의 **Stage 2 (Final Docking)** 계산 로직 사이에 아래 코드를 넣어주세요.
+**순서가 중요합니다.** `calc_vx`, `calc_w`를 계산한 **직후**, 그리고 `final_cmd`에 할당하기 **직전**에 판단해야 합니다.
+
+```python
+        # =========================================================
+        # [Stage 2] Final Docking (0.05m 이내)
+        # =========================================================
+        if dist_to_goal < 0.05:
+            
+            # 1. 목표 계산 (먼저 수행해야 부호 비교 가능)
+            goal_pose_global = self.pruned_path.poses[-1].pose
+            goal_pt_global = [goal_pose_global.position.x, goal_pose_global.position.y]
+            local_x, local_y, _ = self.transform_global_to_local(goal_pt_global, robot_pose)
+            
+            # --- [Raw Control Value Calculation] ---
+            # (속도 제한 전, 순수 P제어 계산값의 부호를 보는 것이 더 정확함)
+            kp_dist = 1.5 
+            raw_vx = kp_dist * local_x 
+            
+            target_yaw_local = math.atan2(local_y, local_x)
+            if local_x < 0: steering_error = normalize_angle(target_yaw_local - math.pi)
+            else: steering_error = target_yaw_local
+            raw_w = 2.5 * steering_error
+
+            # ----------------------------------------------------------------
+            # [신규] 찐(Real) 오실레이션 감지 로직 (Sign Flip Detection)
+            # ----------------------------------------------------------------
+            current_time = self.get_clock().now()
+            
+            # 현재 부호 추출 (-1, 0, 1)
+            # 0.001 같은 노이즈 제외를 위해 약간의 데드존을 줄 수도 있음
+            curr_lin_sign = 1.0 if raw_vx > 1e-4 else (-1.0 if raw_vx < -1e-4 else 0.0)
+            curr_ang_sign = 1.0 if raw_w > 1e-4 else (-1.0 if raw_w < -1e-4 else 0.0)
+            
+            # 플립(부호 반전) 발생 여부 확인
+            # (이전 부호와 곱했을 때 음수면 반전된 것임. 0에서 변하는 건 오실레이션 아님)
+            is_lin_flipped = (curr_lin_sign * self.prev_lin_sign < 0)
+            is_ang_flipped = (curr_ang_sign * self.prev_ang_sign < 0)
+            
+            is_flipped = is_lin_flipped or is_ang_flipped
+
+            if is_flipped:
+                # 부호가 뒤집힘!
+                self.last_flip_time = current_time
+                
+                # 오실레이션 타이머가 안 돌고 있었다면 시작
+                if self.oscillation_start_time is None:
+                    self.oscillation_start_time = current_time
+            else:
+                # 부호가 안 뒤집힘 (안정적 or 한 방향 주행 중)
+                # 만약 마지막 플립으로부터 1초 이상 지났다면 -> "오실레이션 끝났다"고 판정
+                if self.last_flip_time is not None:
+                    elapsed_since_flip = (current_time - self.last_flip_time).nanoseconds / 1e9
+                    if elapsed_since_flip > self.flip_continuity_window:
+                        self.oscillation_start_time = None # 리셋
+                        self.last_flip_time = None
+
+            # 부호 상태 업데이트
+            if abs(curr_lin_sign) > 0: self.prev_lin_sign = curr_lin_sign
+            if abs(curr_ang_sign) > 0: self.prev_ang_sign = curr_ang_sign
+
+            # ----------------------------------------------------------------
+            # [Tolerance 결정] 오실레이션 지속 시간 체크
+            # ----------------------------------------------------------------
+            use_relaxed = False
+            if self.oscillation_start_time is not None:
+                oscillation_duration = (current_time - self.oscillation_start_time).nanoseconds / 1e9
+                if oscillation_duration > self.oscillation_duration_threshold:
+                    use_relaxed = True
+                    # (옵션) 로그: "3.5초간 좌우로 흔들려서 기준 완화함"
+            
+            current_xy_tol = self.relaxed_xy_tolerance if use_relaxed else self.final_xy_tolerance
+            current_yaw_tol = self.relaxed_yaw_tolerance if use_relaxed else self.final_yaw_tolerance
+
+            # ----------------------------------------------------------------
+            # [정지 조건 확인]
+            # ----------------------------------------------------------------
+            _, _, goal_yaw = tf_transformations.euler_from_quaternion(
+                [goal_pose_global.orientation.x, goal_pose_global.orientation.y, goal_pose_global.orientation.z, goal_pose_global.orientation.w])
+            _, _, current_yaw = tf_transformations.euler_from_quaternion(
+                [robot_pose.orientation.x, robot_pose.orientation.y, robot_pose.orientation.z, robot_pose.orientation.w])
+            yaw_error = normalize_angle(goal_yaw - current_yaw)
+
+            if dist_to_goal < current_xy_tol and abs(yaw_error) < current_yaw_tol:
+                final_cmd.linear.x = 0.0
+                final_cmd.angular.z = 0.0
+                self.cmd_pub.publish(final_cmd)
+                self.is_correcting = True
+                
+                # 성공 시 상태 리셋
+                self.oscillation_start_time = None
+                self.last_flip_time = None
+                return
+
+            # ----------------------------------------------------------------
+            # [실제 속도 명령 생성] (이전 로직과 동일 - 변수명만 raw_vx 사용)
+            # ----------------------------------------------------------------
+            # Calc Linear (Clamp & Creep)
+            speed_limit = 0.1 
+            calc_vx = raw_vx # 위에서 계산한 P제어 값 사용
+            
+            if abs(calc_vx) > speed_limit:
+                calc_vx = math.copysign(speed_limit, calc_vx)
+            if abs(calc_vx) < self.min_creep_speed:
+                 calc_vx = math.copysign(self.min_creep_speed, calc_vx)
+
+            # Calc Angular (Clamp)
+            calc_w = raw_w # 위에서 계산한 값
+            calc_w = max(min(calc_w, 0.8), -0.8)
+
+            # Difference Clamping & Publish
+            lin_diff = max(min(calc_vx - final_cmd.linear.x, self.max_linear_diff), -self.max_linear_diff)
+            final_cmd.linear.x = final_cmd.linear.x + lin_diff
+
+            ang_diff = max(min(calc_w - final_cmd.angular.z, self.max_angular_diff), -self.max_angular_diff)
+            final_cmd.angular.z = final_cmd.angular.z + ang_diff
+
+            self.is_correcting = True
+        
+        else:
+            # Stage 2 벗어나면 오실레이션 상태 리셋
+            self.oscillation_start_time = None
+            self.last_flip_time = None
+            self.prev_lin_sign = 0.0
+            self.prev_ang_sign = 0.0
+            
+            # ... (Stage 1 로직 유지) ...
+
+```
+
+### 🧠 로직 상세 설명
+
+1. **부호 비교 (`*` 연산):** `현재_부호 * 이전_부호 < 0` 이면 서로 부호가 다르다는 뜻이므로 **플립(Flip)**이 감지된 것입니다. (예: `1.0 * -1.0 = -1.0`)
+2. **`flip_continuity_window` (1.0초):**
+* 로봇이 `앞 -> 뒤`로 한 번 바꿨다고 바로 오실레이션은 아닙니다. (지나쳐서 돌아오는 걸 수도 있음)
+* 하지만 `앞 -> 뒤`로 바꾸고 **1초 안에** 다시 `뒤 -> 앞`으로 바꾸면 이건 확실한 오실레이션(떨림)입니다.
+* 이 윈도우 시간 내에 플립이 계속 발생하면 `oscillation_start_time`을 유지(누적)합니다.
+
+
+3. **`oscillation_duration_threshold` (3.5초):**
+* 위 상태가 3.5초 동안 이어지면, "아, 얘는 지금 1cm를 맞추려다가 계속 제자리에서 떨고 있구나"라고 판단합니다.
+* 이때 `use_relaxed = True`가 되어 허용 오차를 1cm → 3cm로 넓혀줍니다.
+
+
+4. **자동 멈춤:** 오차가 3cm로 넓어지는 순간, 현재 오차가 2cm였다면 즉시 조건 만족(`True`)이 되어 `0.0` 명령을 보내고 떨림을 멈춥니다.
