@@ -123,3 +123,145 @@ if __name__ == "__main__":
 
 
 이 방식이 이전에 제안드린 단순 개수 세기보다 훨씬 더 **"진동의 움직임"** 자체에 집중한 로직입니다.
+#################  
+####################  
+#######################  
+요청하신 로직은 **"특정 값(예: 0.02)과 반대 값(-0.02) 사이를 즉각적으로 교차(Flip-Flop)하는 순간"**을 카운팅하고, 최근 N초 동안 그 횟수가 기준을 넘으면 출력하는 방식이군요.
+
+가장 단순하고 버그 없이 구현하는 방법은 **"이벤트 타임스탬프 큐"**를 사용하는 것입니다.
+단순히 숫자를 더하고 빼는 것보다, **교차가 발생한 시각(`time.time()`)을 저장**해두고, 현재 시각 기준 N초가 지난 오래된 기록만 지우는 방식이 가장 직관적이고 정확합니다.
+
+요청하신 `if` 조건문을 그대로 반영하여 작성했습니다.
+
+### Python Code
+
+```python
+import time
+from collections import deque
+import math
+
+class SimpleOscillationMonitor:
+    def __init__(self, duration=4.0, count_threshold=5):
+        """
+        :param duration: 감지할 윈도우 시간 (초)
+        :param count_threshold: 해당 시간 내에 진동(교차)이 몇 번 이상 발생하면 출력할지
+        """
+        self.duration = duration
+        self.threshold = count_threshold
+        
+        # 교차(Oscillation)가 발생한 시각을 저장하는 큐
+        self.vx_events = deque()
+        self.w_events = deque()
+        
+        # 이전 값 저장용 변수 (초기값은 0.0으로 가정)
+        self.prev_vx = 0.0
+        self.prev_w = 0.0
+        
+        # 로그 도배 방지용 마지막 출력 시간
+        self.last_print_time = 0
+
+    def update(self, calc_vx, calc_w):
+        current_time = time.time()
+        
+        # ---------------------------------------------------------
+        # 1. 사용자 요청 로직: VX 진동 감지 (0.02 <-> -0.02)
+        # ---------------------------------------------------------
+        # 주의: float끼리의 == 비교는 위험하므로 math.isclose 사용 권장
+        # 하지만 요청하신 로직 그대로의 의도를 살려 구현함
+        is_vx_oscillation = False
+        
+        if (self._is_equal(self.prev_vx, 0.02) and self._is_equal(calc_vx, -0.02)) or \
+           (self._is_equal(self.prev_vx, -0.02) and self._is_equal(calc_vx, 0.02)):
+            is_vx_oscillation = True
+            
+        if is_vx_oscillation:
+            self.vx_events.append(current_time)
+
+        # ---------------------------------------------------------
+        # 2. 사용자 요청 로직: W 진동 감지 (0.01 <-> -0.01)
+        # ---------------------------------------------------------
+        is_w_oscillation = False
+        
+        if (self._is_equal(self.prev_w, 0.01) and self._is_equal(calc_w, -0.01)) or \
+           (self._is_equal(self.prev_w, -0.01) and self._is_equal(calc_w, 0.01)):
+            is_w_oscillation = True
+            
+        if is_w_oscillation:
+            self.w_events.append(current_time)
+
+        # ---------------------------------------------------------
+        # 3. 시간 윈도우 관리 (오래된 이벤트 삭제) & 카운팅
+        # ---------------------------------------------------------
+        self._remove_old_events(self.vx_events, current_time)
+        self._remove_old_events(self.w_events, current_time)
+
+        # 현재 저장된 이벤트 개수 = 최근 duration(4초) 동안 발생한 횟수
+        cnt_csc_vx = len(self.vx_events)
+        cnt_csc_w = len(self.w_events)
+
+        # ---------------------------------------------------------
+        # 4. 조건 충족 시 출력
+        # ---------------------------------------------------------
+        if (cnt_csc_vx >= self.threshold or cnt_csc_w >= self.threshold):
+            # 1초에 한 번만 출력 (도배 방지)
+            if current_time - self.last_print_time > 1.0:
+                print(f"[경고] {self.duration}초 내 과도한 진동 감지!")
+                if cnt_csc_vx >= self.threshold:
+                    print(f"   -> VX (±0.02) 교차 횟수: {cnt_csc_vx}회")
+                if cnt_csc_w >= self.threshold:
+                    print(f"   -> W  (±0.01) 교차 횟수: {cnt_csc_w}회")
+                
+                self.last_print_time = current_time
+
+        # 현재 값을 이전 값으로 업데이트
+        self.prev_vx = calc_vx
+        self.prev_w = calc_w
+
+    def _remove_old_events(self, event_queue, current_time):
+        """큐의 앞부분(오래된 시간)을 확인해서 duration 지난 건 버림"""
+        while event_queue and (current_time - event_queue[0] > self.duration):
+            event_queue.popleft()
+
+    def _is_equal(self, a, b):
+        """실수 비교를 위한 안전장치 (== 대신 사용)"""
+        return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)
+
+# --- 사용 예시 ---
+if __name__ == "__main__":
+    # 4초 동안 5번 이상 뒤집히면 알람
+    monitor = SimpleOscillationMonitor(duration=4.0, count_threshold=5)
+    
+    print("--- 테스트 시작 ---")
+    
+    # 예시: VX가 0.02와 -0.02를 반복한다고 가정
+    # (실제 환경에서는 실시간 루프 안에서 monitor.update()를 호출하면 됨)
+    test_sequence = [0.02, -0.02, 0.02, -0.02, 0.02, -0.02] 
+    
+    for val in test_sequence:
+        time.sleep(0.1) # 0.1초 간격 데이터 수신 가정
+        monitor.update(calc_vx=val, calc_w=0.0) # VX만 흔듦
+        print(f"Input: {val} -> VX Count: {len(monitor.vx_events)}")
+
+```
+
+### 코드 설명 (전문가 포인트)
+
+1. **`collections.deque` 사용**:
+* `cnt += 1`만 하면, **"시간이 지나서 사라져야 할 카운트"**를 빼기가 어렵습니다.
+* 대신 `deque`에 **발생 시각**을 넣어두고, `current_time - duration`보다 오래된 데이터는 `popleft()`로 버리는 방식이 가장 깔끔합니다. 이러면 `len(queue)`가 곧 **"최근 4초간 발생 횟수"**가 됩니다.
+
+
+2. **`_is_equal` (math.isclose)**:
+* 파이썬(및 대부분의 언어)에서 `float` 타입은 `0.02 == 0.02`가 가끔 `False`가 될 수 있습니다(부동소수점 오차).
+* 그래서 안전하게 `math.isclose`를 사용하여 버그 가능성을 원천 차단했습니다.
+
+
+3. **로직 흐름**:
+* `prev`와 `curr`를 비교해 조건이 맞으면 큐에 시간 추가 (`append`).
+* 오래된 시간 삭제 (`while` 루프).
+* 큐 사이즈(`len`) 체크 후 출력.
+* `prev` 업데이트.
+
+
+
+이 코드를 복사해서 그대로 클래스로 사용하시면 됩니다. `update(vx, w)`만 주기적으로 호출해주면 내부에서 알아서 카운팅하고 프린트합니다.
