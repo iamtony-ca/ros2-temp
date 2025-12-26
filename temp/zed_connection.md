@@ -380,3 +380,190 @@ GMSL 카메라는 USB 카메라보다 하드웨어적인 연결/해제 속도가
 
 **요약하자면:**
 가장 추천하는 방식은 **방법 1 (Python 스크립트)** 입니다. `try-except` 구조로 안전하게 종료를 보장하고, 필요하다면 `zed_x_daemon` 재시작 명령어도 끼워 넣을 수 있어 확장성이 좋습니다.
+#######################  
+###########################  
+############################  
+네, 정확한 지적입니다. `ros2 node list`에 노드가 떴다고 해서 카메라가 초기화를 마치고 영상 송출을 시작한 것은 아닙니다. 특히 ZED X는 GMSL 링크 동기화, 펌웨어 로드, 그리고 CUDA 메모리 할당 등의 과정이 있어 노드 실행 후 실제 데이터가 나오기까지 수 초가 더 걸립니다.
+
+**"정상 실행 완료"**의 가장 확실한 정의는 **"실제 센서 데이터가 토픽으로 발행되기 시작했는가?"** 입니다.
+
+이를 위해 Python 스크립트 내에서 가벼운 ROS 2 노드를 하나 만들어, 4개의 카메라 토픽(예: `camera_info`)을 구독(Subscribe)하고, **4개 모두에서 데이터가 한 번 이상 들어왔을 때**를 "준비 완료(Ready)"로 판단하는 코드를 작성해 드리겠습니다.
+
+### 솔루션: Topic Monitoring 방식
+
+이 방식은 단순히 프로세스 존재 여부가 아니라, **데이터 흐름(Data Flow)**을 직접 체크하므로 가장 확실합니다.
+
+**`run_cycle_verified.py`**
+
+```python
+import subprocess
+import time
+import signal
+import sys
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import CameraInfo
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+# ================= 사용자 설정 =================
+# 실행할 런치 커맨드
+LAUNCH_CMD = ["ros2", "launch", "zed_multi_camera", "zed_multi_camera.launch.py"]
+
+# 데이터 수신을 확인할 토픽 리스트 (4개 카메라)
+# 'camera_info'는 데이터가 가볍기 때문에 체크용으로 가장 적합합니다.
+# 실제 사용하시는 namespace에 맞춰 수정해주세요. (예: /zed_multi/zed_node_0/...)
+CHECK_TOPICS = [
+    "/zed_node_0/left/camera_info",
+    "/zed_node_1/left/camera_info",
+    "/zed_node_2/left/camera_info",
+    "/zed_node_3/left/camera_info"
+]
+
+MAINTAIN_TIME = 30     # 4개 모두 정상 수신 확인 후 유지할 시간 (초)
+BOOT_TIMEOUT = 90      # 이 시간 내에 데이터 안 들어오면 실패 간주 (초)
+COOLDOWN = 10          # 종료 후 대기 시간 (초)
+# ==============================================
+
+class StreamChecker(Node):
+    def __init__(self):
+        super().__init__('zed_stream_checker')
+        self.received_status = {topic: False for topic in CHECK_TOPICS}
+        self.subs = []
+        
+        # Best Effort QoS: 센서 데이터 확인용이므로 빠르게 붙기 위함
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
+        for topic in CHECK_TOPICS:
+            # lambda의 캡처 문제를 해결하기 위해 default argument 사용
+            sub = self.create_subscription(
+                CameraInfo,
+                topic,
+                lambda msg, t=topic: self.listener_callback(msg, t),
+                qos
+            )
+            self.subs.append(sub)
+
+    def listener_callback(self, msg, topic_name):
+        if not self.received_status[topic_name]:
+            self.get_logger().info(f"✅ Data received from: {topic_name}")
+            self.received_status[topic_name] = True
+
+    def is_all_ready(self):
+        """모든 토픽에서 데이터를 받았는지 확인"""
+        return all(self.received_status.values())
+    
+    def get_missing_topics(self):
+        """아직 데이터가 안 온 토픽 리스트 반환"""
+        return [t for t, v in self.received_status.items() if not v]
+
+def run_loop():
+    rclpy.init()
+    loop_count = 1
+    
+    try:
+        while True:
+            print(f"\n=== [Loop {loop_count}] Launching ZED Multi Camera... ===")
+            
+            # 1. Launch 실행
+            process = subprocess.Popen(LAUNCH_CMD)
+            
+            # 2. Checker 노드 생성
+            checker_node = StreamChecker()
+            
+            print(f"waiting for data from {len(CHECK_TOPICS)} topics...")
+            start_time = time.time()
+            all_ready = False
+
+            # 3. 데이터 수신 대기 루프 (BOOT_TIMEOUT 동안)
+            while time.time() - start_time < BOOT_TIMEOUT:
+                rclpy.spin_once(checker_node, timeout_sec=0.5)
+                
+                if checker_node.is_all_ready():
+                    all_ready = True
+                    setup_duration = time.time() - start_time
+                    print(f"🎉 All cameras are streaming! (Setup took {setup_duration:.1f}s)")
+                    break
+                
+                # 로그가 너무 빠르지 않게
+                if int(time.time() - start_time) % 5 == 0:
+                    missing = checker_node.get_missing_topics()
+                    # print(f"Still waiting for: {missing}") 
+
+            # 4. 결과에 따른 처리
+            if all_ready:
+                print(f"--- Holding verified state for {MAINTAIN_TIME} seconds ---")
+                time.sleep(MAINTAIN_TIME)
+            else:
+                missing = checker_node.get_missing_topics()
+                print(f"❌ Timeout! No data from: {missing}")
+                print("Process might be stuck or crashed.")
+
+            # 노드 정리
+            checker_node.destroy_node()
+
+            # 5. 종료 절차
+            print("--- Sending SIGINT (Ctrl+C) ---")
+            process.send_signal(signal.SIGINT)
+
+            try:
+                process.wait(timeout=20) # 종료 대기 시간 넉넉히
+            except subprocess.TimeoutExpired:
+                print("!!! Warning: Process stuck. Killing forcefully... !!!")
+                process.kill()
+                process.wait()
+
+            print(f"=== [Loop {loop_count}] Finished. Cooldown {COOLDOWN}s... ===")
+            time.sleep(COOLDOWN)
+            loop_count += 1
+
+    except KeyboardInterrupt:
+        print("\nStopped by User.")
+        if 'process' in locals() and process.poll() is None:
+            process.send_signal(signal.SIGINT)
+            process.wait()
+        rclpy.shutdown()
+        sys.exit(0)
+
+if __name__ == "__main__":
+    run_loop()
+
+```
+
+### 코드의 핵심 원리 및 변경점
+
+1. **`StreamChecker` 노드**:
+* 스크립트가 실행될 때마다 임시 ROS 2 노드를 생성합니다.
+* `CHECK_TOPICS`에 정의된 4개의 토픽을 구독합니다.
+* **`CameraInfo` 사용**: 이미지(`Image`) 토픽은 데이터가 커서(특히 4대 동시) 단순 체크용으로 구독하면 네트워크나 CPU에 부하를 줄 수 있습니다. 반면 `CameraInfo`는 메타데이터라 매우 가볍지만, 이미지가 나올 때 같이 나오므로 **"카메라 동작 여부"**를 판단하기에 가장 효율적입니다.
+
+
+2. **QoS 설정 (`Best Effort`)**:
+* ZED 노드가 이미지를 `Best Effort`로 쏘는 경우가 많고, 설령 `Reliable`이라 해도 리스너가 `Best Effort`면 호환됩니다. 빠르게 데이터를 캐치하기 위해 QoS를 느슨하게 설정했습니다.
+
+
+3. **검증 로직**:
+* `rclpy.spin_once()`를 짧게 돌리면서 메시지가 들어오는지 확인합니다.
+* 4개 카메라 모두에서 최소 1개의 메시지를 받아야만 `all_ready = True`가 됩니다.
+* 하나라도 안 들어오면 타임아웃 처리 후 재시작합니다.
+
+
+
+### 사용 전 설정 (필수)
+
+터미널에서 `ros2 topic list`를 통해 실제 사용 중인 네임스페이스를 확인하고 코드 상단의 `CHECK_TOPICS` 리스트를 수정하세요. 보통 멀티 카메라 런치 파일은 아래와 같은 패턴을 가집니다:
+
+```python
+CHECK_TOPICS = [
+    "/zed_node_0/left/camera_info",  # 네임스페이스가 없다면
+    # 또는
+    "/zed_multi/zed_node_0/left/camera_info", # 네임스페이스가 있다면
+    ...
+]
+
+```
+
+이제 "노드가 켜졌나?"라는 불확실한 추측 대신, **"데이터가 실제로 들어오나?"**를 기준으로 완벽하게 테스트 사이클을 돌릴 수 있습니다.
