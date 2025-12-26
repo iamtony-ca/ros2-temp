@@ -567,3 +567,186 @@ CHECK_TOPICS = [
 ```
 
 이제 "노드가 켜졌나?"라는 불확실한 추측 대신, **"데이터가 실제로 들어오나?"**를 기준으로 완벽하게 테스트 사이클을 돌릴 수 있습니다.
+##########################  
+################################  
+##################################  
+이해했습니다. 요구사항이 **"반복적인 스트레스 테스트"**에서 **"성공할 때까지 재시도하는 자동 실행 스크립트"**로 변경되었군요.
+
+이제 로직은 다음과 같이 변경됩니다:
+
+1. **시도(Launch)**: 노드를 실행합니다.
+2. **검증(Verify)**: 4개의 카메라 데이터가 모두 들어오는지 확인합니다.
+3. **판단(Decision)**:
+* **성공 시**: 프로세스를 종료하지 않고 **그대로 유지(Keep Alive)**합니다. (스크립트는 프로세스가 꺼지지 않게 대기 모드로 들어갑니다.)
+* **실패 시**: 프로세스를 종료하고 잠시 대기 후 **재시도**합니다.
+
+
+4. **제한(Limit)**: 재시도 횟수가 **총 3회**를 넘어가면 포기하고 스크립트를 종료합니다.
+
+아래는 이 로직을 구현한 최종 코드입니다.
+
+### `auto_launch_retry.py`
+
+```python
+import subprocess
+import time
+import signal
+import sys
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import CameraInfo
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+# ================= 사용자 설정 =================
+LAUNCH_CMD = ["ros2", "launch", "zed_multi_camera", "zed_multi_camera.launch.py"]
+
+# 데이터 수신을 확인할 토픽 리스트 (본인의 네임스페이스에 맞게 수정 필수)
+CHECK_TOPICS = [
+    "/zed_node_0/left/camera_info",
+    "/zed_node_1/left/camera_info",
+    "/zed_node_2/left/camera_info",
+    "/zed_node_3/left/camera_info"
+]
+
+BOOT_TIMEOUT = 60      # 이 시간 내에 4개 다 안 켜지면 실패로 간주 (초)
+COOLDOWN = 10          # 재시도 전 대기 시간 (초)
+MAX_ATTEMPTS = 3       # 최대 시도 횟수
+# ==============================================
+
+class StreamChecker(Node):
+    def __init__(self):
+        super().__init__('zed_startup_checker')
+        self.received_status = {topic: False for topic in CHECK_TOPICS}
+        
+        # Best Effort QoS: 센서 데이터 확인용
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
+        for topic in CHECK_TOPICS:
+            self.create_subscription(
+                CameraInfo,
+                topic,
+                lambda msg, t=topic: self.listener_callback(msg, t),
+                qos
+            )
+
+    def listener_callback(self, msg, topic_name):
+        if not self.received_status[topic_name]:
+            self.received_status[topic_name] = True
+
+    def is_all_ready(self):
+        return all(self.received_status.values())
+    
+    def get_missing_topics(self):
+        return [t for t, v in self.received_status.items() if not v]
+
+def run_safe_launch():
+    rclpy.init()
+    
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        print(f"\n========================================")
+        print(f"🚀 [Attempt {attempt}/{MAX_ATTEMPTS}] Starting ZED Multi Camera...")
+        print(f"========================================")
+
+        # 1. 프로세스 실행
+        process = subprocess.Popen(LAUNCH_CMD)
+        
+        # 2. 데이터 수신 확인
+        checker_node = StreamChecker()
+        start_time = time.time()
+        success = False
+        
+        print(f"Waiting for data streams from {len(CHECK_TOPICS)} cameras...")
+
+        while time.time() - start_time < BOOT_TIMEOUT:
+            # 0.5초마다 ROS 콜백 처리
+            rclpy.spin_once(checker_node, timeout_sec=0.5)
+            
+            # 프로세스가 이미 죽었는지 확인 (크래시 등)
+            if process.poll() is not None:
+                print("🚨 Error: Process terminated unexpectedly during startup.")
+                break
+
+            if checker_node.is_all_ready():
+                success = True
+                print(f"✅ Success! All cameras are streaming correctly.")
+                break
+        
+        # Checker 노드 정리
+        checker_node.destroy_node()
+
+        # 3. 결과 처리
+        if success:
+            print("\n🎉 Launch Successful! Keeping process alive.")
+            print("Press Ctrl+C to stop everything.\n")
+            try:
+                # 성공했으므로 프로세스가 끝날 때까지 무한 대기 (ros2 launch 유지)
+                process.wait()
+            except KeyboardInterrupt:
+                print("\nStopping by User request...")
+                process.send_signal(signal.SIGINT)
+                process.wait()
+            
+            # 정상 종료 후 루프 탈출 (프로그램 종료)
+            break
+        
+        else:
+            # 실패 처리
+            print(f"\n❌ Attempt {attempt} Failed (Timeout or Crash).")
+            if attempt < MAX_ATTEMPTS:
+                print("Cleaning up and retrying...")
+                
+                # 프로세스가 살아있다면 종료
+                if process.poll() is None:
+                    process.send_signal(signal.SIGINT)
+                    try:
+                        process.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                
+                print(f"Waiting {COOLDOWN}s for cooldown...")
+                time.sleep(COOLDOWN)
+            else:
+                print("\n💥 All attempts failed. Please check hardware connection or cables.")
+                if process.poll() is None:
+                    process.kill()
+
+    rclpy.shutdown()
+
+if __name__ == "__main__":
+    run_safe_launch()
+
+```
+
+### 코드 작동 방식
+
+1. **실행 (Attempt 1~3)**:
+* `ros2 launch`를 실행합니다.
+* ROS 2 노드를 만들어 실제 카메라 데이터(`camera_info`)가 들어오는지 감시합니다.
+
+
+2. **성공 시 (Success)**:
+* 4개의 카메라 데이터가 모두 확인되면, **프로세스를 죽이지 않습니다.**
+* `process.wait()` 상태로 진입하여 유저가 Ctrl+C를 누르거나 ZED 노드가 스스로 꺼질 때까지 계속 유지합니다. (목표 달성)
+
+
+3. **실패 시 (Failure)**:
+* `BOOT_TIMEOUT`(60초) 동안 데이터가 안 들어오거나, 도중에 프로세스가 죽으면 **실패**로 간주합니다.
+* 실행 중인 프로세스를 `SIGINT`로 정리하고 종료합니다.
+* `COOLDOWN`(10초) 동안 대기 후 다음 시도로 넘어갑니다.
+
+
+4. **최종 실패**:
+* 3번 다 실패하면 "All attempts failed" 메시지를 띄우고 종료합니다.
+
+
+
+### 팁
+
+* 만약 실행에 성공해서 잘 돌고 있는데, **중간에 카메라 연결이 끊겨서 데이터가 멈추는 상황**까지 감지하고 싶으신가요?
+* 현재 코드는 **"초기 구동 성공"**까지만 보장하고 유지 모드로 들어갑니다.
+* 만약 구동 중에도 지속적으로 감시하여 문제가 생기면 재시작하길 원하신다면, `process.wait()` 대신 루프를 돌며 `StreamChecker`를 계속 돌리는 로직이 필요합니다. (하지만 보통 초기 구동만 잘 되면 이후에는 잘 유지되므로 현재 코드로 충분할 것입니다.)
