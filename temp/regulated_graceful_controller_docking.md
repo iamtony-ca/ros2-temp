@@ -1116,157 +1116,163 @@ geometry_msgs::msg::TwistStamped GracefulController::computeVelocityCommands(
 ################  
 #####################  
 #########################  
-제공해주신 `CMakeLists.txt`를 보니 문제의 **정확한 원인**을 찾았습니다.
+제공해주신 `CMakeLists.txt`를 보니 문제의 원인이 명확해졌습니다.
 
-**원인:** `smooth_control_law` 라는 **라이브러리 타겟 이름이 중복**되었기 때문입니다.
+문제의 핵심은 **`add_library(smooth_control_law ...)`** 부분입니다.
 
-기존 패키지와 새 패키지 모두 `add_library(smooth_control_law ...)`를 사용하여 `libsmooth_control_law.so`라는 똑같은 이름의 공유 라이브러리를 생성하고 있습니다. 이로 인해 리눅스 시스템(LD_LIBRARY_PATH) 상에서 **두 패키지의 라이브러리가 뒤섞이거나, 새 라이브러리가 기존 라이브러리를 덮어써서** 기존 컨트롤러가 엉뚱한(수정된) 심볼을 찾게 되는 것입니다.
+### 원인 분석
 
-새 패키지(`regulated_graceful_controller`)의 `CMakeLists.txt`를 아래와 같이 **라이브러리 타겟 이름까지 변경**해야 합니다.
+기존 `nav2_graceful_controller` 패키지는 메인 컨트롤러 라이브러리 외에 내부적으로 사용하는 **`smooth_control_law`라는 이름의 Shared Library(.so)**를 별도로 생성합니다.
+
+사용자님께서 새 패키지(`regulated_graceful_controller`)를 만들 때 `CMakeLists.txt`를 복사하면서 이 타겟 이름(`smooth_control_law`)을 그대로 두셨을 가능성이 매우 큽니다.
+
+1. 두 패키지 모두 `libsmooth_control_law.so` 라는 **동일한 이름의 라이브러리 파일**을 생성하여 `install/lib` 폴더에 설치하려 합니다.
+2. 빌드 순서에 따라 새 패키지의 라이브러리가 기존 라이브러리를 덮어쓰거나, 링커가 둘 중 하나를 모호하게 참조하게 됩니다.
+3. **결과:** 기존 `nav2_graceful_controller`가 실행될 때, `libsmooth_control_law.so`를 로드하는데, 이 파일이 (네임스페이스가 변경된) 새 패키지의 파일로 바뀌어 있어서, 원래 찾던 심볼(`_ZN24nav2...`)을 찾지 못해 죽는 것입니다.
 
 ---
 
-### 수정해야 할 `regulated_graceful_controller`의 CMakeLists.txt
+### 해결 방법: 새 패키지의 `CMakeLists.txt` 수정
 
-아래 주석(COMMENT)이 달린 부분을 중점적으로 수정해주세요.
+새 패키지(`regulated_graceful_controller`)의 `CMakeLists.txt`에서 **라이브러리 타겟 이름**을 반드시 변경해야 합니다. 아래 수정된 내용을 그대로 적용해 보세요.
+
+**수정해야 할 파일:** `regulated_graceful_controller` 패키지 내의 `CMakeLists.txt`
 
 ```cmake
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.5)
 # [변경 1] 프로젝트 이름 변경
-project(regulated_graceful_controller) 
+project(regulated_graceful_controller)
 
-# ... find_package 부분은 동일 ...
-# (단, nav2_graceful_controller 의존성이 있다면 추가해야 할 수도 있음)
+find_package(ament_cmake REQUIRED)
+find_package(nav2_common REQUIRED)
+find_package(nav2_core REQUIRED)
+find_package(nav2_costmap_2d REQUIRED)
+find_package(nav2_util REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(pluginlib REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(nav_2d_utils REQUIRED)
+find_package(angles REQUIRED)
 
 nav2_package()
 
-# [변경 2] 내부 라이브러리 타겟 이름 변경 (중요!!!)
+include_directories(
+  include
+)
+
+set(dependencies
+  rclcpp
+  geometry_msgs
+  nav2_costmap_2d
+  pluginlib
+  nav_msgs
+  nav2_util
+  nav2_core
+  tf2
+  tf2_geometry_msgs
+  nav_2d_utils
+  angles
+)
+
+# [변경 2] 내부 라이브러리 타겟 이름을 변경 (충돌 방지 핵심!)
 # 기존: add_library(smooth_control_law SHARED src/smooth_control_law.cpp)
 add_library(regulated_smooth_control_law SHARED src/smooth_control_law.cpp)
 
-# [변경 3] 타겟 속성 설정도 변경된 이름으로 적용
-target_include_directories(regulated_smooth_control_law
-  PUBLIC
-    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-    "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>"
-)
-target_link_libraries(regulated_smooth_control_law PUBLIC
-  angles::angles
-  ${geometry_msgs_TARGETS}
-  nav2_util::nav2_util_core
-  nav2_ros_common::nav2_ros_common
-  tf2::tf2
-)
+# [변경 3] 의존성 타겟 이름도 변경된 이름으로 적용
+ament_target_dependencies(regulated_smooth_control_law ${dependencies})
 
-# [변경 4] 메인 컨트롤러 라이브러리 이름 설정
+# Add Graceful Controller
+# [변경 4] 메인 라이브러리 이름 변수 설정
 set(library_name regulated_graceful_controller)
 
 add_library(${library_name} SHARED
-  src/graceful_controller.cpp # 파일명을 바꿨다면 바뀐 이름으로 (예: src/regulated_graceful_controller.cpp)
+  src/graceful_controller.cpp
   src/parameter_handler.cpp
   src/path_handler.cpp
   src/utils.cpp
 )
 
-target_include_directories(${library_name}
-  PUBLIC
-    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-    "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>"
-)
+# [변경 5] 링크할 라이브러리 이름을 위에서 변경한 이름으로 수정
+# 기존: target_link_libraries(${library_name} smooth_control_law)
+target_link_libraries(${library_name} regulated_smooth_control_law)
 
-target_link_libraries(${library_name} PUBLIC
-  ${geometry_msgs_TARGETS}
-  nav2_core::nav2_core
-  nav2_ros_common::nav2_ros_common
-  nav2_util::nav2_util_core
-  nav2_costmap_2d::nav2_costmap_2d_core
-  ${nav_msgs_TARGETS}
-  pluginlib::pluginlib
-  rclcpp::rclcpp
-  rclcpp_lifecycle::rclcpp_lifecycle
-  ${rcl_interfaces_TARGETS}
-  # [변경 5] 링크하는 라이브러리 이름도 변경된 것으로 수정
-  regulated_smooth_control_law 
-  tf2::tf2
-  tf2_ros::tf2_ros
-  ${visualization_msgs_TARGETS}
-)
+ament_target_dependencies(${library_name} ${dependencies})
 
-target_link_libraries(${library_name} PRIVATE
-  tf2_geometry_msgs::tf2_geometry_msgs
-)
-
-# [변경 6] Install 타겟 수정
+# [변경 6] 인스톨 타겟 이름 수정
 install(TARGETS regulated_smooth_control_law ${library_name}
-  EXPORT regulated_graceful_controller
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
 )
 
 install(DIRECTORY include/
-  DESTINATION include/${PROJECT_NAME}
+  DESTINATION include/
 )
 
 if(BUILD_TESTING)
-  # ... 테스트 관련 설정 ...
+  find_package(ament_lint_auto REQUIRED)
+  set(ament_cmake_copyright_FOUND TRUE)
+  ament_lint_auto_find_test_dependencies()
+  add_subdirectory(test)
 endif()
 
-ament_export_include_directories(include/${PROJECT_NAME})
+ament_export_include_directories(include)
 
-# [변경 7] Export 라이브러리 이름 수정
+# [변경 7] export 라이브러리 이름 수정
 ament_export_libraries(regulated_smooth_control_law ${library_name})
+ament_export_dependencies(${dependencies})
 
-ament_export_dependencies(
-  geometry_msgs
-  # ... 의존성 목록 ...
-)
-
-# [변경 8] Export 타겟 수정
-ament_export_targets(regulated_graceful_controller)
-
-pluginlib_export_plugin_description_file(nav2_core graceful_controller_plugin.xml)
+# [변경 8] 플러그인 XML 파일명 변경 (파일도 실제로 이름 바꿨는지 확인 필요)
+pluginlib_export_plugin_description_file(nav2_core regulated_graceful_controller_plugin.xml)
 
 ament_package()
 
 ```
 
----
+### 적용 후 절차
 
-### 추가 확인 사항 (C++ 소스 코드)
+이것은 라이브러리 충돌 문제이므로, **반드시 기존 빌드 결과물을 지우고 다시 빌드**해야 합니다.
 
-CMakeLists.txt를 위처럼 수정한 뒤, **소스 코드(.cpp, .hpp) 내부**에서도 아래 사항을 반드시 지켜야 합니다.
-
-1. **네임스페이스 변경:** `src/smooth_control_law.cpp` 파일과 `src/graceful_controller.cpp` 파일 내부의 `namespace`가 `nav2_graceful_controller`가 아닌 **`regulated_graceful_controller`**로 변경되어 있어야 합니다.
-* 만약 네임스페이스를 그대로 `nav2_...`로 둔 채 라이브러리 이름만 바꾸면, 링크 에러는 사라질지 몰라도 런타임에 **클래스 중복 정의(ODR Violation)**로 인해 동작이 이상해질 수 있습니다.
-
-
-
-### 실행 순서
-
-1. 위의 내용대로 `regulated_graceful_controller` 패키지의 `CMakeLists.txt` 수정.
-2. **기존 빌드 완전 삭제 (매우 중요)**: 꼬인 심볼을 풀기 위해 `install` 폴더 내의 관련 파일을 지워야 합니다.
+1. **워크스페이스로 이동:**
 ```bash
-rm -rf build/nav2_graceful_controller install/nav2_graceful_controller
-rm -rf build/regulated_graceful_controller install/regulated_graceful_controller
+cd ~/ammr_ws
 
 ```
 
 
-3. 다시 빌드:
+2. **기존 빌드 삭제 (매우 중요):**
+기존에 잘못 생성된 `libsmooth_control_law.so`가 `install` 폴더에 남아있으면 계속 에러가 납니다.
+```bash
+rm -rf build/ install/
+# 또는 문제가 되는 패키지만 삭제
+# rm -rf build/nav2_graceful_controller install/nav2_graceful_controller
+# rm -rf build/regulated_graceful_controller install/regulated_graceful_controller
+
+```
+
+
+3. **재빌드:**
 ```bash
 colcon build --symlink-install --packages-select nav2_graceful_controller regulated_graceful_controller
 
 ```
 
 
-4. 실행 환경 설정 후 실행:
+4. **환경 설정 및 실행:**
 ```bash
 source install/setup.bash
-ros2 launch ...
+# nav2 실행
 
 ```
 
 
 
-이제 두 패키지가 서로 다른 라이브러리 파일(`libsmooth_control_law.so` vs `libregulated_smooth_control_law.so`)을 사용하므로 충돌이 발생하지 않을 것입니다.
+이제 `nav2_graceful_controller`는 원본 `smooth_control_law`를, `regulated_graceful_controller`는 새로 만든 `regulated_smooth_control_law`를 각각 참조하게 되어 충돌이 사라질 것입니다.
+
+### 추가 체크리스트
+
+* `regulated_graceful_controller_plugin.xml` 파일(변경 8번)의 파일명도 실제로 변경하셨는지 확인하세요.
+* 해당 XML 파일 내부의 `<library path="...">` 부분도 `regulated_graceful_controller`로 되어 있는지 확인하세요.
