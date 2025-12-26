@@ -1155,3 +1155,134 @@ if __name__ == "__main__":
 
 
 이제 안심하고 Ctrl+C를 눌러도 뒷단에 좀비 노드가 남지 않습니다.
+###################  
+#######################  
+###########################  
+`psutil` 라이브러리를 사용하는 것이 가장 안전하고 파이썬다운(Pythonic) 방법입니다. 이 라이브러리는 프로세스 목록을 순회하며 이름이나 실행 인자(command line argument)를 검사할 수 있어, 단순히 실행 파일 이름뿐만 아니라 `ros2 run pkg exec` 형태로 실행된 프로세스도 잘 찾아냅니다.
+
+요청하신 대로 **1. 이름으로 매칭하여 PID를 찾고**, **2. 해당 PID를 kill** 하는 코드를 작성해 드립니다.
+
+### 방법 1: `psutil` 라이브러리 사용 (권장)
+
+이 방법은 프로세스 정보를 객체로 다룰 수 있어 관리가 쉽고, 예외 처리가 용이합니다.
+
+먼저 라이브러리를 설치해야 합니다 (보통 기본 설치되어 있지 않습니다).
+
+```bash
+pip install psutil
+
+```
+
+**Python 코드:**
+
+```python
+import psutil
+import signal
+import os
+
+def kill_process_by_name(target_name):
+    found_pids = []
+    
+    # 1. 실행 중인 모든 프로세스를 순회
+    # attrs=['pid', 'name', 'cmdline']으로 필요한 정보만 가져와 속도 최적화
+    for proc in psutil.process_iter(attrs=['pid', 'name', 'cmdline']):
+        try:
+            # 프로세스 정보 가져오기
+            process_name = proc.info['name']
+            process_cmdline = proc.info['cmdline']
+            
+            # 매칭 로직: 
+            # 1) 프로세스 이름이 정확히 일치하거나
+            # 2) 실행 커맨드라인(cmdline) 리스트 안에 해당 문자열이 포함된 경우 (Python 노드 등)
+            # cmdline은 리스트 형태이므로 join으로 문자열 변환 후 검색하는 것이 안전함
+            if target_name in process_name or (process_cmdline and target_name in ' '.join(process_cmdline)):
+                
+                # 본인(이 파이썬 스크립트)을 죽이지 않도록 방지
+                if proc.pid == os.getpid():
+                    continue
+
+                found_pids.append(proc.pid)
+                
+                # 2. 프로세스 종료 (SIGKILL = -9)
+                # 부드럽게 종료하려면 proc.terminate() 사용
+                print(f"Killing process: {process_name} (PID: {proc.pid})")
+                proc.kill() 
+                
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            # 프로세스가 검사 도중 이미 사라졌거나 권한이 없는 경우 무시
+            pass
+
+    if not found_pids:
+        print(f"No process found with name: {target_name}")
+    else:
+        print(f"Total killed processes: {len(found_pids)}")
+
+if __name__ == "__main__":
+    # 여기에 죽이고 싶은 노드(프로세스) 이름을 입력하세요
+    # 예: 'turtlesim_node' 또는 ros2 실행 시의 노드 이름
+    TARGET_PROCESS_NAME = "my_ros2_node_exec" 
+    
+    kill_process_by_name(TARGET_PROCESS_NAME)
+
+```
+
+---
+
+### 방법 2: `subprocess`와 `pgrep` 사용 (라이브러리 설치 불필요)
+
+`psutil`을 설치할 수 없는 환경이라면, 리눅스 기본 명령어인 `pgrep`을 파이썬에서 호출하여 구현할 수 있습니다.
+
+**Python 코드:**
+
+```python
+import subprocess
+import os
+import signal
+
+def kill_process_by_linux_cmd(target_name):
+    try:
+        # 1. pgrep 명령어로 PID 찾기 (-f 옵션은 전체 커맨드라인 매칭)
+        # 결과값으로 PID들이 줄바꿈(\n)으로 구분되어 나옴
+        result = subprocess.check_output(["pgrep", "-f", target_name])
+        
+        # 바이트 문자열을 디코딩하고 줄바꿈으로 분리
+        pids = result.decode().strip().split('\n')
+        
+        my_pid = str(os.getpid())
+
+        for pid in pids:
+            # 본인 프로세스는 제외
+            if pid == my_pid:
+                continue
+                
+            print(f"Found {target_name} at PID: {pid}. Killing...")
+            
+            # 2. os.kill을 사용하여 시그널 전송
+            # signal.SIGKILL (강제 종료, kill -9와 동일)
+            # signal.SIGTERM (정상 종료 요청, kill -15와 동일)
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except ProcessLookupError:
+                print(f"PID {pid} already dead.")
+                
+    except subprocess.CalledProcessError:
+        print(f"No process found matching: {target_name}")
+
+if __name__ == "__main__":
+    TARGET_PROCESS_NAME = "my_ros2_node_exec"
+    kill_process_by_linux_cmd(TARGET_PROCESS_NAME)
+
+```
+
+### 💡 ROS 2 사용자를 위한 팁
+
+1. **Node Name vs Process Name:** ROS 2에서 `Node Name`과 실제 리눅스 `Process Name`은 다를 수 있습니다.
+* C++ 노드: 보통 실행 파일 이름이 프로세스 이름입니다.
+* Python 노드: 프로세스 이름은 `python3`이고, 인자(argument)에 스크립트 경로가 포함됩니다.
+* 따라서 위 코드들(특히 `psutil` 예제)은 `cmdline`까지 검사하도록 작성되어 있어 **Python 노드와 C++ 노드 모두 잘 잡아냅니다.**
+
+
+2. **종료 강도:** 위 코드는 확실한 종료를 위해 `proc.kill()` (SIGKILL)을 사용했습니다. 하지만 로그 저장이나 DB 연결 해제 등 종료 처리가 중요하다면 `proc.terminate()` (SIGTERM)을 먼저 사용하는 것이 좋습니다.
+
+**다음 단계:**
+작성하신 노드가 종료될 때 데이터를 저장해야 하거나 정리 작업이 필요하다면, `SIGKILL` 대신 `SIGTERM`을 사용하여 안전하게 종료하는 코드로 수정해 드릴까요?
