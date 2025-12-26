@@ -1570,3 +1570,231 @@ while process.poll() is None:
 
 
 이제 실행하시면 **"초기 검증 성공"** 메시지 이후에도, 5초마다 각 카메라가 잘 작동하고 있다는 로그(`[Monitoring] ... Alive`)가 계속 찍히게 됩니다.
+##################  
+######################  
+#########################  
+네, 원하시는 로직은 **"초기 구동 후, 엄격한 안정화 검사(Stability Check) 기간을 거쳐, 그 기간 동안 단 한 번이라도 데이터가 끊기면 즉시 재시작"**하는 구조입니다.
+
+이 방식은 단순히 "데이터가 들어왔는가?"를 확인하는 것보다 훨씬 신뢰성이 높습니다. GMSL 카메라나 USB 대역폭 문제로 인해 **"켜지긴 했는데 데이터가 간헐적으로 끊기는"** 불안정한 상태를 걸러낼 수 있기 때문입니다.
+
+### 핵심 로직 변경 사항
+
+1. **Phase 1 (Start)**: 4개의 카메라로부터 첫 번째 유효 데이터가 들어오기를 기다립니다.
+2. **Phase 2 (Strict Check)**: 모든 카메라가 켜진 순간부터 `CHECK_DURATION`(예: 5초) 카운트다운을 시작합니다.
+* 이 기간 동안 **데이터 수신 간격이 허용치(`MSG_TIMEOUT`, 예: 1초)를 넘어가면 즉시 실패**로 간주하고 재시작합니다.
+
+
+3. **Phase 3 (Maintain)**: 검증을 통과하면 프로세스를 유지하며 모니터링 로그를 남깁니다.
+
+---
+
+### `auto_launch_strict.py`
+
+```python
+import subprocess
+import time
+import signal
+import sys
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import CameraInfo
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+# ================= 사용자 설정 =================
+LAUNCH_CMD = ["ros2", "launch", "zed_multi_camera", "zed_multi_camera.launch.py"]
+
+CHECK_TOPICS = [
+    "/zed_node_0/left/camera_info",
+    "/zed_node_1/left/camera_info",
+    "/zed_node_2/left/camera_info",
+    "/zed_node_3/left/camera_info"
+]
+
+BOOT_TIMEOUT = 60.0    # 초기 데이터 수신까지 기다릴 최대 시간 (초)
+CHECK_DURATION = 5.0   # 모든 노드가 켜진 후, '연속으로' 정상을 유지해야 하는 시간 (초)
+MSG_TIMEOUT = 1.0      # 검증 기간 중 데이터가 이 시간 이상 안 들어오면 비정상 간주 (초)
+COOLDOWN = 10.0        # 재시작 전 대기 시간
+MAX_ATTEMPTS = 3       # 최대 재시도 횟수
+LOG_INTERVAL = 5.0     # 성공 후 로그 남길 간격
+# ==============================================
+
+class StrictChecker(Node):
+    def __init__(self):
+        super().__init__('zed_strict_monitor')
+        
+        # 각 토픽별 마지막으로 데이터 수신한 시간 (초기값 0)
+        self.last_msg_time = {topic: 0.0 for topic in CHECK_TOPICS}
+        self.valid_count = {topic: 0 for topic in CHECK_TOPICS}
+        
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        for topic in CHECK_TOPICS:
+            self.create_subscription(
+                CameraInfo, topic,
+                lambda msg, t=topic: self.listener_callback(msg, t), qos
+            )
+
+    def listener_callback(self, msg, topic_name):
+        # 타임스탬프가 유효할 때만 시간 갱신
+        if msg.header.stamp.sec > 0:
+            self.last_msg_time[topic_name] = time.time()
+            self.valid_count[topic_name] += 1
+
+    def is_all_started(self):
+        """모든 토픽이 최소 1회 이상 데이터를 받았는지 확인"""
+        return all(t > 0.0 for t in self.last_msg_time.values())
+
+    def check_stability(self):
+        """
+        현재 시점에서 모든 토픽이 MSG_TIMEOUT 이내에 데이터를 갱신했는지 확인.
+        리턴값: (bool 정상여부, str 실패이유)
+        """
+        now = time.time()
+        for topic, last_time in self.last_msg_time.items():
+            if last_time == 0.0:
+                return False, f"{topic} not started yet"
+            
+            diff = now - last_time
+            if diff > MSG_TIMEOUT:
+                return False, f"{topic} stalled (No data for {diff:.1f}s)"
+        
+        return True, "Stable"
+
+def cleanup_zed_nodes():
+    print("\n🧹 [Cleanup] Checking for stuck ZED nodes...")
+    subprocess.run(["pkill", "-f", "zed_wrapper_node"])
+    subprocess.run(["pkill", "-f", "zed_multi_camera"])
+
+def run_strict_launch():
+    rclpy.init()
+    process = None
+
+    try:
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            print(f"\n========================================")
+            print(f"🚀 [Attempt {attempt}/{MAX_ATTEMPTS}] Starting ZED Multi Camera...")
+            print(f"========================================")
+
+            # 1. 프로세스 시작
+            process = subprocess.Popen(LAUNCH_CMD)
+            checker = StrictChecker()
+            
+            start_time = time.time()
+            nodes_all_started = False
+            stability_start_time = None
+            success = False
+            
+            print(f"Waiting for initialization ({len(CHECK_TOPICS)} cameras)...")
+
+            # === [Phase 1 & 2: Boot & Stability Check] ===
+            while time.time() - start_time < BOOT_TIMEOUT + CHECK_DURATION:
+                rclpy.spin_once(checker, timeout_sec=0.1)
+                
+                # 프로세스 크래시 확인
+                if process.poll() is not None:
+                    print("🚨 Error: Process died unexpectedly.")
+                    break
+
+                # Step 1: 모든 노드가 데이터를 쏘기 시작했는지 확인
+                if not nodes_all_started:
+                    if checker.is_all_started():
+                        nodes_all_started = True
+                        stability_start_time = time.time()
+                        print(f"⚡ All nodes started! Beginning {CHECK_DURATION}s stability check...")
+                    continue # 아직 시작 안 했으면 계속 대기
+                
+                # Step 2: 안정화 검사 (Stability Check)
+                # 데이터가 끊기지 않고 들어오는지 확인
+                is_stable, reason = checker.check_stability()
+                
+                if not is_stable:
+                    print(f"⚠️ Stability Check Failed: {reason}")
+                    # 안정화 기간 중 끊겼으므로 즉시 실패 처리 -> 재시작 루프로
+                    break 
+                
+                # 안정화 기간을 무사히 통과했는지 확인
+                elapsed_stable = time.time() - stability_start_time
+                if elapsed_stable >= CHECK_DURATION:
+                    success = True
+                    print(f"✅ Success! System stable for {elapsed_stable:.1f}s.")
+                    break
+            
+            # === [Phase 3: Result Handling] ===
+            if success:
+                print("\n🎉 Launch Verified & Stable! Keeping process alive.")
+                print("Press Ctrl+C to stop.\n")
+                
+                # 성공했으므로 모니터링 모드로 진입 (재시작 로직 탈출)
+                last_log = time.time()
+                try:
+                    while process.poll() is None:
+                        rclpy.spin_once(checker, timeout_sec=0.5)
+                        
+                        # 주기적 생존 로그
+                        if time.time() - last_log > LOG_INTERVAL:
+                            is_healthy, msg = checker.check_stability()
+                            status = "🟢 Healthy" if is_healthy else f"🔴 Unstable ({msg})"
+                            print(f"[{time.strftime('%H:%M:%S')}] Monitoring: {status}")
+                            last_log = time.time()
+                            
+                            # (선택사항) 여기서도 끊기면 재시작하고 싶다면?
+                            # if not is_healthy: raise Exception("Runtime Failure")
+                            
+                except KeyboardInterrupt:
+                    raise
+                break # 정상 종료 시 루프 탈출
+            
+            else:
+                # 실패 (타임아웃, 프로세스 사망, 또는 안정화 실패)
+                print(f"\n❌ Attempt {attempt} Failed.")
+                checker.destroy_node()
+                
+                if attempt < MAX_ATTEMPTS:
+                    if process.poll() is None:
+                        process.terminate()
+                        time.sleep(1)
+                        process.kill()
+                    
+                    cleanup_zed_nodes()
+                    print(f"⏳ Cooling down {COOLDOWN}s...")
+                    time.sleep(COOLDOWN)
+                else:
+                    print("\n💥 All attempts failed. Please check hardware.")
+
+    except KeyboardInterrupt:
+        print("\n🛑 User Interrupt detected.")
+        
+    finally:
+        if process and process.poll() is None:
+            process.terminate()
+            process.wait()
+        cleanup_zed_nodes()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+if __name__ == "__main__":
+    run_strict_launch()
+
+```
+
+### 코드 작동 원리 (요약)
+
+1. **시작 대기 (Phase 1)**:
+* `checker.is_all_started()`가 `True`가 될 때까지 기다립니다. (4개 카메라 모두 최소 1회 데이터 수신)
+
+
+2. **안정화 검사 (Phase 2)**:
+* 모두 시작된 시점(`stability_start_time`)부터 `CHECK_DURATION`(5초) 동안 카운트를 셉니다.
+* 이 5초 동안 루프가 돌 때마다 `checker.check_stability()`를 호출합니다.
+* **중요:** 만약 어떤 카메라라도 마지막 데이터 수신 시간이 현재 시간보다 `MSG_TIMEOUT`(1초) 이상 차이나면, **즉시 루프를 깨고(`break`) 실패로 간주**하여 재시작합니다.
+
+
+3. **성공 확정 (Success)**:
+* 끊김 없이 5초를 버티면 `success = True`가 되고, `while process.poll() is None` 루프로 들어가서 시스템을 유지합니다.
+
+
+
+이 코드를 사용하면 ZED 카메라가 켜지긴 했지만 데이터가 불안정하게 들어오는 상황까지 감지하여 **"완벽하게 안정적인 상태"**일 때만 실행을 유지할 수 있습니다.
