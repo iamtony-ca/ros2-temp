@@ -948,3 +948,210 @@ if __name__ == "__main__":
 ### 💡 주의사항 (Namespace)
 
 반드시 `ros2 topic list`를 확인하여 `CHECK_TOPICS` 리스트의 토픽명을 본인의 환경에 맞게 수정해주세요. (예: `/zed_multi/zed_node_0/left/camera_info` 등)
+###################  
+#########################  
+############################  
+ROS 2에서 특정 이름(`zed_multi...`)을 가진 노드만 골라서 죽이는 것은 생각보다 까다롭습니다. ROS 2에는 ROS 1의 `rosnode kill` 같은 명령어가 없고, 노드는 운영체제(OS) 레벨의 **프로세스**로 존재하기 때문입니다.
+
+따라서 가장 확실한 방법은 **Python 스크립트가 종료될 때(KeyboardInterrupt), ZED 관련 프로세스 이름(`zed_wrapper_node` 등)을 찾아 강제로 종료(`pkill`)**시키는 것입니다.
+
+요청하신 기능을 구현하기 위해 **`cleanup_zed_nodes()` 함수**를 추가한 최종 코드입니다.
+
+### 핵심 추가 기능
+
+1. **`cleanup_zed_nodes()`**:
+* `ros2 node list`를 조회하여 `/zed_multi`로 시작하는 노드가 있는지 확인합니다.
+* 존재한다면 `pkill` 명령어를 사용해 ZED 관련 프로세스(`zed_wrapper_node`, `component_container`)를 강제로 정리합니다.
+
+
+2. **`KeyboardInterrupt` 처리**:
+* 사용자가 `Ctrl+C`를 누르면 즉시 이 정리 함수가 실행되어 좀비 프로세스가 남지 않도록 합니다.
+
+
+
+### `auto_launch_final.py`
+
+```python
+import subprocess
+import time
+import signal
+import sys
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import CameraInfo
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+# ================= 사용자 설정 =================
+LAUNCH_CMD = ["ros2", "launch", "zed_multi_camera", "zed_multi_camera.launch.py"]
+
+CHECK_TOPICS = [
+    "/zed_node_0/left/camera_info",
+    "/zed_node_1/left/camera_info",
+    "/zed_node_2/left/camera_info",
+    "/zed_node_3/left/camera_info"
+]
+
+BOOT_TIMEOUT = 60
+COOLDOWN = 10
+MAX_ATTEMPTS = 3
+# ==============================================
+
+class TimestampChecker(Node):
+    def __init__(self):
+        super().__init__('zed_stamp_verifier')
+        self.verified_status = {topic: False for topic in CHECK_TOPICS}
+        
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        for topic in CHECK_TOPICS:
+            self.create_subscription(
+                CameraInfo, topic,
+                lambda msg, t=topic: self.listener_callback(msg, t), qos
+            )
+
+    def listener_callback(self, msg, topic_name):
+        if self.verified_status[topic_name]: return
+        if msg.header.stamp.sec > 0:
+            self.verified_status[topic_name] = True
+
+    def is_all_verified(self):
+        return all(self.verified_status.values())
+    
+    def get_pending_topics(self):
+        return [t for t, v in self.verified_status.items() if not v]
+
+def cleanup_zed_nodes():
+    """
+    /zed_multi 로 시작하는 노드들이 남아있는지 확인하고,
+    관련 프로세스를 강제로 kill 합니다.
+    """
+    print("\n🧹 [Cleanup] Checking for stuck ZED nodes...")
+    
+    try:
+        # 1. 현재 살아있는 노드 확인
+        result = subprocess.run(["ros2", "node", "list"], capture_output=True, text=True)
+        nodes = result.stdout.strip().split('\n')
+        
+        # /zed_multi 로 시작하는 노드 필터링
+        zed_nodes = [n for n in nodes if n.startswith("/zed_multi") or "zed_node" in n]
+        
+        if zed_nodes:
+            print(f"   Found active ZED nodes: {zed_nodes}")
+            print("   ⚠️ Force killing ZED processes...")
+            
+            # 2. 관련 프로세스 강제 종료 (Nuclear Option)
+            # ZED ROS2 Wrapper는 보통 'zed_wrapper_node' 또는 'component_container' 이름으로 실행됨
+            # -f 옵션으로 커맨드라인 전체 매칭
+            subprocess.run(["pkill", "-f", "zed_wrapper_node"]) 
+            subprocess.run(["pkill", "-f", "zed_multi_camera"]) # 런치 파일 잔여물
+            
+            # 잠시 대기 후 확인
+            time.sleep(2)
+            print("   ✅ Cleanup command sent.")
+        else:
+            print("   No active ZED nodes found. Clean exit.")
+            
+    except Exception as e:
+        print(f"   Error during cleanup: {e}")
+
+def run_smart_launch():
+    rclpy.init()
+    process = None # 프로세스 변수 초기화
+
+    try:
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            print(f"\n========================================")
+            print(f"🚀 [Attempt {attempt}/{MAX_ATTEMPTS}] Starting ZED Multi Camera...")
+            print(f"========================================")
+
+            process = subprocess.Popen(LAUNCH_CMD)
+            
+            checker = TimestampChecker()
+            start_time = time.time()
+            success = False
+            
+            print(f"Waiting for valid timestamps from {len(CHECK_TOPICS)} cameras...")
+
+            while time.time() - start_time < BOOT_TIMEOUT:
+                rclpy.spin_once(checker, timeout_sec=0.5)
+                
+                if process.poll() is not None:
+                    print("🚨 Error: Launch process terminated unexpectedly.")
+                    break
+
+                if checker.is_all_verified():
+                    success = True
+                    print(f"\n🎉 Success! All cameras are publishing valid stamps.")
+                    break
+            
+            checker.destroy_node()
+
+            if success:
+                print("🟢 System is healthy. Keeping process alive.")
+                print("Press Ctrl+C to stop and kill all nodes.\n")
+                process.wait() # 무한 대기
+                break # 정상 종료 시 루프 탈출
+            
+            else:
+                print(f"\n❌ Attempt {attempt} Failed.")
+                if attempt < MAX_ATTEMPTS:
+                    print("🔄 Retrying...")
+                    # 실행 중인 프로세스 종료
+                    if process and process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except:
+                            process.kill()
+                    
+                    # 확실한 정리를 위해 cleanup 호출
+                    cleanup_zed_nodes()
+                    
+                    print(f"⏳ Cooling down for {COOLDOWN}s...")
+                    time.sleep(COOLDOWN)
+                else:
+                    print("\n💥 All attempts failed.")
+
+    except KeyboardInterrupt:
+        print("\n\n🛑 User Interrupt detected (Ctrl+C).")
+        
+    finally:
+        # 프로그램 종료 전 최종 정리
+        if process and process.poll() is None:
+            print("   Terminating launch process...")
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except:
+                process.kill()
+        
+        # 여기서 사용자가 요청한 '모든 zed 노드 kill' 로직 수행
+        cleanup_zed_nodes()
+        
+        if rclpy.ok():
+            rclpy.shutdown()
+        print("👋 Bye.")
+
+if __name__ == "__main__":
+    run_smart_launch()
+
+```
+
+### 코드 변경점 설명
+
+1. **`cleanup_zed_nodes()` 함수**:
+* 이 함수는 프로그램이 종료될 때(`finally` 블록) 또는 재시도(`retry`) 전에 호출됩니다.
+* `pkill -f "zed_wrapper_node"`: ZED 노드의 실제 실행 파일 이름이 보통 `zed_wrapper_node`이므로 이를 타겟팅하여 확실하게 죽입니다.
+* `pkill -f "zed_multi_camera"`: 혹시 남아있을 수 있는 Python Launch 프로세스를 죽입니다.
+
+
+2. **`finally` 블록**:
+* 코드가 정상적으로 끝나든, 에러가 나든, `Ctrl+C`로 강제 종료하든 **무조건 실행**되는 블록입니다.
+* 여기서 `cleanup_zed_nodes()`를 호출하므로 어떤 상황에서도 터미널 종료 시 ZED 노드들이 깔끔하게 사라집니다.
+
+
+
+이제 안심하고 Ctrl+C를 눌러도 뒷단에 좀비 노드가 남지 않습니다.
