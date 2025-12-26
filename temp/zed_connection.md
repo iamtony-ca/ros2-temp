@@ -244,3 +244,139 @@ if __name__ == "__main__":
 
 4. **`zed.close()`의 필수성**:
 * GMSL 카메라는 대역폭을 많이 사용합니다. 이전 카메라를 `close()` 하지 않고 다음 카메라를 열려고 하면 대역폭 부족이나 리소스 충돌로 `CAMERA_NOT_DETECTED` 에러가 발생할 확률이 매우 높습니다. 이 코드는 확실하게 `close`를 호출합니다.
+#####################
+###########################
+############################
+안녕하세요! ROS 2 Jazzy와 ZED X 카메라 시스템(Multi-camera setup) 전문가로서 답변 드립니다.
+
+ZED X 4대를 동시에 구동하는 `zed_multi_camera`는 GPU 메모리와 GMSL2 대역폭을 많이 사용하는 무거운 작업입니다. 이를 주기적으로 **"실행 -> 일정 시간 유지 -> 종료(Kill) -> 재시작"** 하는 루프를 만드는 것은 주로 안정성 테스트(Stress Test)나 특정 메모리 이슈를 우회하기 위해 사용됩니다.
+
+이 작업을 수행하는 가장 **세련되고(Pythonic)**, **안전한** 방법 2가지를 제안합니다.
+
+---
+
+### 방법 1: Python 스크립트로 제어 (가장 추천)
+
+Python의 `subprocess` 모듈을 사용하여 프로세스를 실행하고, `SIGINT`(Ctrl+C와 동일) 시그널을 보내 ROS 2 노드가 깔끔하게 종료(Shutdown cleanup)될 시간을 주는 방식입니다.
+
+이 방식은 종료 로그를 확인하거나, 종료 후 ZED 데몬 상태를 점검하는 로직을 추가하기에 가장 적합합니다.
+
+**`run_cycle.py`**
+
+```python
+import subprocess
+import time
+import signal
+import os
+import sys
+
+# 설정
+LAUNCH_CMD = ["ros2", "launch", "zed_multi_camera", "zed_multi_camera.launch.py"]
+RUN_DURATION = 60  # 실행 유지 시간 (초)
+COOLDOWN = 10      # 재시작 전 대기 시간 (초) - ZED 데몬 안정화 시간 필요
+
+def run_loop():
+    loop_count = 1
+    
+    try:
+        while True:
+            print(f"=== [Loop {loop_count}] Starting ZED Multi Camera Launch ===")
+            
+            # 1. 프로세스 실행
+            # process = subprocess.Popen(LAUNCH_CMD, shell=False) # 리스트 형태 명령어 사용 시 shell=False 권장
+            # 만약 alias나 환경변수 로딩이 필요하면 shell=True 사용하되 명령어는 문자열로 변환 필요
+            process = subprocess.Popen(LAUNCH_CMD)
+
+            print(f"--- Running for {RUN_DURATION} seconds... ---")
+            
+            # 2. 지정된 시간만큼 대기 (실행 유지)
+            # 여기서는 단순히 sleep을 썼지만, process.poll()로 조기 종료를 감시할 수도 있습니다.
+            try:
+                process.wait(timeout=RUN_DURATION)
+            except subprocess.TimeoutExpired:
+                # 시간이 다 되면 정상적인 흐름이므로 아래 종료 로직으로 이동
+                pass
+
+            # 3. 종료 시그널 전송 (Clean Shutdown)
+            print("--- Time's up! Sending SIGINT (Ctrl+C) ---")
+            process.send_signal(signal.SIGINT)
+
+            # 4. 프로세스가 완전히 죽을 때까지 대기
+            try:
+                process.wait(timeout=10) # 10초 내에 안 죽으면 강제 종료 고려
+            except subprocess.TimeoutExpired:
+                print("!!! Warning: Process stuck. Killing forcefully... !!!")
+                process.kill()
+                process.wait()
+
+            print(f"=== [Loop {loop_count}] Finished. Cooling down for {COOLDOWN}s... ===\n")
+            
+            # 5. 하드웨어/데몬 안정화를 위한 대기
+            time.sleep(COOLDOWN)
+            loop_count += 1
+
+    except KeyboardInterrupt:
+        print("\n\nStopped by User.")
+        if process.poll() is None:
+            process.send_signal(signal.SIGINT)
+            process.wait()
+        sys.exit(0)
+
+if __name__ == "__main__":
+    run_loop()
+
+```
+
+**실행 방법:**
+
+```bash
+python3 run_cycle.py
+
+```
+
+---
+
+### 방법 2: Linux `timeout` 명령와 Bash 루프 (가장 간편)
+
+복잡한 로직 없이 터미널에서 바로 실행하고 싶다면, 리눅스 내장 명령어인 `timeout`을 활용하는 것이 가장 좋습니다. `timeout`은 지정된 시간이 지나면 프로세스에 종료 신호를 보냅니다.
+
+**터미널 명령어:**
+
+```bash
+while true; do 
+    echo "Starting ZED Launch..."
+    # 60초(1분) 동안 실행 후 SIGINT(-s 2)를 보내 종료
+    timeout -s 2 60s ros2 launch zed_multi_camera zed_multi_camera.launch.py
+    
+    echo "Waiting for cooldown..."
+    sleep 10
+done
+
+```
+
+* `-s 2`: `SIGINT` (Ctrl+C) 신호를 보냅니다. (기본값인 `SIGTERM`을 보내면 ROS 2 노드가 비정상 종료로 인식하여 로그가 지저분해지거나 파라미터가 제대로 해제되지 않을 수 있습니다.)
+* `sleep 10`: ZED X 카메라 드라이버가 종료된 후, GMSL 링크와 ZED 데몬이 정리될 시간을 벌어줍니다.
+
+---
+
+### 💡 ZED X 전문가의 팁 (중요)
+
+ZED X 4대를 다룰 때 재시작 루프에서 주의해야 할 점이 있습니다:
+
+1. **ZED Daemon 상태**:
+ZED X는 백그라운드에서 `zed_x_daemon` 서비스와 통신합니다. 만약 ROS 노드를 재시작했는데 카메라가 인식이 안 된다면, 노드만 껐다 켜는 것으로는 부족할 수 있습니다.
+이 경우 Python 스크립트의 종료 단계에 다음 명령을 추가하여 데몬을 강제로 리프레시해야 할 수 있습니다.
+```python
+subprocess.run(["sudo", "systemctl", "restart", "zed_x_daemon"])
+
+```
+
+
+*(Docker 내부라면 컨테이너 밖의 데몬과 통신하므로 이 부분은 호스트 설정에 따릅니다)*
+2. **Cooldown 시간 필수**:
+GMSL 카메라는 USB 카메라보다 하드웨어적인 연결/해제 속도가 느릴 수 있습니다. 프로세스 종료 후 즉시 다시 시작하면 `Camera not detected` 에러가 발생할 확률이 높습니다. 반드시 **5~10초의 대기 시간**(`sleep`)을 두세요.
+3. **로그 관리**:
+반복 실행하면 로그가 터미널을 가득 채웁니다. Python 스크립트에서 `stdout=subprocess.DEVNULL` 등을 사용해 로그를 숨기거나 파일로 저장하는 것을 추천합니다.
+
+**요약하자면:**
+가장 추천하는 방식은 **방법 1 (Python 스크립트)** 입니다. `try-except` 구조로 안전하게 종료를 보장하고, 필요하다면 `zed_x_daemon` 재시작 명령어도 끼워 넣을 수 있어 확장성이 좋습니다.
