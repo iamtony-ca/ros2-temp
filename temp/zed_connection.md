@@ -1286,3 +1286,86 @@ if __name__ == "__main__":
 
 **다음 단계:**
 작성하신 노드가 종료될 때 데이터를 저장해야 하거나 정리 작업이 필요하다면, `SIGKILL` 대신 `SIGTERM`을 사용하여 안전하게 종료하는 코드로 수정해 드릴까요?
+###################  
+########################  
+##########################  
+네, 좋은 접근입니다. 순간적인 노이즈나 초기화 과정에서 잠깐 튀는 데이터(Glitch)를 정상으로 오판하지 않도록 **"2초간의 안정화(Stability) 검증"** 단계를 추가하겠습니다.
+
+이를 구현하려면 `__init__`에서 각 토픽별로 **'안정화 시작 시간'을 기록할 변수**가 추가로 필요합니다. 따라서 `TimestampChecker` 클래스 전체를 업데이트해 드립니다.
+
+### 변경된 로직 설명
+
+1. **`self.stability_timers`**: 각 토픽별로 유효한 데이터가 **처음 들어온 시간**을 기록합니다.
+2. **`listener_callback`**:
+* 데이터가 유효(`sec > 0`)하면: 타이머가 비어있을 때 시작 시간을 기록하고, 현재 시간과 비교하여 **2.0초가 지났는지** 확인합니다.
+* 데이터가 무효(`sec == 0`)하면: 타이머를 리셋하여 다시 처음부터 2초를 기다리게 합니다.
+
+
+
+### 수정된 `TimestampChecker` 클래스
+
+```python
+class TimestampChecker(Node):
+    def __init__(self):
+        super().__init__('zed_stamp_verifier')
+        
+        # 검증 완료 여부 (False: 미완료, True: 완료)
+        self.verified_status = {topic: False for topic in CHECK_TOPICS}
+        
+        # [NEW] 안정화 시간 측정용 타이머 (None: 측정 전, float: 측정 시작 시간)
+        self.stability_timers = {topic: None for topic in CHECK_TOPICS}
+        
+        # Best Effort QoS 설정
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
+        for topic in CHECK_TOPICS:
+            self.create_subscription(
+                CameraInfo,
+                topic,
+                lambda msg, t=topic: self.listener_callback(msg, t),
+                qos
+            )
+
+    def listener_callback(self, msg, topic_name):
+        # 이미 검증이 끝난 토픽은 연산하지 않고 리턴
+        if self.verified_status[topic_name]:
+            return
+
+        # 1. 데이터 유효성 검사 (Timestamp sec가 0보다 커야 함)
+        if msg.header.stamp.sec > 0:
+            current_time = time.time()
+            
+            # 타이머가 안 켜져 있다면(None), 지금부터 측정 시작
+            if self.stability_timers[topic_name] is None:
+                self.stability_timers[topic_name] = current_time
+                # (옵션) 로그: 안정화 측정 시작
+                # self.get_logger().info(f"⏳ {topic_name}: Stability check started...")
+            
+            else:
+                # 이미 측정 중이라면, 경과 시간 확인
+                elapsed = current_time - self.stability_timers[topic_name]
+                
+                # 2.0초 이상 경과했다면 검증 성공
+                if elapsed >= 2.0:
+                    self.verified_status[topic_name] = True
+                    self.get_logger().info(f"✅ Verified {topic_name}: Stable for {elapsed:.1f}s")
+        
+        else:
+            # 유효하지 않은 데이터(sec=0)가 들어오면 타이머 리셋!
+            if self.stability_timers[topic_name] is not None:
+                self.get_logger().warn(f"⚠️ Reset timer for {topic_name}: Invalid data received.")
+                self.stability_timers[topic_name] = None
+
+    def is_all_verified(self):
+        return all(self.verified_status.values())
+    
+    def get_pending_topics(self):
+        return [t for t, v in self.verified_status.items() if not v]
+
+```
+
+이제 이 클래스를 기존 코드(`auto_launch_final.py`)의 `TimestampChecker` 부분에 덮어씌우면, **"유효한 데이터가 들어오기 시작해서 2초 동안 끊김이나 에러 없이 지속되어야"** 성공으로 판단하게 됩니다.
