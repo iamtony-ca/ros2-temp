@@ -1369,3 +1369,204 @@ class TimestampChecker(Node):
 ```
 
 이제 이 클래스를 기존 코드(`auto_launch_final.py`)의 `TimestampChecker` 부분에 덮어씌우면, **"유효한 데이터가 들어오기 시작해서 2초 동안 끊김이나 에러 없이 지속되어야"** 성공으로 판단하게 됩니다.
+#####################  
+#######################  
+#########################  
+네, 아주 좋은 지적입니다. 이전 코드에서는 검증이 끝나면 자원을 아끼기 위해 `checker` 노드를 파괴(`destroy_node`)하고 프로세스만 지켜봤는데(`process.wait`), **지속적인 모니터링과 로깅**을 원하신다면 구조를 바꿔야 합니다.
+
+**핵심 변경 사항 2가지:**
+
+1. **`listener_callback` 수정**: 검증이 완료된(`verified=True`) 이후에도 리턴(return)하지 않고, **주기적으로 로그를 출력**하도록 로직을 변경합니다. (터미널 도배 방지를 위해 3~5초 간격 출력 추천)
+2. **메인 루프 수정**: 검증 성공 후 `checker.destroy_node()`를 하지 않고, **`while` 루프 안에서 계속 `spin_once`를 돌려서 콜백이 실행되도록** 유지합니다.
+
+---
+
+### 수정된 전체 코드 (`auto_launch_continuous.py`)
+
+이 코드는 초기 검증(2초 안정화)이 끝나면 **"모니터링 모드"**로 전환되어, 런치 파일이 살아있는 동안 계속해서 토픽 상태를 로깅합니다.
+
+```python
+import subprocess
+import time
+import signal
+import sys
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import CameraInfo
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+# ================= 사용자 설정 =================
+LAUNCH_CMD = ["ros2", "launch", "zed_multi_camera", "zed_multi_camera.launch.py"]
+
+CHECK_TOPICS = [
+    "/zed_node_0/left/camera_info",
+    "/zed_node_1/left/camera_info",
+    "/zed_node_2/left/camera_info",
+    "/zed_node_3/left/camera_info"
+]
+
+BOOT_TIMEOUT = 60
+COOLDOWN = 10
+MAX_ATTEMPTS = 3
+LOG_INTERVAL = 5.0  # 검증 완료 후, 로그를 남길 간격 (초)
+# ==============================================
+
+class TimestampChecker(Node):
+    def __init__(self):
+        super().__init__('zed_monitor')
+        
+        # 검증 상태 관리
+        self.verified_status = {topic: False for topic in CHECK_TOPICS}
+        self.stability_timers = {topic: None for topic in CHECK_TOPICS}
+        
+        # [NEW] 로깅 간격 조절용 타이머
+        self.last_log_time = {topic: 0.0 for topic in CHECK_TOPICS}
+        
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        for topic in CHECK_TOPICS:
+            self.create_subscription(
+                CameraInfo, topic,
+                lambda msg, t=topic: self.listener_callback(msg, t), qos
+            )
+
+    def listener_callback(self, msg, topic_name):
+        current_time = time.time()
+        sec = msg.header.stamp.sec
+
+        # --- 1. 초기 검증 단계 (Validation Phase) ---
+        if not self.verified_status[topic_name]:
+            if sec > 0:
+                if self.stability_timers[topic_name] is None:
+                    self.stability_timers[topic_name] = current_time
+                else:
+                    elapsed = current_time - self.stability_timers[topic_name]
+                    if elapsed >= 2.0:
+                        self.verified_status[topic_name] = True
+                        self.get_logger().info(f"✅ Verified {topic_name}: Stable (Stamp: {sec})")
+            else:
+                if self.stability_timers[topic_name] is not None:
+                    self.stability_timers[topic_name] = None
+        
+        # --- 2. 지속 모니터링 단계 (Monitoring Phase) ---
+        else:
+            # 검증이 끝났어도 계속 실행됨.
+            # 단, 터미널 도배를 막기 위해 LOG_INTERVAL마다 한 번씩만 출력
+            if current_time - self.last_log_time[topic_name] > LOG_INTERVAL:
+                self.get_logger().info(f"📊 [Monitoring] {topic_name} is Alive. (Stamp: {sec})")
+                self.last_log_time[topic_name] = current_time
+
+    def is_all_verified(self):
+        return all(self.verified_status.values())
+
+def cleanup_zed_nodes():
+    print("\n🧹 [Cleanup] Checking for stuck ZED nodes...")
+    subprocess.run(["pkill", "-f", "zed_wrapper_node"])
+    subprocess.run(["pkill", "-f", "zed_multi_camera"])
+
+def run_smart_launch():
+    rclpy.init()
+    process = None
+
+    try:
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            print(f"\n========================================")
+            print(f"🚀 [Attempt {attempt}/{MAX_ATTEMPTS}] Starting ZED Multi Camera...")
+            print(f"========================================")
+
+            process = subprocess.Popen(LAUNCH_CMD)
+            
+            # 노드를 여기서 생성하고 계속 유지함
+            checker = TimestampChecker()
+            
+            start_time = time.time()
+            success = False
+            
+            print(f"Waiting for stability check ({len(CHECK_TOPICS)} cameras)...")
+
+            # === [Phase 1: Boot Check Loop] ===
+            while time.time() - start_time < BOOT_TIMEOUT:
+                rclpy.spin_once(checker, timeout_sec=0.1)
+                
+                if process.poll() is not None:
+                    print("🚨 Error: Launch process terminated unexpectedly.")
+                    break
+
+                if checker.is_all_verified():
+                    success = True
+                    break
+            
+            # === [Phase 2: Result Handling] ===
+            if success:
+                print("\n🎉 Launch Successful! Entering Continuous Monitoring Mode.")
+                print("Press Ctrl+C to stop everything.\n")
+                
+                # [핵심] 성공 후 checker를 파괴하지 않고 무한 루프로 진입하여 spin_once 계속 호출
+                try:
+                    while process.poll() is None:
+                        # 1초마다 spin하여 listener_callback 실행 (로깅 발생)
+                        rclpy.spin_once(checker, timeout_sec=1.0)
+                except KeyboardInterrupt:
+                    raise # 바깥의 except 구문으로 던짐
+                
+                break # 프로세스가 스스로 죽으면 루프 탈출
+            
+            else:
+                # 실패 처리
+                print(f"\n❌ Attempt {attempt} Failed.")
+                checker.destroy_node() # 실패했으니 노드 정리하고 재시도
+                
+                if attempt < MAX_ATTEMPTS:
+                    if process.poll() is None:
+                        process.terminate()
+                        time.sleep(2)
+                        process.kill()
+                    cleanup_zed_nodes()
+                    print(f"⏳ Cooling down {COOLDOWN}s...")
+                    time.sleep(COOLDOWN)
+                else:
+                    print("\n💥 All attempts failed.")
+
+    except KeyboardInterrupt:
+        print("\n🛑 User Interrupt detected.")
+        
+    finally:
+        if process and process.poll() is None:
+            process.terminate()
+            process.wait()
+        
+        cleanup_zed_nodes()
+        
+        if rclpy.ok():
+            rclpy.shutdown()
+
+if __name__ == "__main__":
+    run_smart_launch()
+
+```
+
+### 코드 수정 포인트 설명
+
+1. **`listener_callback` 로직 분리**:
+* **Phase 1 (Validation)**: `if not self.verified_status[topic_name]:` 블록에서는 기존처럼 2초 안정화를 체크합니다.
+* **Phase 2 (Monitoring)**: `else:` 블록이 추가되었습니다. 검증이 끝난 후에는 이곳이 실행됩니다. 매번 출력하면 너무 빠르므로 `LOG_INTERVAL`(5초)마다 현재 들어오는 `stamp.sec`를 출력하여 "살아있음"을 표시합니다.
+
+
+2. **`success` 이후 처리 방식 변경**:
+* 이전 코드: `process.wait()` (파이썬 멈춤, 자식 프로세스만 대기)
+* **현재 코드**:
+```python
+while process.poll() is None:
+    rclpy.spin_once(checker, timeout_sec=1.0)
+
+```
+
+
+이 부분이 핵심입니다. 프로세스가 살아있는 동안 **Python도 멈추지 않고 계속 `spin_once`를 돕니다.** 덕분에 `listener_callback`이 계속 호출되어 로깅이 가능해집니다.
+
+
+
+이제 실행하시면 **"초기 검증 성공"** 메시지 이후에도, 5초마다 각 카메라가 잘 작동하고 있다는 로그(`[Monitoring] ... Alive`)가 계속 찍히게 됩니다.
