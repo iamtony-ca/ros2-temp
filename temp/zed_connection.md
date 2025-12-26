@@ -750,3 +750,201 @@ if __name__ == "__main__":
 * 만약 실행에 성공해서 잘 돌고 있는데, **중간에 카메라 연결이 끊겨서 데이터가 멈추는 상황**까지 감지하고 싶으신가요?
 * 현재 코드는 **"초기 구동 성공"**까지만 보장하고 유지 모드로 들어갑니다.
 * 만약 구동 중에도 지속적으로 감시하여 문제가 생기면 재시작하길 원하신다면, `process.wait()` 대신 루프를 돌며 `StreamChecker`를 계속 돌리는 로직이 필요합니다. (하지만 보통 초기 구동만 잘 되면 이후에는 잘 유지되므로 현재 코드로 충분할 것입니다.)
+#####################
+#######################
+##########################
+네, 사용자의 요구사항을 정확히 반영하여 **"실제로 유효한 타임스탬프(`msg.header.stamp.sec > 0`)가 들어오는지"**까지 검증하는 코드를 작성해 드리겠습니다.
+
+단순히 메시지가 들어오는 것을 넘어, **타임스탬프가 0이 아닌 유효한 값**으로 갱신되고 있는지 확인하면 초기화 단계에서 발생할 수 있는 빈 데이터(Dummy Data) 송출 문제를 걸러낼 수 있어 훨씬 안정적입니다.
+
+### 핵심 변경 사항
+
+1. **타임스탬프 검증 로직 추가**: `msg.header.stamp.sec` 값을 읽어 **0보다 큰지** 확인합니다.
+2. **성공 기준**: 4개의 카메라 모두에서 **타임스탬프가 유효한 메시지**를 수신해야 성공으로 간주합니다.
+3. **흐름 유지**: 성공 시 프로세스를 종료하지 않고 유지(`wait`)하며, 실패 시에만 재시작합니다. (최대 3회)
+
+### `launch_with_stamp_check.py`
+
+```python
+import subprocess
+import time
+import signal
+import sys
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import CameraInfo
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+# ================= 사용자 설정 =================
+# 1. 실행할 Launch 명령어
+LAUNCH_CMD = ["ros2", "launch", "zed_multi_camera", "zed_multi_camera.launch.py"]
+
+# 2. 검증할 토픽 리스트 (본인 환경에 맞춰 수정 필수)
+# 'camera_info'가 데이터가 가볍고 헤더(timestamp)를 포함하고 있어 적합합니다.
+CHECK_TOPICS = [
+    "/zed_node_0/left/camera_info",
+    "/zed_node_1/left/camera_info",
+    "/zed_node_2/left/camera_info",
+    "/zed_node_3/left/camera_info"
+]
+
+# 3. 설정 값
+BOOT_TIMEOUT = 60      # 이 시간 내에 검증 실패 시 재시작 (초)
+COOLDOWN = 10          # 재시작 전 대기 시간 (초)
+MAX_ATTEMPTS = 3       # 최대 시도 횟수
+# ==============================================
+
+class TimestampChecker(Node):
+    def __init__(self):
+        super().__init__('zed_stamp_verifier')
+        # 각 토픽별로 검증 성공 여부를 저장 (False: 아직 안 옴, True: 정상 데이터 옴)
+        self.verified_status = {topic: False for topic in CHECK_TOPICS}
+        
+        # Best Effort QoS: 센서 데이터 수신용
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
+        for topic in CHECK_TOPICS:
+            self.create_subscription(
+                CameraInfo,
+                topic,
+                lambda msg, t=topic: self.listener_callback(msg, t),
+                qos
+            )
+
+    def listener_callback(self, msg, topic_name):
+        # 이미 검증된 토픽이면 패스
+        if self.verified_status[topic_name]:
+            return
+
+        # === 핵심 로직: 타임스탬프 확인 ===
+        sec = msg.header.stamp.sec
+        nanosec = msg.header.stamp.nanosec
+        
+        # 타임스탬프가 0이 아닌 유효한 값인지 체크
+        if sec > 0:
+            self.get_logger().info(f"✅ Verified {topic_name}: stamp.sec={sec}")
+            self.verified_status[topic_name] = True
+        else:
+            # 타임스탬프가 0이면 아직 초기화 중이거나 잘못된 데이터일 수 있음
+            # self.get_logger().warn(f"⚠️ Received empty timestamp from {topic_name} (sec=0)")
+            pass
+
+    def is_all_verified(self):
+        """모든 토픽이 검증되었는지 확인"""
+        return all(self.verified_status.values())
+    
+    def get_pending_topics(self):
+        """아직 검증되지 않은 토픽 리스트 반환"""
+        return [t for t, v in self.verified_status.items() if not v]
+
+def run_smart_launch():
+    rclpy.init()
+    
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        print(f"\n========================================")
+        print(f"🚀 [Attempt {attempt}/{MAX_ATTEMPTS}] Starting ZED Multi Camera...")
+        print(f"========================================")
+
+        # 1. 프로세스 실행
+        process = subprocess.Popen(LAUNCH_CMD)
+        
+        # 2. 데이터 및 타임스탬프 검증 시작
+        checker = TimestampChecker()
+        start_time = time.time()
+        success = False
+        
+        print(f"Waiting for valid timestamps from {len(CHECK_TOPICS)} cameras...")
+
+        while time.time() - start_time < BOOT_TIMEOUT:
+            # 0.5초 간격으로 토픽 데이터 확인
+            rclpy.spin_once(checker, timeout_sec=0.5)
+            
+            # 혹시 프로세스가 런치 도중 죽었는지 확인
+            if process.poll() is not None:
+                print("🚨 Error: Launch process terminated unexpectedly.")
+                break
+
+            # 모두 검증 완료되었는지 확인
+            if checker.is_all_verified():
+                success = True
+                elapsed = time.time() - start_time
+                print(f"\n🎉 Success! All cameras are publishing valid stamps. (Time: {elapsed:.1f}s)")
+                break
+        
+        # 노드 정리
+        checker.destroy_node()
+
+        # 3. 결과에 따른 분기
+        if success:
+            # 성공했으므로 프로세스를 끄지 않고 무한 대기 (Ctrl+C 누를 때까지)
+            print("🟢 System is healthy. Keeping process alive.")
+            print("Press Ctrl+C to stop.\n")
+            try:
+                process.wait() # 여기서 멈춰서 계속 실행 상태 유지
+            except KeyboardInterrupt:
+                print("\nStopping by User request...")
+                process.send_signal(signal.SIGINT)
+                process.wait()
+            
+            # 사용자가 종료했으므로 루프 탈출
+            break
+        
+        else:
+            # 실패 처리 (Timeout 또는 Crash)
+            pending = checker.get_pending_topics()
+            print(f"\n❌ Attempt {attempt} Failed.")
+            if pending:
+                print(f"   Missing valid data from: {pending}")
+            
+            if attempt < MAX_ATTEMPTS:
+                print("🔄 Cleaning up and retrying...")
+                
+                # 살아있는 프로세스 종료
+                if process.poll() is None:
+                    process.send_signal(signal.SIGINT)
+                    try:
+                        process.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        print("   Force killing process...")
+                        process.kill()
+                        process.wait()
+                
+                print(f"⏳ Cooling down for {COOLDOWN}s...")
+                time.sleep(COOLDOWN)
+            else:
+                print("\n💥 All 3 attempts failed. Check ZED X connection/power.")
+                if process.poll() is None:
+                    process.send_signal(signal.SIGINT) # 마지막 종료 처리
+
+    rclpy.shutdown()
+
+if __name__ == "__main__":
+    run_smart_launch()
+
+```
+
+### 코드 분석 및 사용법
+
+1. **`listener_callback` 함수**:
+* `msg.header.stamp.sec` 값을 직접 추출합니다.
+* `if sec > 0:` 조건을 통해 타임스탬프가 유효한 시간(Epoch time)을 가리킬 때만 `Verified` 상태로 변경합니다. (초기화 중 0으로 들어오는 경우 무시)
+
+
+2. **성공 시 동작 (`if success:`)**:
+* `process.wait()`를 호출하여 파이썬 스크립트가 종료되지 않고, 자식 프로세스(launch)가 계속 실행되도록 붙잡아둡니다.
+* 이 상태가 되면 터미널을 끄거나 Ctrl+C를 누르기 전까지 **카메라 4대가 계속 켜져 있는 상태**가 됩니다.
+
+
+3. **실패 시 동작 (`else:`)**:
+* 타임아웃(60초) 내에 4개 모두 확인되지 않으면, `SIGINT`를 보내 프로세스를 종료합니다.
+* `COOLDOWN` 후 루프를 돌아 다시 `subprocess.Popen`을 수행합니다.
+
+
+
+### 💡 주의사항 (Namespace)
+
+반드시 `ros2 topic list`를 확인하여 `CHECK_TOPICS` 리스트의 토픽명을 본인의 환경에 맞게 수정해주세요. (예: `/zed_multi/zed_node_0/left/camera_info` 등)
