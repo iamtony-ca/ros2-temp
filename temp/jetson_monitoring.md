@@ -239,3 +239,221 @@ if __name__ == '__main__':
 
 
 이 코드를 사용하시면 ZED, Nav2와 함께 몇 달을 돌려놔도 모니터링 노드 때문에 시스템이 죽는 일은 없을 것입니다.
+##########################  
+##############################  
+#################################  
+ZED Camera의 상태(Connection, Temperature, FPS)와 ROS 2 Node의 생존 여부(Heartbeat)를 모니터링하는 **가장 확실하고 표준적인(Standard) 방법**은 ROS 2의 **`diagnostic_msgs`** 토픽을 활용하는 것입니다.
+
+ZED ROS 2 Wrapper는 이미 내부적으로 카메라 상태를 진단하여 `/diagnostics` 토픽으로 발행하고 있습니다. 굳이 이미지 토픽을 구독해서 FPS를 직접 계산하거나 SDK를 따로 부를 필요가 없습니다. (그러면 오버헤드가 발생합니다.)
+
+### 💡 아키텍처: Diagnostic Listener + Watchdog
+
+1. **데이터 소스:** `/diagnostics` (ZED Node가 발행하는 표준 진단 메시지)
+2. **모니터링 방식:**
+* **FPS & Temp:** 진단 메시지 안의 Key-Value 쌍을 파싱.
+* **Connection & Heartbeat:** **"Watchdog(경비견)" 패턴** 사용. 진단 메시지가 1초 이상 안 들어오면 "연결 끊김(Dead)"으로 간주.
+
+
+
+---
+
+### 🐍 Robust ZED Monitor Code
+
+이 코드는 `/diagnostics`를 감시하다가, ZED 관련 정보만 쏙 뽑아서 JSON으로 발행합니다. 만약 ZED 노드가 멈추면 즉시 `ALIVE: False` 경고를 띄웁니다.
+
+```python
+import rclpy
+from rclpy.node import Node
+from diagnostic_msgs.msg import DiagnosticArray
+from std_msgs.msg import String
+import json
+import time
+
+class ZedMonitor(Node):
+    def __init__(self):
+        super().__init__('zed_status_monitor')
+
+        # 1. 설정
+        # ZED Wrapper의 진단 메시지 이름 (보통 'zed_node: ZED Diagnostic' 형태임)
+        # ros2 topic echo /diagnostics 로 확인 가능
+        self.target_node_name = "zed_node" 
+        
+        # 2. Watchdog 설정 (Heartbeat)
+        self.last_heartbeat_time = 0.0
+        self.timeout_sec = 2.0  # 2초 동안 소식 없으면 사망 판정
+        self.is_connected = False
+
+        # 3. 데이터 저장 변수
+        self.zed_stats = {
+            "fps": 0.0,
+            "temp_left": 0.0,
+            "temp_right": 0.0,
+            "camera_model": "Unknown",
+            "sn": "Unknown"
+        }
+
+        # 4. Subscriber & Publisher
+        # ZED가 발행하는 진단 정보를 수신
+        self.sub_diag = self.create_subscription(
+            DiagnosticArray,
+            '/diagnostics',
+            self.diag_callback,
+            10
+        )
+        
+        # 결과를 보기 좋게 JSON으로 발행
+        self.pub_status = self.create_publisher(String, 'zed_monitor_status', 10)
+        
+        # 5. 주기적 감시 타이머 (1Hz)
+        self.timer = self.create_timer(1.0, self.watchdog_callback)
+
+        self.get_logger().info("ZED Monitor Started via /diagnostics")
+
+    def diag_callback(self, msg):
+        """
+        /diagnostics 토픽이 들어올 때마다 실행.
+        ZED 노드가 보내온 정보인지 확인하고 파싱함.
+        """
+        for status in msg.status:
+            # ZED 노드에서 온 메시지인지 이름으로 필터링
+            if self.target_node_name in status.name:
+                self.last_heartbeat_time = time.time()
+                self.is_connected = True
+                
+                # Key-Value 파싱
+                # ZED Wrapper 버전에 따라 Key 이름이 다를 수 있으니 확인 필요
+                # 보통: 'Input FPS', 'Left CMOS Temp', 'Right CMOS Temp' 등
+                for kv in status.values:
+                    if 'FPS' in kv.key: # Input FPS or Camera FPS
+                        try: self.zed_stats['fps'] = float(kv.value)
+                        except: pass
+                    
+                    elif 'Temp' in kv.key and 'Left' in kv.key:
+                        try: self.zed_stats['temp_left'] = float(kv.value)
+                        except: pass
+
+                    elif 'Temp' in kv.key and 'Right' in kv.key:
+                        try: self.zed_stats['temp_right'] = float(kv.value)
+                        except: pass
+                        
+                    elif 'Model' in kv.key:
+                        self.zed_stats['camera_model'] = kv.value
+                        
+                    elif 'Serial' in kv.key:
+                        self.zed_stats['sn'] = kv.value
+
+    def watchdog_callback(self):
+        """
+        주기적으로 실행되어 '마지막으로 메시지 받은 시간'을 체크함.
+        """
+        current_time = time.time()
+        time_diff = current_time - self.last_heartbeat_time
+
+        # 타임아웃 체크 (Heartbeat Logic)
+        if time_diff > self.timeout_sec:
+            self.is_connected = False
+            status_msg = "DISCONNECTED / DEAD"
+            # 연결 끊기면 수치 0으로 초기화 (선택사항)
+            self.zed_stats['fps'] = 0.0
+        else:
+            status_msg = "ALIVE"
+
+        # 최종 리포트 생성
+        report = {
+            "status": {
+                "alive": self.is_connected,
+                "msg": status_msg,
+                "last_heartbeat_sec_ago": round(time_diff, 1)
+            },
+            "camera": {
+                "fps": self.zed_stats['fps'],
+                "temp": {
+                    "left": self.zed_stats['temp_left'],
+                    "right": self.zed_stats['temp_right']
+                },
+                "info": {
+                    "model": self.zed_stats['camera_model'],
+                    "sn": self.zed_stats['sn']
+                }
+            }
+        }
+
+        # JSON 발행
+        msg = String()
+        msg.data = json.dumps(report)
+        self.pub_status.publish(msg)
+        
+        # 로그 (디버깅용)
+        # if not self.is_connected:
+        #     self.get_logger().warn("ZED Node is NOT responding!")
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ZedMonitor()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+```
+
+---
+
+### 🔍 핵심 포인트 분석
+
+#### 1. 왜 `/diagnostics`를 쓰는가?
+
+* **효율성:** 이미 ZED Node가 내부 C++ 코드에서 하드웨어 상태를 체크해서 보내줍니다. 파이썬에서 무겁게 SDK를 또 열거나 이미지를 처리할 필요가 없습니다.
+* **표준:** Nav2, Hardware Interface 등 모든 ROS 2 메이저 패키지는 `/diagnostics`를 씁니다. 나중에 `rqt_runtime_monitor` 같은 툴에서도 한눈에 볼 수 있습니다.
+
+#### 2. Watchdog (Heartbeat) 로직
+
+* `diag_callback`이 호출될 때마다 `self.last_heartbeat_time`을 갱신합니다.
+* 별도의 `timer`가 돌면서 `현재시간 - 마지막시간 > 2초`를 체크합니다.
+* **결과:** USB 케이블이 빠지거나, 노드가 `Segmentation Fault`로 죽으면 즉시 **"DISCONNECTED"** 상태로 바뀝니다.
+
+#### 3. Temperature & FPS
+
+* ZED Wrapper는 카메라 온도를 `DiagnosticStatus`의 Key-Value 배열(`values`)에 담아 보냅니다.
+* 위 코드는 `Temp`와 `Left`, `FPS` 같은 키워드를 검색해서 값을 추출하므로, ZED 모델(ZED2, ZED X 등)이 조금 바뀌어도 유연하게 작동합니다.
+
+### ✅ 실행 및 확인 방법
+
+1. **실행:**
+```bash
+python3 zed_monitor.py
+
+```
+
+
+2. **데이터 확인:**
+```bash
+ros2 topic echo /zed_monitor_status
+
+```
+
+
+**출력 예시:**
+```json
+{
+  "status": {"alive": true, "msg": "ALIVE", "last_heartbeat_sec_ago": 0.1},
+  "camera": {
+    "fps": 29.8,
+    "temp": {"left": 42.5, "right": 41.2},
+    ...
+  }
+}
+
+```
+
+
+
+**제가 님을 위해 할 수 있는 다음 단계는:**
+
+만약 이 ZED 모니터와 아까 만든 시스템 모니터를 합쳐서, **"FPS가 떨어질 때 시스템 부하(CPU/GPU)가 높았는지, 아니면 카메라 온도가 높았는지"** 원인을 자동으로 분석해 주는 통합 로거(Logger)를 만들어 드릴까요?
