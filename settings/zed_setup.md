@@ -787,3 +787,121 @@ fi
 
 **주의사항:**
 스크립트 내에서 `ros2` 명령어를 실행하려면, 해당 스크립트를 실행하기 전에 터미널에서 `source /opt/ros/jazzy/setup.bash` 등이 선행되어 있거나, 스크립트 맨 윗줄에 `source` 명령을 포함시켜야 합니다.
+###############################  
+##################################  
+#####################################  
+Jetson Orin AGX의 성능을 100% 끌어내고, 재부팅 후에도 귀찮게 매번 명령어를 치지 않아도 되도록 **"관련 명령어 정리"**와 **"자동 실행(Persistence) 설정법"**을 완벽하게 정리해 드립니다.
+
+---
+
+### 1. `jetson_clocks` 핵심 명령어 3대장
+
+`sudo jetson_clocks` 뒤에 옵션을 붙여서 현재 상태를 확인하거나 입맛대로 설정할 수 있습니다.
+
+#### ① 현재 상태 확인 (가장 많이 씀)
+
+```bash
+sudo jetson_clocks --show
+
+```
+
+* **기능:** 현재 CPU, GPU, EMC(메모리)의 클럭 주파수와 팬(Fan) 속도(PWM)를 보여줍니다.
+* **활용:** 명령어가 제대로 먹혔는지 확인할 때 씁니다.
+
+#### ② 현재 설정 저장 (스냅샷)
+
+```bash
+sudo jetson_clocks --store
+
+```
+
+* **기능:** 현재의 클럭 상태와 팬 속도를 파일(`l4t_dfs.conf`)로 저장합니다.
+* **활용:** 무조건 최대 성능이 아니라, "팬 소음은 좀 줄이고 적당히 빠른 상태"를 유지하고 싶을 때, 원하는 상태를 수동으로 맞춘 뒤 저장합니다.
+
+#### ③ 저장된 설정 복구
+
+```bash
+sudo jetson_clocks --restore
+
+```
+
+* **기능:** `--store`로 저장해둔 설정값으로 되돌립니다.
+
+---
+
+### 2. 재부팅 후에도 상태 유지하기 (자동화)
+
+Jetson은 재부팅 시 기본적으로 전력 효율 모드로 돌아갑니다. 이를 막고 **항상 최고 성능(MAXN + Jetson Clocks)**으로 부팅되게 하려면 `systemd` 서비스를 등록하는 것이 **산업 표준(Standard)**입니다.
+
+리눅스 시스템 관리자처럼 딱 한 번만 설정해 두면 됩니다. 따라오세요.
+
+#### 1단계: 서비스 파일 생성
+
+터미널을 열고 편집기를 엽니다.
+
+```bash
+sudo nano /etc/systemd/system/jetson-performance.service
+
+```
+
+#### 2단계: 내용 작성 (복사해서 붙여넣기)
+
+이 스크립트는 부팅 시 **1) 전력 모드를 MAXN(무제한)으로 바꾸고**, **2) 클럭을 최대로 고정**해 줍니다.
+
+```ini
+[Unit]
+Description=Maximize Jetson Orin Performance (MAXN + Jetson Clocks)
+After=nvpmodel.service
+Requires=nvpmodel.service
+
+[Service]
+Type=oneshot
+# 1. 전력 모드를 MAXN(ID:0)으로 강제 설정 (혹시 모를 초기화 방지)
+ExecStartPre=/usr/sbin/nvpmodel -m 0
+# 2. 클럭 고정 (Fan 속도 포함)
+ExecStart=/usr/bin/jetson_clocks
+# (선택사항) 팬 소음이 너무 크다면 아래 주석을 풀고 150(0~255) 정도로 조절 가능
+# ExecStartPost=/bin/sh -c "echo 150 > /sys/devices/platform/pwm-fan/hwmon/hwmon3/pwm1"
+
+[Install]
+WantedBy=multi-user.target
+
+```
+
+* *(참고: `nvpmodel -m 0`은 일반적인 Orin AGX MAXN 모드 ID입니다. 혹시 모르니 `sudo nvpmodel -q`로 ID를 한 번 확인해 보세요.)*
+* 작성 후 `Ctrl + O` (저장), `Enter`, `Ctrl + X` (나가기).
+
+#### 3단계: 서비스 등록 및 시작
+
+이제 OS에게 이 서비스를 부팅 때마다 실행하라고 알려줍니다.
+
+```bash
+# 1. 시스템 설정 새로고침
+sudo systemctl daemon-reload
+
+# 2. 부팅 시 자동 실행 등록
+sudo systemctl enable jetson-performance.service
+
+# 3. 지금 즉시 실행 테스트
+sudo systemctl start jetson-performance.service
+
+```
+
+---
+
+### ✅ 적용 확인 방법
+
+재부팅(`sudo reboot`)을 한 번 하신 뒤, 터미널을 열고 바로 다음을 확인해 보세요.
+
+1. **서비스 상태 확인:**
+```bash
+systemctl status jetson-performance.service
+
+```
+
+
+초록색 불이 들어오면서 `Finished Maximize Jetson Orin Performance`라고 뜨면 성공입니다.
+2. **클럭 확인 (`jtop`):**
+`sudo jtop`을 켰을 때, 부팅 직후임에도 **EMC 클럭이 3000MHz 대**, **GPU 클럭이 1300MHz**로 고정되어 있다면 완벽하게 적용된 것입니다.
+
+이제 ZED 노드와 Nav2를 언제 켜더라도 항상 최고의 성능을 낼 준비가 끝났습니다.
