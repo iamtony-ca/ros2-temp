@@ -457,3 +457,248 @@ ros2 topic echo /zed_monitor_status
 **제가 님을 위해 할 수 있는 다음 단계는:**
 
 만약 이 ZED 모니터와 아까 만든 시스템 모니터를 합쳐서, **"FPS가 떨어질 때 시스템 부하(CPU/GPU)가 높았는지, 아니면 카메라 온도가 높았는지"** 원인을 자동으로 분석해 주는 통합 로거(Logger)를 만들어 드릴까요?
+################################  
+######################################  
+#######################################  
+범인은 바로 **`_get_latency_and_sync` 함수 안에 있는 `ping` 명령어의 타임아웃(Blocking)** 때문입니다.
+
+작성자님께서 `self.interval = 0.1` (10Hz)로 설정을 바꾸셨더라도, 코드 내부의 흐름이 **어딘가에서 1초 동안 멈춰(Block) 있기 때문에** 다음 루프가 실행되지 못하는 것입니다.
+
+### 🕵️‍♂️ 정확한 원인 분석
+
+코드에 포함된 이 줄을 보세요:
+
+```python
+cmd = ['ping', '-c', '1', '-W', '1', self.target_ip]
+
+```
+
+* 여기서 **`-W 1`** 옵션은 "응답이 없으면 **1초 동안 기다려라(Timeout)**"라는 뜻입니다.
+* 그리고 `subprocess.run`은 이 명령어가 끝날 때까지 **파이썬 코드를 멈춥니다(Blocking).**
+* 만약 `target_ip`가 없거나 응답하지 않는다면?
+* Ping 명령어는 정확히 1초를 기다렸다가 종료됩니다.
+* 결과적으로 루프 한 번 도는 데 `0.1초(타이머) + 1.0초(Ping대기) = 1.1초`가 걸리게 됩니다.
+
+
+
+---
+
+### 🛠️ 해결 방법: "Fast Loop"와 "Slow Loop" 분리 (Best Practice)
+
+CPU/GPU 정보는 10Hz(0.1초)로 빠르게 보고 싶지만, `Ping`이나 `Network` 상태는 굳이 0.1초마다 체크할 필요가 없습니다. (오히려 0.1초마다 핑을 날리면 네트워크에 부하를 줍니다.)
+
+따라서 **타이머를 2개로 분리**하는 것이 가장 이상적이고 확실한 해결책입니다.
+
+1. **Fast Timer (0.1s):** CPU, GPU, Memory, Power (빠르게 변하는 값)
+2. **Slow Timer (1.0s):** Ping, Chrony, Network Bandwidth (느리거나 블로킹이 있는 값)
+
+아래 수정된 코드는 **Ping이 실패해서 1초가 걸리더라도, CPU/GPU 모니터링은 멈추지 않고 0.1초마다 쌩쌩 돌아가도록** 멀티 스레드 개념을 적용하지 않고도 타이머 분리로 해결한 버전입니다.
+
+#### 수정된 코드 (`RobustMonitor_v2.py`)
+
+```python
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+import json
+import psutil
+import subprocess
+import time
+from collections import deque
+from jtop import jtop
+
+class RobustMonitorV2(Node):
+    def __init__(self):
+        super().__init__('robust_system_monitor_v2')
+        
+        # 설정
+        self.declare_parameter('target_ip', '192.168.0.1')
+        self.target_ip = self.get_parameter('target_ip').value
+        
+        # 1. 큐 및 Jtop 초기화
+        self.history_len = 60
+        self.cpu_q = deque(maxlen=self.history_len)
+        self.gpu_q = deque(maxlen=self.history_len)
+        
+        # Jtop 시작
+        try:
+            self.jetson = jtop()
+            self.jetson.start()
+        except Exception as e:
+            self.get_logger().error(f"Jtop Start Fail: {e}")
+            self.jetson = None
+
+        # 2. 공유 변수 (Slow Timer가 업데이트하고, Fast Timer가 읽음)
+        self.latest_ping = -1.0
+        self.latest_sync_offset = 0.0
+        self.latest_net_io = {}
+        
+        # 네트워크 계산용
+        self.prev_net = psutil.net_io_counters()
+        self.prev_time = time.time()
+
+        # 3. 타이머 분리 (핵심!)
+        
+        # [Fast Timer] 0.1초 (10Hz) - CPU/GPU/Publish 담당
+        self.create_timer(0.1, self.update_fast_stats)
+        
+        # [Slow Timer] 1.0초 (1Hz) - Ping/Network 담당 (블로킹 되어도 상관없는 주기)
+        self.create_timer(1.0, self.update_slow_stats)
+
+        self.get_logger().info("Monitor V2 Started: Fast(10Hz) & Slow(1Hz) Loops")
+
+    def _get_latency_and_sync(self):
+        """느린 작업들 (Ping, Chrony)"""
+        ping_ms = -1.0
+        sync_offset_ms = 0.0
+
+        # Ping (-W 1 때문에 최대 1초 걸림)
+        try:
+            cmd = ['ping', '-c', '1', '-W', '1', self.target_ip]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if res.returncode == 0:
+                start = res.stdout.find('time=')
+                if start != -1:
+                    end = res.stdout.find(' ms', start)
+                    ping_ms = float(res.stdout[start+5:end])
+        except Exception:
+            pass
+
+        # Chrony
+        try:
+            cmd = ['chronyc', 'tracking']
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if res.returncode == 0:
+                for line in res.stdout.splitlines():
+                    if "Last offset" in line:
+                        parts = line.split(':')
+                        if len(parts) > 1:
+                            seconds = float(parts[1].replace('seconds', '').strip())
+                            sync_offset_ms = seconds * 1000.0
+                        break
+        except Exception:
+            pass
+
+        return ping_ms, sync_offset_ms
+
+    def update_slow_stats(self):
+        """1초마다 실행: 무거운 작업을 수행하고 공유 변수 업데이트"""
+        # 1. Ping & Sync
+        p, s = self._get_latency_and_sync()
+        self.latest_ping = p
+        self.latest_sync_offset = s
+
+        # 2. Network Bandwidth (1초 간격 계산이 가장 정확함)
+        try:
+            curr_net = psutil.net_io_counters()
+            curr_time = time.time()
+            dt = curr_time - self.prev_time
+            if dt <= 0: dt = 1.0
+
+            sent_bps = (curr_net.bytes_sent - self.prev_net.bytes_sent) / dt
+            recv_bps = (curr_net.bytes_recv - self.prev_net.bytes_recv) / dt
+
+            self.prev_net = curr_net
+            self.prev_time = curr_time
+
+            self.latest_net_io = {
+                "tx_mbps": round(sent_bps * 8 / 1_000_000, 2),
+                "rx_mbps": round(recv_bps * 8 / 1_000_000, 2),
+                "tx_total_mb": round(curr_net.bytes_sent / 1024 / 1024, 1),
+                "rx_total_mb": round(curr_net.bytes_recv / 1024 / 1024, 1)
+            }
+        except Exception:
+            pass
+
+    def update_fast_stats(self):
+        """0.1초마다 실행: 빠른 작업 수행 및 Publish"""
+        # 1. CPU & RAM (Fast)
+        cpu_cur = psutil.cpu_percent(interval=None) # Non-blocking
+        self.cpu_q.append(cpu_cur)
+        mem = psutil.virtual_memory()
+
+        # 2. GPU & Power (Fast)
+        gpu_cur = 0
+        gpu_temp = 0
+        gpu_mem = 0
+        power_w = 0
+        
+        if self.jetson and self.jetson.ok():
+            try:
+                gpu_cur = self.jetson.stats['GPU']
+                self.gpu_q.append(gpu_cur)
+                gpu_temp = self.jetson.stats['Temp'].get('GPU', 0)
+                gpu_mem = self.jetson.stats['RAM'].get('shared', 0) / 1024
+                power_w = self.jetson.stats['Power'].get('avg', 0) / 1000
+            except: pass
+
+        # 통계 계산
+        cpu_avg = sum(self.cpu_q) / len(self.cpu_q) if self.cpu_q else 0
+        cpu_max = max(self.cpu_q) if self.cpu_q else 0
+        gpu_avg = sum(self.gpu_q) / len(self.gpu_q) if self.gpu_q else 0
+        gpu_max = max(self.gpu_q) if self.gpu_q else 0
+
+        # 3. 메시지 생성 (느린 데이터는 최신값(latest)을 가져다 씀)
+        status_data = {
+            "timestamp": time.time(),
+            "cpu": {
+                "usage_percent": cpu_cur,
+                "avg": round(cpu_avg, 1),
+                "max": round(cpu_max, 1),
+                "mem_usage_mb": round(mem.used / 1024 / 1024, 1),
+            },
+            "gpu": {
+                "usage_percent": int(gpu_cur),
+                "avg": round(gpu_avg, 1),
+                "max": int(gpu_max),
+                "temp_c": int(gpu_temp),
+                "mem_usage_mb": int(gpu_mem)
+            },
+            "network": {
+                "io": self.latest_net_io,       # Slow Loop에서 업데이트된 값
+                "latency_ping_ms": self.latest_ping # Slow Loop에서 업데이트된 값
+            },
+            "system": {
+                "time_offset_ms": round(self.latest_sync_offset, 4), # Slow Loop에서 업데이트된 값
+                "power_w": round(power_w, 2)
+            }
+        }
+        
+        # Publish (10Hz)
+        msg = String()
+        msg.data = json.dumps(status_data)
+        self.publisher_.publish(msg) # self.pub 대신 self.publisher_ 등 초기화 변수명에 맞게 사용
+
+    def destroy_node(self):
+        if self.jetson: self.jetson.close()
+        super().destroy_node()
+
+def main(args=None):
+    rclpy.init(args=args)
+    # create_publisher 변수명만 주의해서 사용하면 됩니다. (위 코드에선 생략됨, init에 추가 필요)
+    node = RobustMonitorV2()
+    # publisher 초기화 누락 방지용 
+    node.publisher_ = node.create_publisher(String, 'system_status', 10)
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+```
+
+### 요약
+
+1. **원인:** `ping` 명령어가 타겟 IP를 못 찾으면 1초간 대기(`-W 1`)하느라 전체 코드가 멈춤.
+2. **해결:**
+* **Slow Timer (1.0s):** 핑과 네트워크 속도 계산 담당 (멈춰도 상관없음).
+* **Fast Timer (0.1s):** Jtop과 CPU 값만 읽어서 **최신 핑 값(캐시)**과 함께 Publish.
+
+
+3. 이제 `ros2 topic hz /system_status`를 해보시면 정확히 **10Hz**가 나올 것입니다.
