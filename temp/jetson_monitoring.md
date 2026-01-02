@@ -702,3 +702,252 @@ if __name__ == '__main__':
 
 
 3. 이제 `ros2 topic hz /system_status`를 해보시면 정확히 **10Hz**가 나올 것입니다.
+###############################
+######################################
+############################################
+네, 아주 좋은 접근입니다. ZED X(GMSL)는 보통 하드웨어 포트(GMSL Port A, B, C, D)에 따라 **Device ID**가 고정되는 특성이 있습니다. 따라서 **"현재 연결된 카메라들의 ID와 S/N을 조회"**한 뒤, 그 매핑 정보를 `ros2 launch` 명령어의 인자(argument)로 동적으로 넣어주는 방식이 가장 깔끔합니다.
+
+이 기능을 구현하기 위해 가장 확실한 방법은 ZED SDK의 Python API(`pyzed.sl`)를 사용하는 것입니다.
+
+기존 코드에 **S/N 자동 탐지 및 명령어 생성 로직**을 추가한 완성된 코드를 드립니다.
+
+### 핵심 추가 기능
+
+1. **`pyzed.sl` 활용**: ZED SDK를 통해 현재 연결된 모든 카메라의 ID와 S/N을 가져옵니다.
+2. **동적 매핑**: 카메라 ID(0~3)에 맞는 S/N을 찾아서 Launch Argument(`cam_0_sn:=...`)로 변환합니다.
+3. **명령어 조립**: 고정된 `LAUNCH_CMD` 리스트 대신, 실행 시마다 인자가 추가된 리스트를 생성합니다.
+
+---
+
+### `auto_launch_with_sn.py`
+
+```python
+import subprocess
+import time
+import signal
+import sys
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import CameraInfo
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+# [NEW] ZED SDK Import
+try:
+    import pyzed.sl as sl
+except ImportError:
+    print("❌ Error: ZED SDK (pyzed) not found. Please install ZED SDK.")
+    sys.exit(1)
+
+# ================= 사용자 설정 =================
+# 기본 런치 파일 경로 (인자 제외)
+BASE_LAUNCH_CMD = ["ros2", "launch", "zed_multi_camera", "zed_multi_camera.launch.py"]
+
+# 예상되는 카메라 개수
+EXPECTED_CAM_COUNT = 4
+
+CHECK_TOPICS = [
+    "/zed_node_0/left/camera_info",
+    "/zed_node_1/left/camera_info",
+    "/zed_node_2/left/camera_info",
+    "/zed_node_3/left/camera_info"
+]
+
+BOOT_TIMEOUT = 60.0
+CHECK_DURATION = 5.0
+MSG_TIMEOUT = 1.0
+COOLDOWN = 10.0
+MAX_ATTEMPTS = 3
+LOG_INTERVAL = 5.0
+# ==============================================
+
+def get_zed_launch_args():
+    """
+    연결된 ZED 카메라를 스캔하여 ID와 Serial Number 매핑을 찾고,
+    ros2 launch 인자 리스트를 생성하여 반환합니다.
+    예: ['cam_0_sn:=12345678', 'cam_1_sn:=87654321', ...]
+    """
+    print("🔍 Scanning ZED X devices via SDK...")
+    
+    # ZED SDK로 장치 리스트 가져오기
+    dev_list = sl.Camera.get_device_list()
+    
+    if len(dev_list) < EXPECTED_CAM_COUNT:
+        print(f"⚠️ Warning: Found {len(dev_list)} cameras, but expected {EXPECTED_CAM_COUNT}.")
+    
+    # ID 별 Serial Number 딕셔너리 생성 (예: {0: 1234, 1: 5678})
+    # ZED X는 GMSL 포트에 따라 ID가 고정되므로 id 값을 신뢰할 수 있습니다.
+    id_sn_map = {dev.id: dev.serial_number for dev in dev_list}
+    
+    launch_args = []
+    
+    # 0번부터 3번까지 순회하며 인자 생성
+    # launch 파일에서 받는 인자 이름(cam_X_sn)이 맞는지 확인 필요!
+    for cam_id in range(EXPECTED_CAM_COUNT):
+        if cam_id in id_sn_map:
+            sn = id_sn_map[cam_id]
+            arg = f"cam_{cam_id}_sn:={sn}" # 이 부분이 핵심
+            launch_args.append(arg)
+            print(f"   -> Found CAM ID {cam_id}: S/N {sn}")
+        else:
+            print(f"   -> ❌ CAM ID {cam_id} not detected!")
+            # 감지 안 된 경우 처리는 사용자가 결정 (여기선 그냥 넘어감 or 더미값)
+            
+    return launch_args
+
+class StrictChecker(Node):
+    def __init__(self):
+        super().__init__('zed_strict_monitor')
+        self.last_msg_time = {topic: 0.0 for topic in CHECK_TOPICS}
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        for topic in CHECK_TOPICS:
+            self.create_subscription(
+                CameraInfo, topic,
+                lambda msg, t=topic: self.listener_callback(msg, t), qos
+            )
+
+    def listener_callback(self, msg, topic_name):
+        if msg.header.stamp.sec > 0:
+            self.last_msg_time[topic_name] = time.time()
+
+    def is_all_started(self):
+        return all(t > 0.0 for t in self.last_msg_time.values())
+
+    def check_stability(self):
+        now = time.time()
+        for topic, last_time in self.last_msg_time.items():
+            if last_time == 0.0: return False, f"{topic} waiting"
+            if now - last_time > MSG_TIMEOUT: return False, f"{topic} stalled"
+        return True, "Stable"
+
+def cleanup_zed_nodes():
+    print("\n🧹 [Cleanup] Force killing ZED nodes...")
+    subprocess.run(["pkill", "-f", "zed_wrapper_node"])
+    subprocess.run(["pkill", "-f", "zed_multi_camera"])
+
+def run_strict_launch():
+    rclpy.init()
+    process = None
+
+    try:
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            print(f"\n========================================")
+            print(f"🚀 [Attempt {attempt}/{MAX_ATTEMPTS}] Preparing Launch...")
+            print(f"========================================")
+
+            # [STEP 1] S/N 감지 및 커맨드 생성
+            # 매 시도마다 새로 스캔 (혹시 케이블을 뽑았다 꽂았을 수 있으므로)
+            try:
+                dynamic_args = get_zed_launch_args()
+            except Exception as e:
+                print(f"❌ Error during SDK scan: {e}")
+                time.sleep(2)
+                continue
+
+            # 기본 명령어 + 동적 S/N 인자 합치기
+            full_cmd = BASE_LAUNCH_CMD + dynamic_args
+            
+            print("▶ Executing Command:")
+            print("  " + " ".join(full_cmd))
+            print("----------------------------------------")
+
+            # [STEP 2] 프로세스 실행
+            process = subprocess.Popen(full_cmd)
+            checker = StrictChecker()
+            
+            start_time = time.time()
+            nodes_all_started = False
+            stability_start_time = None
+            success = False
+            
+            # ... (이하 로직은 이전과 동일: 부팅 대기 -> 안정화 체크) ...
+            print(f"Waiting for initialization ({len(CHECK_TOPICS)} cameras)...")
+            
+            while time.time() - start_time < BOOT_TIMEOUT + CHECK_DURATION:
+                rclpy.spin_once(checker, timeout_sec=0.1)
+                
+                if process.poll() is not None:
+                    print("🚨 Error: Process died unexpectedly.")
+                    break
+
+                if not nodes_all_started:
+                    if checker.is_all_started():
+                        nodes_all_started = True
+                        stability_start_time = time.time()
+                        print(f"⚡ All nodes started! Checking stability for {CHECK_DURATION}s...")
+                    continue
+                
+                is_stable, reason = checker.check_stability()
+                if not is_stable:
+                    print(f"⚠️ Stability Check Failed: {reason}")
+                    break 
+                
+                if time.time() - stability_start_time >= CHECK_DURATION:
+                    success = True
+                    print(f"✅ Success! System stable.")
+                    break
+            
+            if success:
+                print("\n🎉 Launch Verified! Keeping process alive.")
+                print("Press Ctrl+C to stop.\n")
+                last_log = time.time()
+                try:
+                    while process.poll() is None:
+                        rclpy.spin_once(checker, timeout_sec=0.5)
+                        if time.time() - last_log > LOG_INTERVAL:
+                            is_healthy, msg = checker.check_stability()
+                            status = "🟢 Healthy" if is_healthy else f"🔴 Unstable ({msg})"
+                            print(f"[{time.strftime('%H:%M:%S')}] Monitoring: {status}")
+                            last_log = time.time()
+                except KeyboardInterrupt:
+                    raise
+                break 
+            
+            else:
+                print(f"\n❌ Attempt {attempt} Failed.")
+                checker.destroy_node()
+                if attempt < MAX_ATTEMPTS:
+                    if process.poll() is None:
+                        process.terminate()
+                        time.sleep(1)
+                        process.kill()
+                    cleanup_zed_nodes()
+                    print(f"⏳ Cooling down {COOLDOWN}s...")
+                    time.sleep(COOLDOWN)
+                else:
+                    print("\n💥 All attempts failed.")
+
+    except KeyboardInterrupt:
+        print("\n🛑 User Interrupt detected.")
+    finally:
+        if process and process.poll() is None:
+            process.terminate()
+            process.wait()
+        cleanup_zed_nodes()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+if __name__ == "__main__":
+    run_strict_launch()
+
+```
+
+### 💡 중요 체크 포인트 (필독)
+
+1. **Launch Argument 이름 확인**:
+* 코드에서 `arg = f"cam_{cam_id}_sn:={sn}"` 라고 작성했습니다.
+* 실제 사용하시는 `zed_multi_camera.launch.py` 파일 내부에서 이 인자를 받도록 설정되어 있는지 확인해야 합니다.
+* 보통 Stereolabs 공식 예제는 `zed_multi_camera.launch.py`에서 `cam_0_sn`, `cam_1_sn` 등을 `DeclareLaunchArgument`로 선언해두거나, `common.yaml` 파일을 덮어쓰는 방식을 사용합니다.
+* 만약 인자 이름이 다르면(예: `serial_0`, `sn_0` 등) 코드의 해당 문자열 부분을 수정해주세요.
+
+
+2. **`pyzed` 라이브러리**:
+* ZED SDK가 설치된 환경이라면 `import pyzed.sl`이 정상 작동합니다. 도커 컨테이너 내부라면 ZED 전용 도커 이미지를 사용해야 합니다.
+
+
+3. **카메라 ID 매핑**:
+* ZED X(GMSL)는 하드웨어적으로 ID가 할당되므로, `sl.Camera.get_device_list()`를 호출하면 각 카메라 객체(`dev`)에 `dev.id`와 `dev.serial_number`가 들어있습니다.
+* 이 코드는 `dev.id`가 0인 카메라의 S/N을 `cam_0_sn`에 할당합니다. 즉, 사용자가 의도한 "1, 2, 0, 3 순서" 등의 섞인 상황이라도, **"ID 0번 포트에 꽂힌 카메라의 S/N은 0번 노드 인자로"** 정확하게 매칭됩니다.
