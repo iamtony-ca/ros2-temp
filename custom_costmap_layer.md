@@ -907,3 +907,249 @@ global_costmap:
   * **토픽 이름:** `/global_costmap/wanted_layers_container/costmap_raw`
 
 이 토픽을 구독하면 `obstacle_layer`와 `inflation_layer`가 합쳐진 costmap을 얻을 수 있습니다.
+############################  
+###############################  
+################################  
+네, 원하시는 대로 **기존 Nav2 시스템(LiDAR Only)**과 **별도의 장애물 인식 시스템(LiDAR + Camera)**이 공존하는 구성을 완벽한 코드로 구현해 드리겠습니다.
+
+기존 `nav2_bringup` 패키지의 런치 파일을 건드리지 않고, 사용자 패키지(예: `tb3_multi_robot` 또는 `my_robot_bringup`) 내에 **추가 파일 2개(Launch, YAML)**를 생성하여 깔끔하게 실행하는 방식입니다.
+
+---
+
+### 1. 파라미터 파일 작성 (`custom_costmap_params.yaml`)
+
+먼저 카메라 데이터를 포함하는 커스텀 코스트맵 설정을 정의합니다.
+기존 Nav2 파라미터와 독립적이어야 하므로 별도 파일로 만듭니다.
+
+**경로 예시:** `src/my_robot_bringup/params/custom_costmap_params.yaml`
+
+```yaml
+# custom_costmap_params.yaml
+# 이 이름(custom_costmap_node)은 Launch 파일의 'name' 파라미터와 일치해야 합니다.
+custom_costmap_node:
+  ros__parameters:
+    use_sim_time: True  # 시뮬레이션 사용 시 True, 실기체는 False
+    
+    # Costmap2DROS 객체 이름 (보통 global_costmap 또는 local_costmap)
+    global_costmap:
+      ros__parameters:
+        update_frequency: 5.0
+        publish_frequency: 2.0
+        global_frame: map
+        robot_base_frame: base_link
+        resolution: 0.05
+        track_unknown_space: true
+        
+        # 플러그인 정의: 여기에는 Camera 레이어가 포함됩니다.
+        plugins: ["static_layer", "obstacle_layer", "camera_layer", "inflation_layer"]
+
+        # 1. 정적 지도 레이어
+        static_layer:
+          plugin: "nav2_costmap_2d::StaticLayer"
+          map_subscribe_transient_local: True
+
+        # 2. LiDAR 레이어 (기존과 동일)
+        obstacle_layer:
+          plugin: "nav2_costmap_2d::ObstacleLayer"
+          enabled: True
+          observation_sources: scan
+          scan:
+            topic: /scan
+            max_obstacle_height: 2.0
+            clearing: True
+            marking: True
+            data_type: "LaserScan"
+            raytrace_max_range: 3.0
+            obstacle_max_range: 2.5
+
+        # 3. [핵심] Camera 레이어 (3D 장애물 인식용)
+        # VoxelLayer를 사용하여 3D 데이터를 처리하거나, 간단히 ObstacleLayer를 하나 더 써도 됩니다.
+        camera_layer:
+          plugin: "nav2_costmap_2d::VoxelLayer" 
+          enabled: True
+          publish_voxel_map: True
+          origin_z: 0.0
+          z_resolution: 0.05
+          z_voxels: 16
+          max_obstacle_height: 2.0
+          mark_threshold: 0
+          observation_sources: pointcloud
+          pointcloud:
+            topic: /camera/depth/points  # 실제 카메라 포인트클라우드 토픽 입력
+            max_obstacle_height: 2.0
+            min_obstacle_height: 0.0
+            clearing: True
+            marking: True
+            data_type: "PointCloud2"
+            raytrace_max_range: 3.0
+            obstacle_max_range: 2.5
+
+        # 4. 인플레이션 레이어
+        inflation_layer:
+          plugin: "nav2_costmap_2d::InflationLayer"
+          cost_scaling_factor: 3.0
+          inflation_radius: 0.55
+
+```
+
+---
+
+### 2. 별도 실행용 Launch 파일 작성 (`custom_costmap.launch.py`)
+
+이 파일은 `nav2_costmap_2d` 노드를 단독으로 실행하며, 토픽 이름을 사용자가 원하는 `_custom` 형태로 변경(Remapping)합니다.
+
+**경로 예시:** `src/my_robot_bringup/launch/custom_costmap.launch.py`
+
+```python
+import os
+
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node, LifecycleNode
+
+def generate_launch_description():
+    # 1. 파라미터 파일 경로 설정 (자신의 패키지 이름으로 수정하세요)
+    # 예: 'my_robot_bringup'
+    my_package_name = 'tb3_multi_robot' 
+    
+    # 기본 파라미터 파일 경로
+    default_params_file = os.path.join(
+        get_package_share_directory(my_package_name),
+        'params',
+        'custom_costmap_params.yaml'
+    )
+
+    # Launch Arguments
+    use_sim_time = LaunchConfiguration('use_sim_time')
+    params_file = LaunchConfiguration('params_file')
+
+    declare_use_sim_time = DeclareLaunchArgument(
+        'use_sim_time',
+        default_value='true',
+        description='Use simulation (Gazebo) clock if true'
+    )
+
+    declare_params_file = DeclareLaunchArgument(
+        'params_file',
+        default_value=default_params_file,
+        description='Full path to the ROS2 parameters file to use'
+    )
+
+    # 2. 커스텀 Costmap 노드 (LifecycleNode)
+    # nav2_costmap_2d 패키지의 실행 파일을 독립적으로 실행합니다.
+    custom_costmap_node = LifecycleNode(
+        package='nav2_costmap_2d',
+        executable='nav2_costmap_2d',
+        name='custom_costmap_node',  # YAML 파일의 최상위 키와 일치해야 함
+        namespace='',                # 필요하다면 네임스페이스 지정 가능
+        output='screen',
+        parameters=[
+            params_file,
+            {'use_sim_time': use_sim_time}
+        ],
+        # [핵심] 사용자가 원하는 이름으로 토픽 Remapping
+        # 원본 토픽 -> 사용자 지정 토픽
+        remappings=[
+            ('/global_costmap/costmap', '/global_costmap/costmap_custom'),
+            ('/global_costmap/costmap_raw', '/global_costmap/costmap_raw_custom'),
+            ('/global_costmap/costmap_updates', '/global_costmap/costmap_updates_custom'),
+            ('/global_costmap/published_footprint', '/global_costmap/published_footprint_custom')
+        ]
+    )
+
+    # 3. Lifecycle Manager
+    # Costmap 노드는 Lifecycle 관리 대상이므로, 이 매니저가 'Active' 상태로 만들어줘야 동작합니다.
+    lifecycle_manager = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_custom_costmap',
+        output='screen',
+        parameters=[
+            {'use_sim_time': use_sim_time},
+            {'autostart': True},  # 자동 시작
+            {'node_names': ['custom_costmap_node']} # 위에서 설정한 노드 이름
+        ]
+    )
+
+    return LaunchDescription([
+        declare_use_sim_time,
+        declare_params_file,
+        custom_costmap_node,
+        lifecycle_manager
+    ])
+
+```
+
+---
+
+### 3. 최종 통합: 메인 Launch 파일에서 불러오기
+
+이제 사용자가 평소에 실행하던 메인 Launch 파일(예: `bringup.launch.py` 또는 `navigation.launch.py`를 감싸는 파일)에서 **기존 Nav2와 위의 커스텀 런치를 동시에 실행**하면 됩니다.
+
+```python
+# (사용자의 메인 launch 파일 예시)
+from launch import LaunchDescription
+from launch.actions import IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
+from ament_index_python.packages import get_package_share_directory
+import os
+
+def generate_launch_description():
+    pkg_nav2_bringup = get_package_share_directory('nav2_bringup')
+    pkg_my_robot = get_package_share_directory('tb3_multi_robot') # 본인 패키지
+
+    use_sim_time = LaunchConfiguration('use_sim_time', default='true')
+
+    # 1. 표준 Nav2 실행 (Planner용 - LiDAR Only)
+    # 여기서는 nav2_params.yaml(LiDAR만 설정된 파일)을 사용한다고 가정
+    nav2_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(pkg_nav2_bringup, 'launch', 'navigation_launch.py')
+        ),
+        launch_arguments={
+            'use_sim_time': use_sim_time,
+            'params_file': os.path.join(pkg_my_robot, 'params', 'nav2_params.yaml')
+        }.items()
+    )
+
+    # 2. 커스텀 Costmap 실행 (장애물 인식용 - LiDAR + Camera)
+    custom_costmap_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(pkg_my_robot, 'launch', 'custom_costmap.launch.py')
+        ),
+        launch_arguments={
+            'use_sim_time': use_sim_time,
+            'params_file': os.path.join(pkg_my_robot, 'params', 'custom_costmap_params.yaml')
+        }.items()
+    )
+
+    return LaunchDescription([
+        nav2_launch,
+        custom_costmap_launch
+    ])
+
+```
+
+---
+
+### 요약 및 결과
+
+1. **기존 Nav2 (`planner_server`)**:
+* `/global_costmap/costmap` 토픽 발행.
+* LiDAR만 사용하여 보수적이고 깔끔한 경로 계획 수행.
+
+
+2. **커스텀 Node (`nav2_costmap_2d` standalone)**:
+* `/global_costmap/costmap_custom` (및 `_raw_custom`) 토픽 발행.
+* LiDAR + Camera를 모두 사용하여 3D 장애물까지 포함.
+
+
+3. **사용자 Obstacle Node**:
+* `/global_costmap/costmap_custom` 토픽을 Subscribe 하여 정밀한 장애물 판단 수행.
+
+
+
+이 코드를 적용하시면 `global_costmap` 노드를 2개 띄우는 것과 토픽 이름을 분리하는 목적을 완벽하게 달성하실 수 있습니다.
