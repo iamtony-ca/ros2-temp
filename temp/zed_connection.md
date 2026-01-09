@@ -2047,3 +2047,95 @@ if __name__ == "__main__":
 3. **카메라 ID 매핑**:
 * ZED X(GMSL)는 하드웨어적으로 ID가 할당되므로, `sl.Camera.get_device_list()`를 호출하면 각 카메라 객체(`dev`)에 `dev.id`와 `dev.serial_number`가 들어있습니다.
 * 이 코드는 `dev.id`가 0인 카메라의 S/N을 `cam_0_sn`에 할당합니다. 즉, 사용자가 의도한 "1, 2, 0, 3 순서" 등의 섞인 상황이라도, **"ID 0번 포트에 꽂힌 카메라의 S/N은 0번 노드 인자로"** 정확하게 매칭됩니다.
+##########################
+##############################
+##################################
+ROS 2 Jazzy 환경과 ZED X 멀티 카메라 설정을 다루고 계시군요. 전문가로서 `launch` 파일 수정을 도와드리겠습니다.
+
+`zed_multi_camera.launch.py`는 **Composable Node** 방식을 사용하고 있습니다. 이 방식에서는 개별 카메라 노드들이 하나의 **Container** 프로세스 안에서 실행됩니다. 따라서 노드가 비정상 종료(Crash)되었을 때 다시 살리려면, 이들을 담고 있는 **Container 자체에 `respawn` 설정**을 해야 합니다.
+
+추가로 `robot_state_publisher`도 별도 노드로 실행되므로, 이 친구도 죽었을 때 되살아나도록 설정하면 시스템이 더 견고해집니다.
+
+수정해야 할 부분은 크게 두 군데입니다.
+
+---
+
+### 수정 방법
+
+`launch_setup` 함수 내부의 `zed_container` 정의 부분과 `multi_rsp_node` 정의 부분에 `respawn=True`와 `respawn_delay` 옵션을 추가합니다.
+
+#### 1. Composable Node Container (메인 컨테이너) 수정
+
+모든 ZED 카메라 노드가 실행되는 컨테이너입니다. 하나라도 치명적인 오류(Segfault 등)가 발생하면 컨테이너 전체가 재시작되어야 모든 카메라가 복구됩니다.
+
+```python
+    # [수정 전]
+    # zed_container = ComposableNodeContainer(
+    #     name=container_name,
+    #     namespace=namespace_val,
+    #     package='rclcpp_components',
+    #     executable=container_exec,
+    #     arguments=['--ros-args', '--log-level', 'info'],
+    #     output='screen',
+    # )
+
+    # [수정 후] respawn=True 추가
+    zed_container = ComposableNodeContainer(
+        name=container_name,
+        namespace=namespace_val,
+        package='rclcpp_components',
+        executable=container_exec,
+        arguments=['--ros-args', '--log-level', 'info'],
+        output='screen',
+        respawn=True,        # 자동 재실행 활성화
+        respawn_delay=2.0,   # (선택) 너무 빠른 재부팅 방지를 위한 2초 딜레이
+    )
+    actions.append(zed_container)
+
+```
+
+#### 2. Robot State Publisher 수정
+
+TF 트리를 관리하는 `robot_state_publisher`도 만약을 대비해 재실행 설정을 합니다.
+
+```python
+    # [수정 전]
+    # multi_rsp_node = Node(
+    #     package='robot_state_publisher',
+    #     namespace=namespace_val,
+    #     executable='robot_state_publisher',
+    #     name=rsp_name,
+    #     output='screen',
+    #     parameters=[{
+    #         'robot_description': Command(xacro_command).perform(context)
+    #     }]
+    # )
+
+    # [수정 후] respawn=True 추가
+    multi_rsp_node = Node(
+        package='robot_state_publisher',
+        namespace=namespace_val,
+        executable='robot_state_publisher',
+        name=rsp_name,
+        output='screen',
+        parameters=[{
+            'robot_description': Command(xacro_command).perform(context)
+        }],
+        respawn=True,        # 자동 재실행 활성화
+        respawn_delay=2.0,   # (선택) 2초 딜레이
+    )
+
+```
+
+---
+
+### 주의사항 (Expert Tip)
+
+1. **컨테이너 기반 재실행:**
+현재 구조는 하나의 `zed_multi_container` 안에 여러 카메라(Node Component)가 로드되는 방식입니다. 만약 **카메라 A**에서 메모리 오류가 발생해 프로세스가 죽으면, 같은 프로세스를 공유하는 **카메라 B**도 함께 꺼지게 됩니다. `respawn=True`를 설정하면 컨테이너가 다시 뜨면서 **모든 카메라가 동시에 재시작**됩니다. 멀티캠 동기화 관점에서는 오히려 이것이 더 안전한 동작 방식입니다.
+2. **개별 재실행 불가:**
+위 코드는 단일 컨테이너 방식이므로, 특정 카메라 하나만 죽었다가 혼자 살아나게 하려면, launch 파일을 수정하여 카메라마다 별도의 `ComposableNodeContainer`를 띄우도록 구조를 변경해야 합니다. (일반적으로는 리소스 절약을 위해 단일 컨테이너를 권장합니다.)
+
+적용 후 `ros2 launch ...`를 실행하고, 강제로 프로세스를 죽여보거나(`kill` 명령어 등) 케이블을 뽑아보며 재실행되는지 테스트해보시길 바랍니다.
+
+도움이 필요하시면 언제든 말씀해주세요!
