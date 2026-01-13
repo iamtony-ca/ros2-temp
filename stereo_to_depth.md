@@ -328,3 +328,193 @@ def generate_launch_description():
 이 방식을 사용하면, 물리적으로는 다른 위치에 있는 두 카메라지만 소프트웨어적으로는 "같은 평면상에 정렬된(Rectified) 이미지"라고 선언해 줌으로써 `stereo_image_proc`의 엄격한 검사를 통과하게 됩니다.
 
 성공하면 RViz2를 켜서 `/camera/depth/points` 토픽을 확인해 보세요! PointCloud가 보일 겁니다.
+#################################  
+#################################  
+#################################  
+제공해주신 코드는 ROS 2 `stereo_image_proc` 패키지의 표준 launch 파일입니다. 이것은 매우 범용적으로 작성되어 있어서, 님의 구체적인 ZED 카메라 토픽 구조(`/zed_multi/...`)에 맞추려면 수정이 꽤 필요합니다.
+
+요청하신 대로 **1) 파라미터 상세 설명**과 **2) ZED 카메라 및 Frame ID Fixer에 맞게 수정한 코드**를 정리해 드립니다.
+
+---
+
+### 1. 주요 파라미터 설명 (Computer Vision 관점)
+
+이 파라미터들은 **"왼쪽 이미지의 어떤 픽셀이 오른쪽 이미지의 어디랑 짝궁인지(Matching)"** 찾는 알고리즘의 성능을 조절합니다.
+
+#### **A. 핵심 알고리즘 설정**
+
+* **`stereo_algorithm`**: (중요) 매칭 방식 결정
+* `0` (Block Matching): 빠르지만 품질이 낮음. 점들이 듬성듬성 생김.
+* `1` (SGM - Semi-Global Matching): 느리지만 훨씬 부드럽고 꽉 찬 PointCloud를 생성함. **(추천)**
+
+
+* **`approximate_sync`**:
+* `True`: 좌/우 이미지의 시간이 미세하게 달라도 짝을 맞춰줌. (네트워크 지연 등이 있을 때 필수)
+* `False`: 시간이 완벽하게 일치해야 함. (ZED 같은 하드웨어 싱크 카메라는 False가 정석이나, 토픽 발행 딜레이가 있다면 True로 켜야 함)
+
+
+
+#### **B. 매칭 품질 & 범위 설정**
+
+* **`disparity_range`**: (가장 중요) 탐색 범위
+* 값이 클수록 **더 가까운 물체**까지 감지할 수 있지만 연산량이 늘어남.
+* 반드시 **16의 배수**여야 함 (예: 32, 64, 128). 보통 64나 128 사용.
+
+
+* **`min_disparity`**:
+* 탐색을 시작할 최소 시차. 보통 `0`으로 둡니다. 이 값을 키우면 먼 거리는 무시하고 가까운 것만 봅니다.
+
+
+* **`correlation_window_size`**: (블록 크기)
+* 비교할 사각형의 크기(픽셀).
+* **값이 작으면(5~9):** 디테일이 살지만 노이즈가 많음.
+* **값이 크면(15~21):** 부드러워지지만 작은 물체가 뭉개짐. **(보통 15 추천)**
+
+
+
+#### **C. 노이즈 필터링 (품질 개선)**
+
+* **`uniqueness_ratio`**:
+* "확실한 짝궁"만 남기는 기준. 값이 클수록 엄격하게 걸러내어 PointCloud에 구멍이 많이 뚫리지만 정확도는 올라감. **(보통 10~15)**
+
+
+* **`texture_threshold`**:
+* 흰 벽처럼 무늬가 없는 곳을 걸러냄. 값을 높이면 벽면 노이즈가 사라짐.
+
+
+* **`speckle_size` / `speckle_range**`:
+* 허공에 둥둥 떠다니는 작은 점(Speckle)들을 지워버리는 필터.
+
+
+
+---
+
+### 2. 수정된 Launch 파일 (복사해서 사용하세요)
+
+이 코드는 님의 **ZED 토픽**과, 앞서 만든 **Fixer 노드(오른쪽 카메라 수정)**를 반영하여 바로 작동하도록 개조했습니다.
+
+**변경점:**
+
+1. 복잡한 Namespace 인자 제거  님의 실제 토픽 이름(`zed_multi/...`)으로 **하드코딩**.
+2. 불필요한 `image_proc`(색보정/Rectify) 과정 비활성화 (ZED가 이미 해주므로 CPU 낭비임).
+3. 파라미터를 SGM(고품질) 모드로 기본 설정.
+
+`run_zed_stereo_proc.launch.py` 이름으로 저장하세요.
+
+```python
+import os
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import ComposableNodeContainer
+from launch_ros.descriptions import ComposableNode
+
+def generate_launch_description():
+    # === [설정 1] 토픽 이름 정의 (사용자 환경) ===
+    # 왼쪽: ZED 원본 데이터 사용
+    left_image_topic = '/zed_multi/zed_right/left/color/rect/image'
+    left_info_topic  = '/zed_multi/zed_right/left/color/rect/camera_info'
+    
+    # 오른쪽: 우리가 만든 "Fixer 노드"가 뱉어내는 데이터 사용 (frame_id 수정본)
+    right_image_topic = '/fixed/right/image'
+    right_info_topic  = '/fixed/right/camera_info'
+
+    # 결과물: Nav2가 구독할 토픽 이름
+    output_cloud_topic = '/camera/depth/points'
+
+
+    return LaunchDescription([
+        # 파라미터 선언 (터미널에서 변경 가능)
+        DeclareLaunchArgument('approximate_sync', default_value='True', description='Use approximate sync'),
+        DeclareLaunchArgument('stereo_algorithm', default_value='1', description='0=BlockMatching, 1=SGBM(Better)'),
+        DeclareLaunchArgument('disparity_range', default_value='128', description='Search range (16 multiple)'),
+
+        # Stereo Image Proc 컨테이너 실행
+        ComposableNodeContainer(
+            name='stereo_proc_container',
+            namespace='',
+            package='rclcpp_components',
+            executable='component_container',
+            output='screen',
+            composable_node_descriptions=[
+                
+                # 1. Disparity Node (시차 계산)
+                ComposableNode(
+                    package='stereo_image_proc',
+                    plugin='stereo_image_proc::DisparityNode',
+                    name='disparity_node',
+                    parameters=[{
+                        'approximate_sync': LaunchConfiguration('approximate_sync'),
+                        'stereo_algorithm': LaunchConfiguration('stereo_algorithm'),
+                        'disparity_range': LaunchConfiguration('disparity_range'),
+                        'correlation_window_size': 15,
+                        'uniqueness_ratio': 10.0,
+                        'texture_threshold': 10,
+                        'speckle_size': 100,
+                        'speckle_range': 4,
+                        'min_disparity': 0,
+                    }],
+                    remappings=[
+                        # [입력]
+                        ('left/image_rect', left_image_topic),
+                        ('left/camera_info', left_info_topic),
+                        ('right/image_rect', right_image_topic),
+                        ('right/camera_info', right_info_topic)
+                        # [출력] -> /disparity (기본값 유지)
+                    ]
+                ),
+
+                # 2. PointCloud Node (3D 변환)
+                ComposableNode(
+                    package='stereo_image_proc',
+                    plugin='stereo_image_proc::PointCloudNode',
+                    name='point_cloud_node',
+                    parameters=[{
+                        'approximate_sync': LaunchConfiguration('approximate_sync'),
+                        'use_color': True, # 컬러 입히기
+                        'avoid_point_cloud_padding': False,
+                    }],
+                    remappings=[
+                        # [입력]
+                        ('left/image_rect_color', left_image_topic), # 컬러 입힐 때 사용
+                        ('left/camera_info', left_info_topic),
+                        ('right/camera_info', right_info_topic),
+                        ('disparity', '/disparity'), # 위 노드가 만든 토픽 받기
+                        
+                        # [출력] -> Nav2가 쓸 토픽
+                        ('points2', output_cloud_topic)
+                    ]
+                )
+            ]
+        )
+    ])
+
+```
+
+### 3. 실행 방법 (Step-by-Step)
+
+1. **ZED 카메라 실행:** (기존 방식대로)
+2. **Fixer 노드 실행:** (아까 만든 파이썬 파일)
+```bash
+python3 fix_frame_id.py
+
+```
+
+
+3. **이 Launch 파일 실행:**
+```bash
+ros2 launch <패키지명> run_zed_stereo_proc.launch.py
+
+```
+
+
+
+### 전문가 팁: 튜닝 가이드
+
+* 실행 후 **Nav2 Costmap에 장애물이 잘 안 뜬다면?**
+* `min_disparity`나 `disparity_range` 문제일 수 있습니다.
+* 특히 **가까운 물체가 안 보이면** `min_disparity`는 0으로 두시고, 카메라 초점 거리상 너무 가까운 건(20cm 이내) 물리적으로 안 보일 수 있음을 감안해야 합니다.
+
+
+* **Costmap에 점들이 너무 지저분하다면?**
+* launch 파일에서 `speckle_size`를 `100`  `500` 정도로 올려보세요. 허공의 노이즈가 확 줄어듭니다.
