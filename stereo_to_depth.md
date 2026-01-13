@@ -169,3 +169,162 @@ local_costmap:
 
 **다음 단계로 무엇을 도와드릴까요?**
 `stereo_image_proc`을 테스트할 수 있는 간단한 docker-compose 예시를 만들어 드릴까요, 아니면 Isaac ROS/nvblox를 활용한 심화 설정에 대해 더 설명해 드릴까요?
+#########################  
+##############################  
+#################################  
+네, **학습과 연습**이 목적이시라면 그 의도에 맞춰서 정확히 해결해 드려야죠! ZED X의 훌륭한 하드웨어를 두고 왜 소프트웨어(stereo_image_proc)로 고생하시나 했지만, **ROS 2의 내부 파이프라인을 이해하는 데에는 이만한 연습이 없습니다.**
+
+말씀하신 `Assertion failed` 에러는 **"왼쪽 눈과 오른쪽 눈의 데이터가 같은 좌표계 이름(Frame ID)을 달고 있어야 하는데, 서로 다르다"**는 이유로 발생합니다.
+
+`stereo_image_proc`을 속여서 작동시키기 위해, **오른쪽 카메라 데이터의 포장지(Header frame_id)만 왼쪽 것과 똑같이 바꿔치기하는 "중계 노드(Shim Node)"**를 하나 만들어서 해결하겠습니다.
+
+---
+
+### 1단계: 왼쪽 카메라의 정확한 Frame ID 확인
+
+먼저, 우리가 "정답"으로 삼을 왼쪽 카메라의 `frame_id`를 알아내야 합니다. 터미널에 다음을 입력하세요.
+
+```bash
+ros2 topic echo /zed_multi/zed_right/left/color/rect/camera_info --field header.frame_id --once
+
+```
+
+출력 결과가 예를 들어 `zed_right_left_camera_optical_frame`라고 나왔다고 가정하겠습니다. (이 값을 아래 코드에 넣어야 합니다.)
+
+---
+
+### 2단계: Frame ID 해결사 노드 만들기 (Python)
+
+이 파이썬 스크립트는 오른쪽 카메라의 이미지와 정보를 받아서, `frame_id`만 왼쪽 것과 똑같이 바꾼 뒤 다시 발행(Publish)합니다.
+
+`fix_frame_id.py`라는 이름으로 파일을 만들고 아래 내용을 붙여넣으세요.
+(**주의:** `TARGET_FRAME_ID` 변수에는 1단계에서 확인한 값을 넣으세요!)
+
+```python
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image, CameraInfo
+
+class FrameIdFixer(Node):
+    def __init__(self):
+        super().__init__('frame_id_fixer')
+
+        # === [설정] 여기에 1단계에서 확인한 왼쪽 카메라의 Frame ID를 넣으세요 ===
+        self.TARGET_FRAME_ID = 'zed_right_left_camera_optical_frame' 
+        # ===============================================================
+
+        # 구독 (원래 오른쪽 데이터)
+        self.sub_info = self.create_subscription(
+            CameraInfo, 
+            '/zed_multi/zed_right/right/color/rect/camera_info', 
+            self.info_callback, 10)
+        self.sub_img = self.create_subscription(
+            Image, 
+            '/zed_multi/zed_right/right/color/rect/image', 
+            self.img_callback, 10)
+
+        # 발행 (수정된 오른쪽 데이터)
+        self.pub_info = self.create_publisher(CameraInfo, '/fixed/right/camera_info', 10)
+        self.pub_img = self.create_publisher(Image, '/fixed/right/image', 10)
+
+        self.get_logger().info('Frame ID Fixer Node Started...')
+
+    def info_callback(self, msg):
+        msg.header.frame_id = self.TARGET_FRAME_ID # Frame ID 강제 변경
+        self.pub_info.publish(msg)
+
+    def img_callback(self, msg):
+        msg.header.frame_id = self.TARGET_FRAME_ID # Frame ID 강제 변경
+        self.pub_img.publish(msg)
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = FrameIdFixer()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+```
+
+---
+
+### 3단계: Launch 파일 수정
+
+이제 `stereo_image_proc`이 원본 오른쪽 데이터 대신, 우리가 만든 **`/fixed/...`** 토픽을 듣도록 `remappings`를 수정합니다.
+
+```python
+from launch import LaunchDescription
+from launch_ros.actions import ComposableNodeContainer, Node
+from launch_ros.descriptions import ComposableNode
+
+def generate_launch_description():
+    return LaunchDescription([
+        # 1. 우리가 만든 Frame ID 고치는 노드 실행 (Python 스크립트 실행)
+        Node(
+            package='YOUR_PACKAGE_NAME', # 파이썬 스크립트가 있는 패키지명 (없으면 단순히 python3 실행으로 대체 가능)
+            executable='fix_frame_id',   # setup.py에 등록된 entry point
+            name='frame_fixer',
+            output='screen'
+        ),
+
+        # 2. Stereo Image Proc 실행
+        ComposableNodeContainer(
+            name='stereo_container',
+            namespace='',
+            package='rclcpp_components',
+            executable='component_container',
+            composable_node_descriptions=[
+                ComposableNode(
+                    package='stereo_image_proc',
+                    plugin='stereo_image_proc::DisparityNode',
+                    name='disparity_node',
+                    remappings=[
+                        # 왼쪽은 원래 데이터 그대로 사용
+                        ('left/image_rect', '/zed_multi/zed_right/left/color/rect/image'),
+                        ('left/camera_info', '/zed_multi/zed_right/left/color/rect/camera_info'),
+                        
+                        # [중요] 오른쪽은 우리가 수정한 '/fixed' 토픽을 사용
+                        ('right/image_rect', '/fixed/right/image'),
+                        ('right/camera_info', '/fixed/right/camera_info')
+                    ]
+                ),
+                ComposableNode(
+                    package='stereo_image_proc',
+                    plugin='stereo_image_proc::PointCloudNode',
+                    name='point_cloud_node',
+                    remappings=[
+                        # PointCloudNode도 동일하게 매핑
+                        ('left/camera_info', '/zed_multi/zed_right/left/color/rect/camera_info'),
+                        ('right/camera_info', '/fixed/right/camera_info'),
+                        ('left/image_rect_color', '/zed_multi/zed_right/left/color/rect/image'),
+                        ('disparity', '/disparity'),
+                        ('points2', '/camera/depth/points')
+                    ]
+                )
+            ],
+            output='screen',
+        )
+    ])
+
+```
+
+---
+
+### 실행 순서
+
+1. **ZED Driver 실행:** 카메라 데이터를 뿜어냅니다.
+2. **Fixer 노드 실행:** `python3 fix_frame_id.py` (또는 ros2 run)
+* 이제 `/fixed/right/image` 같은 토픽이 나오는지 확인하세요.
+
+
+3. **Launch 파일 실행:** 이제 `stereo_image_proc`이 에러 없이 돌아갈 것입니다.
+
+이 방식을 사용하면, 물리적으로는 다른 위치에 있는 두 카메라지만 소프트웨어적으로는 "같은 평면상에 정렬된(Rectified) 이미지"라고 선언해 줌으로써 `stereo_image_proc`의 엄격한 검사를 통과하게 됩니다.
+
+성공하면 RViz2를 켜서 `/camera/depth/points` 토픽을 확인해 보세요! PointCloud가 보일 겁니다.
