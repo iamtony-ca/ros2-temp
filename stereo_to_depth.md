@@ -518,3 +518,189 @@ ros2 launch <패키지명> run_zed_stereo_proc.launch.py
 
 * **Costmap에 점들이 너무 지저분하다면?**
 * launch 파일에서 `speckle_size`를 `100`  `500` 정도로 올려보세요. 허공의 노이즈가 확 줄어듭니다.
+############################
+##############################
+################################
+**아주 훌륭한 선택입니다.**
+
+`stereo_image_proc` 자체에는 "Decimation(다운샘플링)"이라는 정수형 파라미터가 직접적으로 존재하지 않습니다. 대신 ROS 2의 표준 방식인 **`image_proc::CropDecimateNode`**를 영상 처리 **앞단**에 붙여서 해결합니다.
+
+이 방법은 단순히 점의 개수만 줄이는 것이 아니라, **SGBM(매칭 연산)을 수행할 픽셀 수 자체를 줄여주므로**, CPU 부하가 획기적으로 줄어들고 딜레이가 사라집니다.
+
+---
+
+### 1. 변경된 데이터 파이프라인
+
+이미지를 먼저 줄이고(Resize), 그 작은 이미지를 가지고 Depth를 계산하는 방식입니다.
+
+1. **입력 (High Res):** ZED(Left) / Fixer(Right)  예를 들어 1280x720
+2. **Decimator:** 1/2 또는 1/4로 축소  640x360 (데이터량 1/4배)
+3. **Stereo Proc:** 작은 이미지로 연산 수행  **초고속 연산**
+4. **결과:** 가볍고 빠른 PointCloud  `pointcloud_to_laserscan` 딜레이 해소
+
+---
+
+### 2. 수정된 Launch 파일 코드
+
+아래 코드는 **Decimator Node 2개(좌/우)**를 추가하고, 파이프라인을 연결한 최종 버전입니다.
+
+**주요 변경점:**
+
+* `decimation_factor` 변수 추가: `2`로 설정하면 가로/세로가 절반이 되어 **데이터는 1/4**로 줄어듭니다. `4`로 설정하면 **데이터는 1/16**로 줄어듭니다.
+
+```python
+import os
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import ComposableNodeContainer
+from launch_ros.descriptions import ComposableNode
+
+def generate_launch_description():
+    # === [설정] 토픽 이름 정의 ===
+    # 1. 원본 소스 (ZED & Fixer)
+    raw_left_image  = '/zed_multi/zed_right/left/color/rect/image'
+    raw_left_info   = '/zed_multi/zed_right/left/color/rect/camera_info'
+    raw_right_image = '/fixed/right/image'       # Fixer 노드 출력
+    raw_right_info  = '/fixed/right/camera_info' # Fixer 노드 출력
+
+    # 2. 다운샘플링된 내부 토픽 (중간 단계)
+    down_left_image  = '/down/left/image_rect'
+    down_left_info   = '/down/left/camera_info'
+    down_right_image = '/down/right/image_rect'
+    down_right_info  = '/down/right/camera_info'
+
+    # 3. 최종 출력
+    output_cloud_topic = '/camera/depth/points'
+
+    return LaunchDescription([
+        # === [Argument] 다운샘플링 배율 설정 ===
+        # 2 -> 해상도 1/2 (데이터 1/4), 4 -> 해상도 1/4 (데이터 1/16)
+        DeclareLaunchArgument('decimation_factor', default_value='2', description='Decimation factor (2 or 4)'),
+        
+        DeclareLaunchArgument('approximate_sync', default_value='True'),
+        DeclareLaunchArgument('stereo_algorithm', default_value='1'), # SGBM
+        DeclareLaunchArgument('disparity_range', default_value='128'), 
+
+        ComposableNodeContainer(
+            name='stereo_proc_container',
+            namespace='',
+            package='rclcpp_components',
+            executable='component_container',
+            output='screen',
+            composable_node_descriptions=[
+                
+                # =========================================
+                # [Step 1] 왼쪽 이미지 줄이기 (Decimator)
+                # =========================================
+                ComposableNode(
+                    package='image_proc',
+                    plugin='image_proc::CropDecimateNode',
+                    name='decimator_left',
+                    parameters=[{
+                        'decimation_x': LaunchConfiguration('decimation_factor'),
+                        'decimation_y': LaunchConfiguration('decimation_factor'),
+                        'width': 0,  # 0이면 전체 크기에서 decimation 수행
+                        'height': 0,
+                    }],
+                    remappings=[
+                        ('in/image_raw', raw_left_image),
+                        ('in/camera_info', raw_left_info),
+                        ('out/image_raw', down_left_image),     # 줄어든 이미지 나감
+                        ('out/camera_info', down_left_info)     # 줄어든 Info 나감 (자동 보정됨)
+                    ]
+                ),
+
+                # =========================================
+                # [Step 2] 오른쪽 이미지 줄이기 (Decimator)
+                # =========================================
+                ComposableNode(
+                    package='image_proc',
+                    plugin='image_proc::CropDecimateNode',
+                    name='decimator_right',
+                    parameters=[{
+                        'decimation_x': LaunchConfiguration('decimation_factor'),
+                        'decimation_y': LaunchConfiguration('decimation_factor'),
+                        'width': 0,
+                        'height': 0,
+                    }],
+                    remappings=[
+                        ('in/image_raw', raw_right_image),
+                        ('in/camera_info', raw_right_info),
+                        ('out/image_raw', down_right_image),
+                        ('out/camera_info', down_right_info)
+                    ]
+                ),
+
+                # =========================================
+                # [Step 3] Stereo Proc (줄어든 이미지로 수행)
+                # =========================================
+                ComposableNode(
+                    package='stereo_image_proc',
+                    plugin='stereo_image_proc::DisparityNode',
+                    name='disparity_node',
+                    parameters=[{
+                        'approximate_sync': LaunchConfiguration('approximate_sync'),
+                        'stereo_algorithm': LaunchConfiguration('stereo_algorithm'),
+                        'disparity_range': LaunchConfiguration('disparity_range'),
+                        'correlation_window_size': 15,
+                        'uniqueness_ratio': 15.0,
+                        'speckle_size': 500,  # 노이즈 제거
+                        'speckle_range': 4,
+                        'min_disparity': 1,
+                    }],
+                    remappings=[
+                        # 입력으로 다운샘플링된 토픽을 받습니다.
+                        ('left/image_rect', down_left_image),
+                        ('left/camera_info', down_left_info),
+                        ('right/image_rect', down_right_image),
+                        ('right/camera_info', down_right_info)
+                    ]
+                ),
+
+                # [Step 4] PointCloud 생성
+                ComposableNode(
+                    package='stereo_image_proc',
+                    plugin='stereo_image_proc::PointCloudNode',
+                    name='point_cloud_node',
+                    parameters=[{
+                        'approximate_sync': LaunchConfiguration('approximate_sync'),
+                        'use_color': True,
+                    }],
+                    remappings=[
+                        ('left/image_rect_color', down_left_image),
+                        ('left/camera_info', down_left_info),
+                        ('right/camera_info', down_right_info),
+                        ('disparity', '/disparity'),
+                        ('points2', output_cloud_topic)
+                    ]
+                )
+            ]
+        )
+    ])
+
+```
+
+---
+
+### 3. 적용 및 기대 효과
+
+1. **실행:** 위 코드로 launch 파일을 교체하고 실행하세요.
+* 기본값인 `decimation_factor=2`가 적용됩니다.
+* 더 가볍게 하고 싶으면: `ros2 launch ... decimation_factor:=4`
+
+
+2. **`image_proc` 패키지 설치 확인:**
+* 만약 실행 시 `CropDecimateNode`를 못 찾는다는 에러가 뜨면 설치가 필요합니다.
+* `sudo apt install ros-jazzy-image-proc`
+
+
+3. **기대 효과:**
+* **입력 해상도:** 1280x720  640x360 (Factor 2)
+* **PointCloud 개수:** 약 92만 개  약 23만 개 (75% 감소)
+* **ROS 2 Delay:** 1.0s  **0.2s 이하**로 급격히 감소 예상.
+* **장애물 인식:** 해상도가 줄어도 벽, 사람, 기둥 같은 장애물 인식에는 전~혀 지장이 없습니다.
+
+
+
+이제 `ros2 topic hz /camera/depth/points`로 속도가 얼마나 빨라졌는지, 그리고 `pointcloud_to_laserscan`의 딜레이가 줄었는지 확인해 보세요!
