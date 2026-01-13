@@ -184,3 +184,119 @@ if __name__ == "__main__":
 
 * **ODA File Converter 경로:** 코드 내의 `oda_path`를 실제 설치된 경로로 변경해야 합니다.
 * **좌표계:** 도면이 원점(0,0)에서 아주 멀리 떨어져 그려진 경우(예: 건축 도면이 GIS 좌표계 사용), 이미지 사이즈가 비정상적으로 커질 수 있습니다. 이 경우 `msp.get_bounding_box()` 전에 좌표를 원점으로 이동시키는 전처리가 필요할 수 있습니다.
+########################
+##########################
+#############################
+JPG to PGM 변환은 DWG 변환보다 훨씬 간단하며, Python의 대표적인 이미지 라이브러리인 **Pillow (PIL)**만 있으면 완벽하게 처리할 수 있습니다.
+
+단, **Robotics Developer** 관점에서 주의할 점이 하나 있습니다.
+JPG는 **손실 압축(Lossy Compression)** 포맷이라 가장자리에 **노이즈(Artifact)**가 끼어 있을 확률이 높습니다. 이를 그대로 PGM(Grayscale)으로 바꾸면, Nav2 Costmap에서 "벽도 아니고 빈 공간도 아닌" 애매한 장애물로 인식될 수 있습니다.
+
+따라서 단순 변환 코드와 **노이즈를 제거하는 이진화(Thresholding) 변환 코드** 두 가지 버전을 준비했습니다.
+
+---
+
+### 1단계: 라이브러리 설치
+
+```bash
+pip install pillow numpy
+
+```
+
+### 2단계: Python 변환 코드
+
+이 코드는 단순 변환뿐만 아니라, 로봇 맵으로 쓸 때 필수적인 **"깔끔한 흑백 처리(Binarization)"** 옵션을 포함합니다.
+
+```python
+import os
+from PIL import Image
+import numpy as np
+
+def jpg_to_pgm(input_path: str, output_path: str, binary_threshold: int = None):
+    """
+    JPG 이미지를 PGM 파일로 변환합니다.
+    
+    :param input_path: 원본 JPG 경로
+    :param output_path: 저장할 PGM 경로
+    :param binary_threshold: (선택) 0~255 사이 값. 
+                             이 값을 기준으로 흑/백을 명확히 나눕니다. (노이즈 제거용)
+                             None이면 단순 Grayscale 변환만 수행합니다.
+    """
+    try:
+        # 1. 이미지 열기
+        with Image.open(input_path) as img:
+            print(f"Original Image Mode: {img.mode}, Size: {img.size}")
+            
+            # 2. Grayscale(L) 변환
+            # RGB 채널을 휘도(Luminance) 기준으로 회색조로 합칩니다.
+            gray_img = img.convert("L")
+            
+            # 3. (옵션) 이진화 처리 (Thresholding) -> 로봇 맵 추천
+            # JPG 노이즈를 없애고 벽(검은색)과 빈 공간(흰색)을 뚜렷하게 만듭니다.
+            if binary_threshold is not None:
+                # numpy 배열로 변환하여 고속 연산
+                np_img = np.array(gray_img)
+                
+                # threshold보다 밝으면 255(흰색), 어두우면 0(검은색)
+                # Nav2 map_server 기준: 255=Free, 0=Occupied
+                binary_img = np.where(np_img > binary_threshold, 255, 0).astype(np.uint8)
+                
+                # 다시 이미지 객체로 변환
+                final_img = Image.fromarray(binary_img)
+                print(f"Applied Binary Threshold: {binary_threshold}")
+            else:
+                final_img = gray_img
+                print("Applied Simple Grayscale Conversion")
+
+            # 4. PGM 저장
+            # PGM은 보통 바이너리 포맷(P5)이 표준이며 용량이 작습니다.
+            final_img.save(output_path)
+            print(f"Successfully saved to {output_path}")
+
+    except FileNotFoundError:
+        print(f"Error: The file '{input_path}' was not found.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+# --- 실행 예시 ---
+if __name__ == "__main__":
+    input_jpg = "map_image.jpg"
+    output_pgm = "map_image.pgm"
+    
+    # [옵션 A] 원본 그대로 변환 (사진 등)
+    # jpg_to_pgm(input_jpg, output_pgm)
+    
+    # [옵션 B] 로봇 맵용 깔끔한 변환 (추천)
+    # 200~230 정도의 값을 주면 회색 노이즈가 흰색(Free)으로 날아갑니다.
+    # 벽이 흐릿하다면 값을 낮추세요 (예: 128).
+    jpg_to_pgm(input_jpg, output_pgm, binary_threshold=200)
+
+```
+
+### 전문가 팁 (ROS 2 Nav2 Map Server 관련)
+
+1. **왜 Thresholding이 필요한가?**
+* JPG는 압축 과정에서 벽 주변에 흐릿한 회색 픽셀(Blur)을 만듭니다.
+* 이를 그대로 PGM으로 바꾸면, ROS 2 Costmap은 이 회색 영역을 **Lethal Obstacle(확실한 벽)**이 아닌 **Inflation Layer(부풀리기 영역)** 등으로 애매하게 해석할 수 있습니다.
+* `binary_threshold=200` 정도로 설정하면, 약간의 회색 노이즈는 모두 255(이동 가능 구역)로 처리되어 맵이 훨씬 깔끔해집니다.
+
+
+2. **Scale(척도) 문제:**
+* 이미지 변환(`JPG -> PGM`)은 픽셀 대 픽셀(1:1) 변환이므로 이미지 자체의 품질 손실은 없습니다.
+* 하지만 **물리적 스케일(미터 단위)**은 이미지 파일에 저장되지 않습니다.
+* 변환 후 반드시 `map_name.yaml` 파일을 작성하여 `resolution` (meters/pixel)을 명시해야 합니다.
+
+
+```yaml
+image: map_image.pgm
+resolution: 0.05  # 예: 1픽셀 = 5cm
+origin: [-10.0, -10.0, 0.0] # 맵의 원점 좌표 (Rviz 상 위치)
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
+
+```
+
+
+
+이 코드를 사용하시면 화질 저하 없이, 오히려 로봇이 이해하기 더 좋은 형태로 변환이 가능합니다.
