@@ -300,3 +300,135 @@ free_thresh: 0.196
 
 
 이 코드를 사용하시면 화질 저하 없이, 오히려 로봇이 이해하기 더 좋은 형태로 변환이 가능합니다.
+##########################  
+###########################  
+#############################  
+네, **정확합니다.** 로봇 개발자가 가장 많이 사용하는 방식 중 하나입니다.
+
+이미지를 "있는 그대로" 쓰는 게 아니라, **"내가 정한 규칙(Resolution 0.05)"에 이미지를 맞추는(Resizing)** 역공학 방식입니다.
+
+이 방식의 핵심 로직은 다음과 같습니다:
+
+1. **목표:** `map.yaml`의 resolution을 **0.05**로 고정하고 싶다.
+2. **현실:** 실제 건물의 가로 길이(m)를 알고 있다.
+3. **해결:** `실제 길이 / 0.05 = 필요한 픽셀 수` 공식을 이용해 이미지를 리사이징(Resizing)한다.
+
+이 과정을 수행하는 Python 코드를 작성해 드립니다.
+
+---
+
+### Python 코드: Real World Scale에 맞춰 리사이징 후 PGM 변환
+
+이 코드는 **"실제 가로 길이(m)"**만 입력하면, 비율(Aspect Ratio)을 유지하면서 `Resolution: 0.05`에 딱 맞는 크기로 이미지를 변경해줍니다.
+
+```python
+import os
+from PIL import Image, ImageOps
+import numpy as np
+
+def resize_and_convert_to_pgm(
+    input_path: str, 
+    output_path: str, 
+    real_width_m: float, 
+    target_resolution: float = 0.05,
+    binary_threshold: int = 200
+):
+    """
+    실제 크기(m)와 목표 해상도(resolution)에 맞춰 이미지를 리사이징한 후 PGM으로 저장합니다.
+    
+    :param input_path: 원본 JPG 파일 경로
+    :param output_path: 저장할 PGM 파일 경로
+    :param real_width_m: 실제 환경의 가로 길이 (미터 단위)
+    :param target_resolution: 목표로 하는 맵 해상도 (기본 0.05 m/px)
+    :param binary_threshold: 이진화 임계값 (0~255, None이면 안함)
+    """
+    
+    if not os.path.exists(input_path):
+        print(f"Error: File not found at {input_path}")
+        return
+
+    with Image.open(input_path) as img:
+        print(f"--- Original Info ---")
+        print(f"Size: {img.size} (Width x Height)")
+        
+        # 1. 목표 픽셀 너비 계산
+        # 공식: 실제길이(m) / 해상도(m/px) = 픽셀(px)
+        target_width_px = int(real_width_m / target_resolution)
+        
+        # 2. 비율 유지하며 높이 계산 (찌그러짐 방지)
+        aspect_ratio = img.height / img.width
+        target_height_px = int(target_width_px * aspect_ratio)
+        
+        print(f"\n--- Resizing Info ---")
+        print(f"Real Width: {real_width_m} m")
+        print(f"Target Resolution: {target_resolution} m/px")
+        print(f"Calculated Target Size: {target_width_px} x {target_height_px} px")
+        
+        # 3. 고품질 리사이징 (LANCZOS 필터 사용)
+        # 도면 리사이징 시 선이 깨지는 것을 최소화하기 위해 가장 높은 품질의 필터 사용
+        resized_img = img.resize((target_width_px, target_height_px), resample=Image.Resampling.LANCZOS)
+        
+        # 4. Grayscale 변환
+        gray_img = resized_img.convert("L")
+        
+        # 5. 이진화 (Thresholding) - Nav2용 깔끔한 처리
+        if binary_threshold is not None:
+            np_img = np.array(gray_img)
+            # Threshold보다 밝으면 Free(255), 어두우면 Occupied(0)
+            binary_img = np.where(np_img > binary_threshold, 255, 0).astype(np.uint8)
+            final_img = Image.fromarray(binary_img)
+        else:
+            final_img = gray_img
+        
+        # 6. PGM 저장
+        final_img.save(output_path)
+        print(f"\nSuccess! Saved to: {output_path}")
+        
+        # 결과 검증 출력
+        print(f"Verification: {target_width_px} px * {target_resolution} = {target_width_px * target_resolution:.2f} m (Matches Real Width)")
+
+# --- 사용 예시 ---
+if __name__ == "__main__":
+    # 입력 파일
+    input_jpg = "map_image.jpg"
+    output_pgm = "scaled_map.pgm"
+    
+    # [중요] 사용자가 알고 있는 실제 가로 길이 (미터)
+    # 예: 도면의 가로 끝에서 끝이 50미터라면 50.0 입력
+    KNOWN_REAL_WIDTH_METERS = 50.0 
+    
+    # 실행
+    resize_and_convert_to_pgm(
+        input_jpg, 
+        output_pgm, 
+        real_width_m=KNOWN_REAL_WIDTH_METERS, 
+        target_resolution=0.05,  # Nav2 표준
+        binary_threshold=200     # 노이즈 제거
+    )
+
+```
+
+### 이 방식의 장점
+
+1. **Nav2 설정 불변:** `map_server` 설정 파일(yaml)을 매번 수정할 필요 없이, 항상 `resolution: 0.05`로 고정해두고 이미지 파일만 교체하면 됩니다.
+2. **직관적 검증:** RViz에서 맵을 띄운 뒤 `2D Pose Estimate` 등을 찍어볼 때, 그리드 한 칸이 정확히 5cm(또는 1m 그리드 설정 시 1m)와 맞아떨어집니다.
+3. **왜곡 방지:** 위 코드는 `가로` 길이를 기준으로 `세로` 길이를 비율에 맞춰 자동 계산합니다.
+* *주의:* 만약 가로 50m, 세로 20m라고 강제로 픽셀을 지정해버리면, 원본 비율과 다를 경우 맵이 찌그러져서 로봇이 회전할 때 장애물 위치가 틀어집니다. 위 코드는 **가로 기준 비율 유지(Aspect Ratio Preserved)** 방식이라 안전합니다.
+
+
+
+### 실행 후 할 일
+
+생성된 `scaled_map.pgm` 파일과 함께 `map.yaml`을 아래와 같이 작성해서 실행하시면 됩니다.
+
+```yaml
+image: scaled_map.pgm
+resolution: 0.05
+origin: [0.0, 0.0, 0.0] # 필요에 따라 원점 조정
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
+
+```
+
+이제 실제 사이즈를 아신다면, 위 코드의 `KNOWN_REAL_WIDTH_METERS` 값만 바꿔서 돌리시면 완벽한 맵이 생성됩니다.
