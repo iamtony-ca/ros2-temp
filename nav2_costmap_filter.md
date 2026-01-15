@@ -489,3 +489,144 @@ def generate_launch_description():
 4. **실행 순서:** `bringup_cmd_group` 리스트 안에서 `Localization` 실행 후, `Navigation` 실행 전에 필터를 실행하는 것이 논리적으로 가장 깔끔합니다.
 
 이제 이 `bringup_launch.py`를 실행할 때 `filter_mask_file` 경로에 아까 만든 **회색 중앙선 마스크 yaml**을 지정해주면 모든 시스템이 연동됩니다.
+#####################  
+#########################  
+##########################  
+네, **충분히 하나로 통합할 수 있습니다!** 👍
+
+원래 데모 코드에서는 관리를 편하게 하려고 파일을 분리해 둔 것이지만, ROS 2의 파라미터 파일 구조상 **노드 이름(Node Name)**만 다르다면 하나의 YAML 파일(`nav2_params.yaml`)에 모두 몰아넣어도 아무런 문제가 없습니다.
+
+오히려 **파일 하나로 모든 설정을 관리**하고 싶다면 통합하는 것이 훨씬 깔끔할 수 있습니다.
+
+통합하는 방법과 그에 따른 Launch 파일 수정 사항을 알려드리겠습니다.
+
+---
+
+### 1. `nav2_params.yaml`에 내용 합치기
+
+기존 `nav2_params.yaml` 파일을 열어보시면 `amcl:`, `bt_navigator:`, `controller_server:` 처럼 각 노드의 이름이 최상위 키(Key)로 되어 있을 겁니다.
+
+여기에 **필터 관련 서버 2개의 설정**을 그대로 복사해서 붙여넣으시면 됩니다. (들여쓰기 주의: 최상위 레벨에 위치해야 함)
+
+**[통합된 nav2_params.yaml 예시]**
+
+```yaml
+amcl:
+  ros__parameters:
+    # ... (기존 설정) ...
+
+bt_navigator:
+  ros__parameters:
+    # ... (기존 설정) ...
+
+# ... (기존 nav2 노드들 설정) ...
+
+# =========================================================
+# [추가] Costmap Filter 관련 설정 (여기에 붙여넣기)
+# =========================================================
+
+costmap_filter_info_server:
+  ros__parameters:
+    use_sim_time: true
+    type: 0                       # Keepout Filter (Weighted 모드 활용)
+    filter_info_topic: "/costmap_filter_info"
+    mask_topic: "/median_filter_mask" 
+    base: 0.0
+    multiplier: 1.0
+
+filter_mask_server:
+  ros__parameters:
+    use_sim_time: true
+    frame_id: "map"
+    topic_name: "/median_filter_mask"
+    yaml_filename: "median_mask.yaml"  # 경로는 launch에서 관리하거나 절대경로 추천
+
+```
+
+---
+
+### 2. `bringup_launch.py` 수정 (중요!)
+
+파라미터 파일이 하나로 합쳐졌으니, Launch 파일에서 **"필터용 파라미터 파일 경로"**를 따로 받을 필요가 없어졌습니다. 그냥 **메인 `params_file`을 필터 실행 시에도 똑같이 넘겨주면 됩니다.**
+
+아까 작성해 드린 `bringup_launch.py` 수정본에서 아래 부분만 살짝 바꾸면 됩니다.
+
+**[수정 전]**
+
+```python
+    declare_filter_params_file_cmd = DeclareLaunchArgument(
+        'filter_params_file',
+        default_value=os.path.join(bringup_dir, 'params', 'keepout_params.yaml'), # 별도 파일
+        description='Full path to the Costmap Filter params file'
+    )
+    
+    # ... (생략) ...
+
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource( ... ),
+                launch_arguments={
+                    # ...
+                    'params_file': filter_params_file, # 별도 변수 사용
+                    # ...
+                }.items(),
+            ),
+
+```
+
+**[수정 후: 통합된 파일 사용]**
+
+```python
+    # 1. declare_filter_params_file_cmd 삭제 가능 (필요 없음)
+
+    # ... (생략) ...
+
+            # [추가] Costmap Filters 실행
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(filters_launch_dir, 'costmap_filter_info.launch.py')
+                ),
+                condition=IfCondition(use_filters),
+                launch_arguments={
+                    'namespace': namespace,
+                    'use_sim_time': use_sim_time,
+                    'autostart': autostart,
+                    
+                    # [핵심 변경] 필터 전용 파일 대신, 메인 params_file을 그대로 전달
+                    'params_file': params_file, 
+                    
+                    'mask': filter_mask_file,
+                    'use_composition': use_composition,
+                    'container_name': 'nav2_container',
+                }.items(),
+            ),
+
+```
+
+---
+
+### 3. 주의사항: `yaml_filename` 경로 문제
+
+`nav2_params.yaml`에 설정을 통합할 때 딱 하나 주의할 점은 **마스크 yaml 파일의 경로(`yaml_filename`)**입니다.
+
+```yaml
+filter_mask_server:
+  ros__parameters:
+    # ...
+    # 이 부분은 Launch 파일에서 'mask' 인자로 덮어쓰기(Overwrite) 되므로
+    # 여기 적힌 값은 사실상 무시되거나 기본값으로 쓰입니다.
+    yaml_filename: "median_mask.yaml" 
+
+```
+
+`costmap_filter_info.launch.py` 내부를 보면, Launch Argument로 받은 `mask` 값이 파라미터 파일의 설정을 덮어쓰도록 되어 있습니다(`RewrittenYaml`).
+
+따라서:
+
+1. **`nav2_params.yaml`에 적는 `yaml_filename`**은 비워두거나 아무거나 적어도 큰 상관없습니다.
+2. 중요한 건 **`bringup_launch.py`를 실행할 때 `filter_mask_file` 인자에 올바른 경로가 들어가느냐**입니다.
+
+### 요약
+
+1. **통합 가능:** `nav2_params.yaml` 맨 아래에 `costmap_filter_info_server`와 `filter_mask_server` 항목을 복사/붙여넣기 하세요.
+2. **Launch 수정:** `bringup_launch.py`에서 필터 실행 시 `params_file` 인자에 **메인 Nav2 파라미터 변수(`params_file`)**를 그대로 넘겨주세요.
+3. **관리 효율:** 이렇게 하면 파일 하나로 모든 파라미터 튜닝이 가능해져서 관리가 훨씬 편해집니다. 추천합니다! 👍
