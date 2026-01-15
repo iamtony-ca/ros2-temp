@@ -630,3 +630,311 @@ filter_mask_server:
 1. **통합 가능:** `nav2_params.yaml` 맨 아래에 `costmap_filter_info_server`와 `filter_mask_server` 항목을 복사/붙여넣기 하세요.
 2. **Launch 수정:** `bringup_launch.py`에서 필터 실행 시 `params_file` 인자에 **메인 Nav2 파라미터 변수(`params_file`)**를 그대로 넘겨주세요.
 3. **관리 효율:** 이렇게 하면 파일 하나로 모든 파라미터 튜닝이 가능해져서 관리가 훨씬 편해집니다. 추천합니다! 👍
+############################
+#############################
+################################
+네, 헷갈리실 수 있습니다. 파일들이 서로 얽혀있기 때문입니다.
+
+사용자님의 패키지 이름을 **`my_nav_pkg`**라고 가정하고, **총 4개의 파일**을 다룹니다.
+(2개는 신규 생성, 2개는 기존 파일 수정)
+
+이 가이드만 그대로 따라 하면 **"중앙 분리대(Weighted Median Strip)"** 시스템이 완벽하게 작동합니다.
+
+---
+
+### 📂 전체 파일 구조 미리보기
+
+```text
+my_nav_pkg/
+├── launch/
+│   ├── bringup_launch.py          # [수정] 필터 실행 로직 추가
+│   └── costmap_filter.launch.py   # [신규] 필터 서버들만 실행하는 런치 파일
+├── maps/
+│   ├── map.pgm                    # (기존) 건드리지 않음
+│   ├── map.yaml                   # (기존) 건드리지 않음
+│   ├── median_mask.pgm            # [신규] 중앙에 회색 선을 그린 이미지
+│   └── median_mask.yaml           # [신규] 마스크 메타데이터
+└── params/
+    └── nav2_params.yaml           # [수정] 필터 서버 설정 통합 + Global Costmap 플러그인 추가
+
+```
+
+---
+
+### 1. [신규] 마스크 이미지 & YAML
+
+**위치:** `my_nav_pkg/maps/`
+
+#### 1-1. `median_mask.pgm` (이미지 파일)
+
+* **작업:** 포토샵/GIMP 등을 사용.
+* **배경:** 흰색 (255)
+* **중앙선:** **진한 회색 (RGB값 100~150 정도)**. 절대 검은색(0)으로 칠하지 마세요!
+* 회색으로 칠해야 "비싼 길(Weighted)"이 되어 비상시 지나갈 수 있습니다.
+
+
+
+#### 1-2. `median_mask.yaml` (메타 파일)
+
+기존 `map.yaml`의 **origin**과 **resolution**을 복사해서 똑같이 맞춰야 합니다.
+
+```yaml
+image: median_mask.pgm
+mode: scale             # [중요] 명암을 비용으로 변환
+resolution: 0.05        # [주의] 기존 map.yaml과 동일하게!
+origin: [-10.0, -10.0, 0.0] # [주의] 기존 map.yaml과 동일하게!
+negate: 0
+occupied_thresh: 1.0    # 안전장치 (완전 검은색만 벽으로 인식)
+free_thresh: 0.0
+
+```
+
+---
+
+### 2. [신규] 필터 전용 Launch 파일
+
+**위치:** `my_nav_pkg/launch/costmap_filter.launch.py`
+Nav2 데모 코드를 깔끔하게 정리한 버전입니다. 복사해서 파일로 만드세요.
+
+```python
+import os
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, GroupAction
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch_ros.actions import Node, LoadComposableNodes
+from launch_ros.descriptions import ComposableNode
+from nav2_common.launch import RewrittenYaml
+
+def generate_launch_description():
+    lifecycle_nodes = ['filter_mask_server', 'costmap_filter_info_server']
+
+    # Arguments
+    namespace = LaunchConfiguration('namespace')
+    use_sim_time = LaunchConfiguration('use_sim_time')
+    autostart = LaunchConfiguration('autostart')
+    params_file = LaunchConfiguration('params_file') # nav2_params.yaml을 그대로 받음
+    mask_yaml_file = LaunchConfiguration('mask')     # median_mask.yaml 경로를 받음
+    use_composition = LaunchConfiguration('use_composition')
+    container_name = LaunchConfiguration('container_name')
+    container_name_full = (namespace, '/', container_name)
+
+    # 파라미터 재작성 (마스크 파일 경로 덮어쓰기 위함)
+    param_substitutions = {
+        'use_sim_time': use_sim_time,
+        'yaml_filename': mask_yaml_file}
+
+    configured_params = RewrittenYaml(
+        source_file=params_file,
+        root_key=namespace,
+        param_rewrites=param_substitutions,
+        convert_types=True)
+
+    # 노드 정의 (Standalone)
+    load_nodes = GroupAction(
+        condition=IfCondition(PythonExpression(['not ', use_composition])),
+        actions=[
+            Node(
+                package='nav2_map_server',
+                executable='map_server',
+                name='filter_mask_server',
+                namespace=namespace,
+                output='screen',
+                emulate_tty=True,
+                parameters=[configured_params]),
+            Node(
+                package='nav2_map_server',
+                executable='costmap_filter_info_server',
+                name='costmap_filter_info_server',
+                namespace=namespace,
+                output='screen',
+                emulate_tty=True,
+                parameters=[configured_params]),
+            Node(
+                package='nav2_lifecycle_manager',
+                executable='lifecycle_manager',
+                name='lifecycle_manager_costmap_filters',
+                namespace=namespace,
+                output='screen',
+                emulate_tty=True,
+                parameters=[{'use_sim_time': use_sim_time},
+                            {'autostart': autostart},
+                            {'node_names': lifecycle_nodes}])
+        ]
+    )
+
+    # 노드 정의 (Composition)
+    load_composable_nodes = GroupAction(
+        condition=IfCondition(use_composition),
+        actions=[
+            LoadComposableNodes(
+                target_container=container_name_full,
+                composable_node_descriptions=[
+                    ComposableNode(
+                        package='nav2_map_server',
+                        plugin='nav2_map_server::MapServer',
+                        name='filter_mask_server',
+                        parameters=[configured_params]),
+                    ComposableNode(
+                        package='nav2_map_server',
+                        plugin='nav2_map_server::CostmapFilterInfoServer',
+                        name='costmap_filter_info_server',
+                        parameters=[configured_params]),
+                    ComposableNode(
+                        package='nav2_lifecycle_manager',
+                        plugin='nav2_lifecycle_manager::LifecycleManager',
+                        name='lifecycle_manager_costmap_filters',
+                        parameters=[{'use_sim_time': use_sim_time},
+                                    {'autostart': autostart},
+                                    {'node_names': lifecycle_nodes}]),
+                ]
+            )
+        ]
+    )
+
+    return LaunchDescription([
+        DeclareLaunchArgument('namespace', default_value=''),
+        DeclareLaunchArgument('use_sim_time', default_value='true'),
+        DeclareLaunchArgument('autostart', default_value='true'),
+        DeclareLaunchArgument('params_file'), # 필수 입력
+        DeclareLaunchArgument('mask'),        # 필수 입력
+        DeclareLaunchArgument('use_composition', default_value='True'),
+        DeclareLaunchArgument('container_name', default_value='nav2_container'),
+        load_nodes,
+        load_composable_nodes
+    ])
+
+```
+
+---
+
+### 3. [수정] 파라미터 파일 통합
+
+**위치:** `my_nav_pkg/params/nav2_params.yaml`
+
+기존 파일에 **두 가지** 작업을 해야 합니다.
+
+#### 수정 포인트 A: Global Costmap 플러그인 추가
+
+`global_costmap` 섹션을 찾아서 수정하세요.
+
+```yaml
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      # ... (기존 설정들) ...
+      
+      # [수정] plugins 리스트 맨 뒤에 'keepout_filter' 추가 (순서 중요!)
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer", "keepout_filter"]
+
+      # ... (기존 레이어 설정들) ...
+
+      # [추가] Keepout Filter 플러그인 설정
+      keepout_filter:
+        plugin: "nav2_costmap_2d::KeepoutFilter"
+        enabled: True
+        filter_info_topic: "/costmap_filter_info"
+
+```
+
+#### 수정 포인트 B: 서버 파라미터 추가 (파일 맨 아래에 붙여넣기)
+
+파일의 가장 끝부분(들여쓰기 없는 최상위 레벨)에 아래 내용을 붙여넣으세요.
+
+```yaml
+# =======================================================
+# [추가] Costmap Filter Servers Configuration
+# =======================================================
+costmap_filter_info_server:
+  ros__parameters:
+    use_sim_time: true
+    type: 0                     # Keepout 모드지만 마스크가 회색이라 Weighted로 동작
+    filter_info_topic: "/costmap_filter_info"
+    mask_topic: "/median_filter_mask"
+    base: 0.0
+    multiplier: 1.0
+
+filter_mask_server:
+  ros__parameters:
+    use_sim_time: true
+    frame_id: "map"
+    topic_name: "/median_filter_mask"
+    yaml_filename: "" # Launch 파일에서 경로를 주입하므로 비워둬도 됨
+
+```
+
+---
+
+### 4. [수정] 메인 Launch 파일
+
+**위치:** `my_nav_pkg/launch/bringup_launch.py`
+
+이제 2번에서 만든 Launch 파일을 불러오고, 1번에서 만든 마스크 경로를 알려줍니다.
+
+```python
+# ... import 구문들 ...
+
+def generate_launch_description():
+    bringup_dir = get_package_share_directory('nav2_bringup') # 혹은 my_nav_pkg
+    launch_dir = os.path.join(bringup_dir, 'launch')
+
+    # [추가] 내 패키지 경로 (Launch 파일과 Map 파일 위치 찾기 위함)
+    # 만약 nav2_bringup 패키지를 수정 중이라면 위 bringup_dir을 그대로 사용
+    # 커스텀 패키지라면 아래와 같이 수정:
+    # my_pkg_dir = get_package_share_directory('my_nav_pkg') 
+
+    # ... 기존 변수 선언들 ...
+    
+    # [추가] 마스크 파일 경로 정의
+    # (주의: 실제 파일 위치에 맞게 경로 수정)
+    mask_yaml_file = os.path.join(bringup_dir, 'maps', 'median_mask.yaml')
+
+    # ... 기존 declare 선언들 ...
+
+    bringup_cmd_group = GroupAction(
+        [
+            PushROSNamespace(condition=IfCondition(use_namespace), namespace=namespace),
+            
+            # ... (기존 nav2_container, slam, localization 등) ...
+
+            # ---------------------------------------------------------
+            # [추가] Costmap Filter 실행 (Localization 뒤, Navigation 앞)
+            # ---------------------------------------------------------
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    # 2번에서 만든 launch 파일 경로
+                    os.path.join(launch_dir, 'costmap_filter.launch.py')
+                ),
+                launch_arguments={
+                    'namespace': namespace,
+                    'use_sim_time': use_sim_time,
+                    'autostart': autostart,
+                    'params_file': params_file, # 통합된 nav2_params.yaml 전달
+                    'mask': mask_yaml_file,     # 1번에서 만든 마스크 전달
+                    'use_composition': use_composition,
+                    'container_name': 'nav2_container',
+                }.items(),
+            ),
+            # ---------------------------------------------------------
+
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(launch_dir, 'navigation_launch.py')
+                ),
+                # ... (기존 내용) ...
+            ),
+        ]
+    )
+    
+    # ... (나머지 코드 동일) ...
+
+```
+
+### ✅ 최종 점검 리스트
+
+1. **`median_mask.pgm`**: 중앙에 **회색** 선을 그렸나요? (검은색 아님!)
+2. **`median_mask.yaml`**: `origin`을 `map.yaml`과 똑같이 맞췄나요?
+3. **`nav2_params.yaml`**: `plugins` 리스트 맨 끝에 `keepout_filter`를 적었나요?
+4. **`bringup_launch.py`**: `costmap_filter.launch.py`를 Include 했나요?
+
+이렇게 4가지만 확인하면 끝입니다. 그대로 실행하시면 됩니다!
