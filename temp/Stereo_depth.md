@@ -1102,4 +1102,211 @@ SVGA(800×600)에서 CPU만으로 10Hz가 애매하면 아래 순서로 조정�
 * **WLS 후처리** 옵션(품질↑, CPU↑)
 * `QoS`를 센서용으로 조정(`SensorDataQoS`)해서 지연/버퍼 최적화
 
-지금 `left/right image_rect`의 encoding이 보통 `mono8`인지 `bgr8`인지(또는 `rgb8`)만 알려주면, PointCloud에 색 넣는 버전까지 바로 맞춰서 줄게요.
+지금 `left/right image_rect`의 encoding이 보통 `mono8`인지 `bgr8`인지(또는 `rgb8`)만 알려주면, PointCloud에 색 넣는 버disp_msg.header.################
+############################  
+################################  
+#################################  
+좋아. **WLS 후처리(=opencv_contrib의 ximgproc)** 를 “옵션”으로 붙이려면 핵심이 2개야:
+
+1. **left disparity + right disparity 둘 다 필요** (WLS가 L/R consistency를 보기 때문)
+2. `opencv_contrib`의 **`cv::ximgproc`** 를 써야 함
+
+아래는 네가 올린 C++ 노드에 **WLS on/off 파라미터**를 추가한 “완전 동작 버전” 변경사항이야.
+
+---
+
+## 0) (필수) opencv_contrib 설치 확인
+
+Ubuntu에서 보통 아래로 해결돼:
+
+```bash
+sudo apt update
+sudo apt install -y libopencv-contrib-dev
+```
+
+---
+
+## 1) `CMakeLists.txt` 수정 (ximgproc 컴포넌트 추가)
+
+기존 `find_package(OpenCV REQUIRED)`를 아래처럼 바꾸는 걸 추천해.
+
+```cmake
+find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d ximgproc)
+```
+
+그리고 link는 그대로 `${OpenCV_LIBS}`면 충분한 경우가 많아.
+
+> 만약 환경에 따라 COMPONENTS가 문제를 일으키면, `find_package(OpenCV REQUIRED)`로 두고 빌드가 ximgproc를 찾는지 확인하는 방식도 가능하지만, “명확히” 하려면 위처럼 쓰는 게 좋아.
+
+---
+
+## 2) 헤더 수정: `stereo_sgbm_depth_node.hpp`
+
+### 추가 include
+
+```cpp
+#include <opencv2/ximgproc/disparity_filter.hpp>
+```
+
+### 클래스 멤버 추가 (WLS 관련)
+
+`private:` 아래에 추가:
+
+```cpp
+  // WLS
+  bool enable_wls_{false};
+  double wls_lambda_{8000.0};     // typical: 8000~20000
+  double wls_sigma_{1.5};         // typical: 0.8~2.0
+  int wls_lrc_thresh_{24};        // typical: 5~30
+  int wls_depth_disc_radius_{3};  // typical: 1~5
+
+  cv::Ptr<cv::StereoMatcher> right_matcher_;
+  cv::Ptr<cv::ximgproc::DisparityWLSFilter> wls_filter_;
+```
+
+---
+
+## 3) 구현 수정: `stereo_sgbm_depth_node.cpp`
+
+### (A) 파라미터 선언/로드 추가
+
+생성자에서 declare:
+
+```cpp
+  this->declare_parameter<bool>("enable_wls", false);
+  this->declare_parameter<double>("wls_lambda", 8000.0);
+  this->declare_parameter<double>("wls_sigma", 1.5);
+  this->declare_parameter<int>("wls_lrc_thresh", 24);
+  this->declare_parameter<int>("wls_depth_disc_radius", 3);
+```
+
+get_parameter 로드:
+
+```cpp
+  enable_wls_ = this->get_parameter("enable_wls").as_bool();
+  wls_lambda_ = this->get_parameter("wls_lambda").as_double();
+  wls_sigma_ = this->get_parameter("wls_sigma").as_double();
+  wls_lrc_thresh_ = this->get_parameter("wls_lrc_thresh").as_int();
+  wls_depth_disc_radius_ = this->get_parameter("wls_depth_disc_radius").as_int();
+```
+
+로그에도 표시하고 싶으면:
+
+```cpp
+  RCLCPP_INFO(this->get_logger(),
+              "WLS: enable=%s lambda=%.1f sigma=%.2f lrc=%d depth_disc_radius=%d",
+              enable_wls_ ? "true" : "false",
+              wls_lambda_, wls_sigma_, wls_lrc_thresh_, wls_depth_disc_radius_);
+```
+
+---
+
+### (B) `rebuildSGBM()`에서 right matcher / wls filter 생성
+
+`rebuildSGBM()` 마지막에 아래를 추가해줘.
+
+```cpp
+  // WLS helpers (need left matcher)
+  // right matcher computes disparity for the right view
+  right_matcher_ = cv::ximgproc::createRightMatcher(sgbm_);
+
+  // WLS filter guided by left image
+  wls_filter_ = cv::ximgproc::createDisparityWLSFilter(sgbm_);
+  wls_filter_->setLambda(wls_lambda_);
+  wls_filter_->setSigmaColor(wls_sigma_);
+  wls_filter_->setLRCthresh(wls_lrc_thresh_);
+  wls_filter_->setDepthDiscontinuityRadius(wls_depth_disc_radius_);
+```
+
+---
+
+### (C) `onTimer()`에서 disparity 계산부를 “WLS 옵션 분기”로 변경
+
+기존에는:
+
+```cpp
+  cv::Mat disp16;
+  sgbm_->compute(left_gray, right_gray, disp16);
+
+  cv::Mat disp;
+  disp16.convertTo(disp, CV_32F, 1.0 / 16.0);
+```
+
+이 부분을 아래처럼 교체:
+
+```cpp
+  cv::Mat disp_left16;
+  sgbm_->compute(left_gray, right_gray, disp_left16);   // CV_16S (disp*16)
+
+  cv::Mat disp16_to_use = disp_left16;
+
+  if (enable_wls_) {
+    // Need right disparity too
+    cv::Mat disp_right16;
+    right_matcher_->compute(right_gray, left_gray, disp_right16); // CV_16S
+
+    // Filtered output (CV_16S)
+    cv::Mat disp_filtered16;
+    // guidance image must be 8-bit 1ch or 3ch; we have left_gray CV_8U
+    wls_filter_->setLambda(wls_lambda_);
+    wls_filter_->setSigmaColor(wls_sigma_);
+    wls_filter_->setLRCthresh(wls_lrc_thresh_);
+    wls_filter_->setDepthDiscontinuityRadius(wls_depth_disc_radius_);
+
+    wls_filter_->filter(disp_left16, left_gray, disp_filtered16, disp_right16);
+
+    disp16_to_use = disp_filtered16;
+  }
+
+  cv::Mat disp;
+  disp16_to_use.convertTo(disp, CV_32F, 1.0 / 16.0);
+```
+
+이 뒤의 depth/pointcloud 계산은 **disp를 그대로 사용**하면 돼. (WLS가 켜져 있으면 더 깔끔한 disparity가 들어오게 됨)
+
+---
+
+## 4) launch에 파라미터 추가
+
+`launch/stereo_sgbm_depth.launch.py`에 옵션 넣어줘.
+
+```python
+'enable_wls': True,
+'wls_lambda': 8000.0,
+'wls_sigma': 1.5,
+'wls_lrc_thresh': 24,
+'wls_depth_disc_radius': 3,
+```
+
+---
+
+## 5) 성능 팁 (SVGA에서 10Hz 유지)
+
+WLS는 품질은 좋아지지만 CPU를 더 먹어. 10Hz가 흔들리면 아래 순서로 조절하면 안정적이야.
+
+* `scale:=0.5` (가장 강력)
+* `num_disparities:=96` (또는 64)
+* `wls_lambda`는 크게 올릴수록 “매끈”, 대신 경계가 뭉개질 수 있음
+* `wls_sigma`는 색상(가이던스) 기반 smoothing 강도 느낌이라 1.0~2.0 사이에서 조절
+
+---
+
+## 6) 실행 예시
+
+```bash
+ros2 run stereo_sgbm_depth stereo_sgbm_depth_node --ros-args \
+  -p left_image_topic:=/stereo/left/image_rect \
+  -p right_image_topic:=/stereo/right/image_rect \
+  -p left_info_topic:=/stereo/left/camera_info \
+  -p right_info_topic:=/stereo/right/camera_info \
+  -p output_hz:=10.0 \
+  -p scale:=0.5 \
+  -p enable_wls:=true \
+  -p wls_lambda:=8000.0 \
+  -p wls_sigma:=1.5
+```
+
+---
+
+원하면 내가 위 변경이 반영된 **최종 완성본 전체 파일(헤더/CPP/CMake/package/launch)** 을 “그대로 복붙해서 빌드되는 형태”로 한 번에 다시 정리해서 줄게.
+(지금은 네가 기존 코드를 이미 빌드 성공했다고 해서, **필요한 변경점만 정확히 추가**하는 형태로 적어줬어.)
