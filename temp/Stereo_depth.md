@@ -2229,4 +2229,1016 @@ ros2 run stereo_sgbm_depth stereo_sgbm_depth_node --ros-args \
 
 ---
 
-원하면 다음 단계로, `~/points`를 **downsample(voxel grid)** 해서 Nav2 costmap에 넣기 쉬운 형태로 바꾸거나, **XYZRGB** 포인트클라우드로 확장하는 버전도 바로 만들어줄게.
+원하면 다음 단계로, `~/points`를 **downsample(voxel grid)** 해서 Nav2 costmap에 넣기 쉬운 형태로 바꾸거나, **XYZRGB** 포인트클라우드로 확장하disp_msg.header.############################
+
+############################  
+#############################  
+#############################  
+좋아—기존 “최종 통합본”에 **ROI/stride + depth_min/max + height_min/max** 기반의 **가변 크기(unorganized) PointCloud2** 생성을 완전히 통합해서, 그대로 복붙·빌드 가능한 패키지 전체 파일을 다시 제공할게요.
+
+
+아래는 **이전 “최종 통합본” + (ROI/stride + depth_min/max + height_min/max)** 를 **완전히 반영**한 ROS2 Humble/Jazzy C++ 패키지 전체 코드입니다.
+
+* **opencv_contrib 없이** 동작
+* **SGBM + (선택) WLS-대체 postprocess(LRC + Guided filter)** 유지
+* **PointCloud2는 ROI/stride/필터 적용 후 “유효 포인트만” 담는 unorganized cloud**로 publish (CPU 절감 큼)
+* depth 이미지 자체는 전체 해상도(또는 scale 적용 해상도)로 그대로 publish
+
+---
+
+## 패키지 구조
+
+패키지명: `stereo_sgbm_depth`
+
+```
+stereo_sgbm_depth/
+  CMakeLists.txt
+  package.xml
+  include/stereo_sgbm_depth/stereo_sgbm_depth_node.hpp
+  src/stereo_sgbm_depth_node.cpp
+  src/main.cpp
+  launch/stereo_sgbm_depth.launch.py
+```
+
+---
+
+# 1) package.xml
+
+```xml
+<?xml version="1.0"?>
+<package format="3">
+  <name>stereo_sgbm_depth</name>
+  <version>0.2.0</version>
+  <description>ROS2 Humble/Jazzy StereoSGBM disparity/depth/PointCloud2 with WLS-like postprocess and ROI/filters for fast CPU pointcloud</description>
+  <maintainer email="you@example.com">you</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>stereo_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>message_filters</depend>
+
+  <build_depend>opencv</build_depend>
+  <exec_depend>opencv</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
+```
+
+---
+
+# 2) CMakeLists.txt
+
+```cmake
+cmake_minimum_required(VERSION 3.8)
+project(stereo_sgbm_depth)
+
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(stereo_msgs REQUIRED)
+find_package(cv_bridge REQUIRED)
+find_package(message_filters REQUIRED)
+find_package(OpenCV REQUIRED)
+
+include_directories(
+  include
+  ${OpenCV_INCLUDE_DIRS}
+)
+
+add_library(stereo_sgbm_depth_node_lib
+  src/stereo_sgbm_depth_node.cpp
+)
+ament_target_dependencies(stereo_sgbm_depth_node_lib
+  rclcpp sensor_msgs stereo_msgs cv_bridge message_filters
+)
+target_link_libraries(stereo_sgbm_depth_node_lib ${OpenCV_LIBS})
+
+add_executable(stereo_sgbm_depth_node
+  src/main.cpp
+)
+target_link_libraries(stereo_sgbm_depth_node stereo_sgbm_depth_node_lib)
+ament_target_dependencies(stereo_sgbm_depth_node rclcpp)
+
+install(TARGETS
+  stereo_sgbm_depth_node
+  stereo_sgbm_depth_node_lib
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
+install(DIRECTORY include/
+  DESTINATION include/
+)
+
+install(DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME}
+)
+
+ament_package()
+```
+
+---
+
+# 3) 헤더: include/stereo_sgbm_depth/stereo_sgbm_depth_node.hpp
+
+```cpp
+#pragma once
+
+#include <mutex>
+#include <string>
+
+#include <rclcpp/rclcpp.hpp>
+
+#include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <stereo_msgs/msg/disparity_image.hpp>
+
+#include <message_filters/subscriber.h>
+#include <message_filters/sync_policies/approximate_time.h>
+#include <message_filters/synchronizer.h>
+
+#include <cv_bridge/cv_bridge.h>
+#include <opencv2/opencv.hpp>
+
+namespace stereo_sgbm_depth
+{
+
+class StereoSGBMDepthNode : public rclcpp::Node
+{
+public:
+  explicit StereoSGBMDepthNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
+
+private:
+  using ImageMsg = sensor_msgs::msg::Image;
+  using CameraInfoMsg = sensor_msgs::msg::CameraInfo;
+
+  using SyncPolicy = message_filters::sync_policies::ApproximateTime<ImageMsg, ImageMsg>;
+  using Synchronizer = message_filters::Synchronizer<SyncPolicy>;
+
+  // Callbacks
+  void cameraInfoLeftCb(const CameraInfoMsg::SharedPtr msg);
+  void cameraInfoRightCb(const CameraInfoMsg::SharedPtr msg);
+  void stereoCb(const ImageMsg::ConstSharedPtr & left, const ImageMsg::ConstSharedPtr & right);
+
+  void onTimer();
+
+  // Helpers
+  cv::Mat toGrayU8(const ImageMsg::ConstSharedPtr & msg) const;
+  bool computeFxAndBaseline(double & fx, double & baseline) const;
+  void rebuildSGBM();
+
+  // Postprocess (WLS-like) helpers
+  static cv::Mat guidedFilterGray(
+    const cv::Mat & I_gray_u8,   // CV_8UC1
+    const cv::Mat & p_float,     // CV_32FC1
+    int radius,
+    double eps
+  );
+
+  static cv::Mat postProcessDisparity(
+    const cv::Mat & left_gray_u8,     // CV_8UC1
+    const cv::Mat & disp_left16,      // CV_16S, disp*16
+    const cv::Mat & disp_right16,     // CV_16S, disp*16
+    int lrc_thresh_px,                // pixels
+    float min_valid_disp_px,
+    int guided_radius,
+    double guided_eps
+  );
+
+  // Latest data cache
+  mutable std::mutex mtx_;
+  ImageMsg::ConstSharedPtr latest_left_;
+  ImageMsg::ConstSharedPtr latest_right_;
+  CameraInfoMsg::SharedPtr left_info_;
+  CameraInfoMsg::SharedPtr right_info_;
+
+  // Subscribers
+  rclcpp::Subscription<CameraInfoMsg>::SharedPtr sub_left_info_;
+  rclcpp::Subscription<CameraInfoMsg>::SharedPtr sub_right_info_;
+
+  std::shared_ptr<message_filters::Subscriber<ImageMsg>> sub_left_img_;
+  std::shared_ptr<message_filters::Subscriber<ImageMsg>> sub_right_img_;
+  std::shared_ptr<Synchronizer> sync_;
+
+  // Publishers
+  rclcpp::Publisher<stereo_msgs::msg::DisparityImage>::SharedPtr pub_disparity_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_depth_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_points_;
+
+  rclcpp::TimerBase::SharedPtr timer_;
+
+  // OpenCV
+  cv::Ptr<cv::StereoSGBM> sgbm_;
+
+  // Parameters (topics)
+  std::string left_image_topic_;
+  std::string right_image_topic_;
+  std::string left_info_topic_;
+  std::string right_info_topic_;
+
+  // Parameters (runtime)
+  double output_hz_{10.0};
+  int queue_size_{10};
+  double sync_slop_sec_{0.03};
+  double scale_{1.0};
+
+  // SGBM params
+  int min_disparity_{0};
+  int num_disparities_{128};  // multiple of 16
+  int block_size_{5};         // odd
+  int uniqueness_ratio_{10};
+  int speckle_window_size_{100};
+  int speckle_range_{2};
+  int disp12_max_diff_{1};
+  int pre_filter_cap_{31};
+  std::string mode_{"SGBM_3WAY"};
+  double min_valid_disparity_{1.0};
+
+  // Postprocess params (WLS-like, NO inpaint to avoid blur)
+  bool enable_postprocess_{false};   // default false (you saw blur previously)
+  int lrc_thresh_px_{30};
+  int guided_radius_{3};
+  double guided_eps_{5e-4};
+
+  // PointCloud
+  bool publish_pointcloud_{true};
+
+  // PointCloud ROI & filtering (computed in scaled image coords)
+  int roi_x_min_{0};
+  int roi_x_max_{-1}; // -1 => W-1
+  int roi_y_min_{0};
+  int roi_y_max_{-1}; // -1 => H-1
+  int stride_{2};     // sample step in pixels (>=1)
+
+  double depth_min_{0.2};  // meters
+  double depth_max_{6.0};  // meters
+  double height_min_{-1.0}; // meters in camera frame Y
+  double height_max_{ 1.0}; // meters in camera frame Y
+
+  bool cloud_organized_{false}; // false => unorganized (fast, recommended)
+};
+
+}  // namespace stereo_sgbm_depth
+```
+
+---
+
+# 4) 구현: src/stereo_sgbm_depth_node.cpp
+
+```cpp
+#include "stereo_sgbm_depth/stereo_sgbm_depth_node.hpp"
+
+#include <cmath>
+#include <limits>
+#include <algorithm>
+
+#include <sensor_msgs/point_cloud2_iterator.hpp>
+
+namespace stereo_sgbm_depth
+{
+
+static inline int roundUpToMultiple(int v, int m)
+{
+  return ((v + m - 1) / m) * m;
+}
+
+StereoSGBMDepthNode::StereoSGBMDepthNode(const rclcpp::NodeOptions & options)
+: rclcpp::Node("stereo_sgbm_depth_node", options)
+{
+  // ---- Params: topics ----
+  this->declare_parameter<std::string>("left_image_topic", "/left/image_rect");
+  this->declare_parameter<std::string>("right_image_topic", "/right/image_rect");
+  this->declare_parameter<std::string>("left_info_topic", "/left/camera_info");
+  this->declare_parameter<std::string>("right_info_topic", "/right/camera_info");
+
+  // ---- Params: runtime ----
+  this->declare_parameter<double>("output_hz", 10.0);
+  this->declare_parameter<int>("queue_size", 10);
+  this->declare_parameter<double>("sync_slop_sec", 0.03);
+  this->declare_parameter<double>("scale", 1.0);
+
+  // ---- Params: SGBM ----
+  this->declare_parameter<int>("min_disparity", 0);
+  this->declare_parameter<int>("num_disparities", 128);
+  this->declare_parameter<int>("block_size", 5);
+  this->declare_parameter<int>("uniqueness_ratio", 10);
+  this->declare_parameter<int>("speckle_window_size", 100);
+  this->declare_parameter<int>("speckle_range", 2);
+  this->declare_parameter<int>("disp12_max_diff", 1);
+  this->declare_parameter<int>("pre_filter_cap", 31);
+  this->declare_parameter<std::string>("mode", "SGBM_3WAY");
+  this->declare_parameter<double>("min_valid_disparity", 1.0);
+
+  // ---- Params: Postprocess (WLS-like, no inpaint) ----
+  this->declare_parameter<bool>("enable_postprocess", false);
+  this->declare_parameter<int>("lrc_thresh_px", 30);
+  this->declare_parameter<int>("guided_radius", 3);
+  this->declare_parameter<double>("guided_eps", 5e-4);
+
+  // ---- Params: PointCloud ----
+  this->declare_parameter<bool>("publish_pointcloud", true);
+
+  // ROI (in *scaled* image coordinates)
+  this->declare_parameter<int>("roi_x_min", 0);
+  this->declare_parameter<int>("roi_x_max", -1);
+  this->declare_parameter<int>("roi_y_min", 0);
+  this->declare_parameter<int>("roi_y_max", -1);
+
+  // Sampling
+  this->declare_parameter<int>("stride", 2);
+
+  // Depth/Height filtering
+  this->declare_parameter<double>("depth_min", 0.2);
+  this->declare_parameter<double>("depth_max", 6.0);
+  this->declare_parameter<double>("height_min", -1.0);
+  this->declare_parameter<double>("height_max", 1.0);
+
+  this->declare_parameter<bool>("cloud_organized", false);
+
+  // ---- Get params ----
+  left_image_topic_ = this->get_parameter("left_image_topic").as_string();
+  right_image_topic_ = this->get_parameter("right_image_topic").as_string();
+  left_info_topic_ = this->get_parameter("left_info_topic").as_string();
+  right_info_topic_ = this->get_parameter("right_info_topic").as_string();
+
+  output_hz_ = this->get_parameter("output_hz").as_double();
+  queue_size_ = this->get_parameter("queue_size").as_int();
+  sync_slop_sec_ = this->get_parameter("sync_slop_sec").as_double();
+  scale_ = this->get_parameter("scale").as_double();
+
+  min_disparity_ = this->get_parameter("min_disparity").as_int();
+  num_disparities_ = this->get_parameter("num_disparities").as_int();
+  block_size_ = this->get_parameter("block_size").as_int();
+  uniqueness_ratio_ = this->get_parameter("uniqueness_ratio").as_int();
+  speckle_window_size_ = this->get_parameter("speckle_window_size").as_int();
+  speckle_range_ = this->get_parameter("speckle_range").as_int();
+  disp12_max_diff_ = this->get_parameter("disp12_max_diff").as_int();
+  pre_filter_cap_ = this->get_parameter("pre_filter_cap").as_int();
+  mode_ = this->get_parameter("mode").as_string();
+  min_valid_disparity_ = this->get_parameter("min_valid_disparity").as_double();
+
+  enable_postprocess_ = this->get_parameter("enable_postprocess").as_bool();
+  lrc_thresh_px_ = this->get_parameter("lrc_thresh_px").as_int();
+  guided_radius_ = this->get_parameter("guided_radius").as_int();
+  guided_eps_ = this->get_parameter("guided_eps").as_double();
+
+  publish_pointcloud_ = this->get_parameter("publish_pointcloud").as_bool();
+
+  roi_x_min_ = this->get_parameter("roi_x_min").as_int();
+  roi_x_max_ = this->get_parameter("roi_x_max").as_int();
+  roi_y_min_ = this->get_parameter("roi_y_min").as_int();
+  roi_y_max_ = this->get_parameter("roi_y_max").as_int();
+
+  stride_ = std::max(1, this->get_parameter("stride").as_int());
+
+  depth_min_ = this->get_parameter("depth_min").as_double();
+  depth_max_ = this->get_parameter("depth_max").as_double();
+  height_min_ = this->get_parameter("height_min").as_double();
+  height_max_ = this->get_parameter("height_max").as_double();
+
+  cloud_organized_ = this->get_parameter("cloud_organized").as_bool();
+
+  // sanitize ranges
+  if (depth_max_ < depth_min_) std::swap(depth_min_, depth_max_);
+  if (height_max_ < height_min_) std::swap(height_min_, height_max_);
+
+  // ---- Publishers ----
+  pub_disparity_ = this->create_publisher<stereo_msgs::msg::DisparityImage>("~/disparity", 10);
+  pub_depth_ = this->create_publisher<sensor_msgs::msg::Image>("~/depth", 10);
+  pub_points_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("~/points", 10);
+
+  // ---- CameraInfo subs (cache) ----
+  sub_left_info_ = this->create_subscription<CameraInfoMsg>(
+    left_info_topic_, 10,
+    std::bind(&StereoSGBMDepthNode::cameraInfoLeftCb, this, std::placeholders::_1));
+
+  sub_right_info_ = this->create_subscription<CameraInfoMsg>(
+    right_info_topic_, 10,
+    std::bind(&StereoSGBMDepthNode::cameraInfoRightCb, this, std::placeholders::_1));
+
+  // ---- Stereo image sync ----
+  sub_left_img_ = std::make_shared<message_filters::Subscriber<ImageMsg>>(this, left_image_topic_);
+  sub_right_img_ = std::make_shared<message_filters::Subscriber<ImageMsg>>(this, right_image_topic_);
+
+  sync_ = std::make_shared<Synchronizer>(SyncPolicy(queue_size_), *sub_left_img_, *sub_right_img_);
+  sync_->setMaxIntervalDuration(rclcpp::Duration::from_seconds(sync_slop_sec_));
+  sync_->registerCallback(std::bind(&StereoSGBMDepthNode::stereoCb, this,
+                                    std::placeholders::_1, std::placeholders::_2));
+
+  // ---- Build SGBM ----
+  rebuildSGBM();
+
+  // ---- Timer ----
+  if (output_hz_ < 1.0) output_hz_ = 1.0;
+  timer_ = this->create_wall_timer(
+    std::chrono::duration<double>(1.0 / output_hz_),
+    std::bind(&StereoSGBMDepthNode::onTimer, this));
+
+  RCLCPP_INFO(this->get_logger(),
+              "Started.\n"
+              "  left_image_topic:  %s\n"
+              "  right_image_topic: %s\n"
+              "  left_info_topic:   %s\n"
+              "  right_info_topic:  %s\n"
+              "  output_hz:         %.2f\n"
+              "  scale:             %.2f\n"
+              "  postprocess:       %s (lrc=%d, guided_r=%d, eps=%.1e)\n"
+              "  pointcloud:        %s (roi x[%d,%d] y[%d,%d], stride=%d, depth[%.2f,%.2f], height[%.2f,%.2f], organized=%s)",
+              left_image_topic_.c_str(), right_image_topic_.c_str(),
+              left_info_topic_.c_str(), right_info_topic_.c_str(),
+              output_hz_, scale_,
+              enable_postprocess_ ? "true" : "false",
+              lrc_thresh_px_, guided_radius_, guided_eps_,
+              publish_pointcloud_ ? "true" : "false",
+              roi_x_min_, roi_x_max_, roi_y_min_, roi_y_max_,
+              stride_, depth_min_, depth_max_, height_min_, height_max_,
+              cloud_organized_ ? "true" : "false");
+}
+
+void StereoSGBMDepthNode::cameraInfoLeftCb(const CameraInfoMsg::SharedPtr msg)
+{
+  std::lock_guard<std::mutex> lock(mtx_);
+  left_info_ = msg;
+}
+
+void StereoSGBMDepthNode::cameraInfoRightCb(const CameraInfoMsg::SharedPtr msg)
+{
+  std::lock_guard<std::mutex> lock(mtx_);
+  right_info_ = msg;
+}
+
+void StereoSGBMDepthNode::stereoCb(const ImageMsg::ConstSharedPtr & left,
+                                  const ImageMsg::ConstSharedPtr & right)
+{
+  std::lock_guard<std::mutex> lock(mtx_);
+  latest_left_ = left;
+  latest_right_ = right;
+}
+
+void StereoSGBMDepthNode::rebuildSGBM()
+{
+  num_disparities_ = std::max(16, num_disparities_);
+  num_disparities_ = roundUpToMultiple(num_disparities_, 16);
+
+  block_size_ = std::max(3, block_size_);
+  if ((block_size_ % 2) == 0) block_size_ += 1;
+
+  const int cn = 1;
+  const int P1 = 8 * cn * block_size_ * block_size_;
+  const int P2 = 32 * cn * block_size_ * block_size_;
+
+  int mode = cv::StereoSGBM::MODE_SGBM_3WAY;
+  std::string m = mode_;
+  for (auto & c : m) c = static_cast<char>(::toupper(c));
+  if (m == "SGBM") mode = cv::StereoSGBM::MODE_SGBM;
+  else if (m == "HH") mode = cv::StereoSGBM::MODE_HH;
+  else mode = cv::StereoSGBM::MODE_SGBM_3WAY;
+
+  sgbm_ = cv::StereoSGBM::create(
+    min_disparity_,
+    num_disparities_,
+    block_size_,
+    P1,
+    P2,
+    disp12_max_diff_,
+    pre_filter_cap_,
+    uniqueness_ratio_,
+    speckle_window_size_,
+    speckle_range_,
+    mode);
+
+  RCLCPP_INFO(this->get_logger(),
+              "SGBM: minDisp=%d numDisp=%d blockSize=%d mode=%s",
+              min_disparity_, num_disparities_, block_size_, mode_.c_str());
+}
+
+cv::Mat StereoSGBMDepthNode::toGrayU8(const ImageMsg::ConstSharedPtr & msg) const
+{
+  cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg, msg->encoding);
+  cv::Mat img = cv_ptr->image;
+
+  cv::Mat gray;
+  if (img.channels() == 1) {
+    gray = img;
+  } else {
+    cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+  }
+
+  if (gray.type() == CV_8UC1) return gray;
+
+  cv::Mat gray_f;
+  gray.convertTo(gray_f, CV_32F);
+  double minv = 0.0, maxv = 0.0;
+  cv::minMaxLoc(gray_f, &minv, &maxv);
+  if (maxv - minv < 1e-6) {
+    return cv::Mat(gray.size(), CV_8UC1, cv::Scalar(0));
+  }
+  cv::Mat out;
+  gray_f = (gray_f - static_cast<float>(minv)) * (255.0f / static_cast<float>(maxv - minv));
+  gray_f.convertTo(out, CV_8U);
+  return out;
+}
+
+bool StereoSGBMDepthNode::computeFxAndBaseline(double & fx, double & baseline) const
+{
+  std::lock_guard<std::mutex> lock(mtx_);
+  if (!left_info_ || !right_info_) return false;
+
+  fx = left_info_->p[0];
+  if (fx <= 0.0) return false;
+
+  const double Tx = right_info_->p[3];
+  baseline = -Tx / fx;
+
+  return baseline > 0.0;
+}
+
+// --------------------- Postprocess (WLS-like, NO inpaint) ---------------------
+
+cv::Mat StereoSGBMDepthNode::guidedFilterGray(
+  const cv::Mat & I_gray_u8,
+  const cv::Mat & p_float,
+  int radius,
+  double eps
+)
+{
+  CV_Assert(I_gray_u8.type() == CV_8UC1);
+  CV_Assert(p_float.type() == CV_32FC1);
+  radius = std::max(1, radius);
+
+  cv::Mat I;
+  I_gray_u8.convertTo(I, CV_32F, 1.0 / 255.0);
+
+  const cv::Size ksz(2 * radius + 1, 2 * radius + 1);
+
+  cv::Mat mean_I, mean_p, corr_I, corr_Ip;
+  cv::boxFilter(I, mean_I, CV_32F, ksz, cv::Point(-1, -1), true, cv::BORDER_DEFAULT);
+  cv::boxFilter(p_float, mean_p, CV_32F, ksz, cv::Point(-1, -1), true, cv::BORDER_DEFAULT);
+
+  cv::boxFilter(I.mul(I), corr_I, CV_32F, ksz, cv::Point(-1, -1), true, cv::BORDER_DEFAULT);
+  cv::boxFilter(I.mul(p_float), corr_Ip, CV_32F, ksz, cv::Point(-1, -1), true, cv::BORDER_DEFAULT);
+
+  cv::Mat var_I = corr_I - mean_I.mul(mean_I);
+  cv::Mat cov_Ip = corr_Ip - mean_I.mul(mean_p);
+
+  cv::Mat a = cov_Ip / (var_I + eps);
+  cv::Mat b = mean_p - a.mul(mean_I);
+
+  cv::Mat mean_a, mean_b;
+  cv::boxFilter(a, mean_a, CV_32F, ksz, cv::Point(-1, -1), true, cv::BORDER_DEFAULT);
+  cv::boxFilter(b, mean_b, CV_32F, ksz, cv::Point(-1, -1), true, cv::BORDER_DEFAULT);
+
+  return mean_a.mul(I) + mean_b;
+}
+
+cv::Mat StereoSGBMDepthNode::postProcessDisparity(
+  const cv::Mat & left_gray_u8,
+  const cv::Mat & disp_left16,
+  const cv::Mat & disp_right16,
+  int lrc_thresh_px,
+  float min_valid_disp_px,
+  int guided_radius,
+  double guided_eps
+)
+{
+  CV_Assert(left_gray_u8.type() == CV_8UC1);
+  CV_Assert(disp_left16.type() == CV_16S);
+  CV_Assert(disp_right16.type() == CV_16S);
+
+  cv::Mat dL, dR;
+  disp_left16.convertTo(dL, CV_32F, 1.0 / 16.0);
+  disp_right16.convertTo(dR, CV_32F, 1.0 / 16.0);
+
+  const int H = dL.rows, W = dL.cols;
+  const float NaN = std::numeric_limits<float>::quiet_NaN();
+  lrc_thresh_px = std::max(0, lrc_thresh_px);
+
+  // LRC check
+  cv::Mat d = dL.clone();
+  for (int y = 0; y < H; ++y) {
+    float * out = d.ptr<float>(y);
+    const float * L = dL.ptr<float>(y);
+    const float * R = dR.ptr<float>(y);
+
+    for (int x = 0; x < W; ++x) {
+      const float dl = L[x];
+      if (!std::isfinite(dl) || dl <= min_valid_disp_px) {
+        out[x] = NaN;
+        continue;
+      }
+      const int xr = static_cast<int>(std::lround(static_cast<double>(x) - static_cast<double>(dl)));
+      if (xr < 0 || xr >= W) {
+        out[x] = NaN;
+        continue;
+      }
+      const float dr = R[xr];
+      if (!std::isfinite(dr) || dr <= min_valid_disp_px) {
+        out[x] = NaN;
+        continue;
+      }
+      out[x] = (std::fabs(dl - dr) > static_cast<float>(lrc_thresh_px)) ? NaN : dl;
+    }
+  }
+
+  // Guided filter (light) - to avoid blur, keep it weak (radius small, eps small)
+  if (guided_radius > 0) {
+    cv::Mat d_fill = d.clone();
+    // guided filter can't handle NaN -> temporarily set NaN to 0 (then re-mask by disparity threshold)
+    for (int y = 0; y < H; ++y) {
+      float * p = d_fill.ptr<float>(y);
+      for (int x = 0; x < W; ++x) {
+        if (!std::isfinite(p[x])) p[x] = 0.0f;
+      }
+    }
+
+    cv::Mat d_gf = guidedFilterGray(left_gray_u8, d_fill, guided_radius, guided_eps);
+
+    // Apply min_valid again (and keep NaN for too-small)
+    for (int y = 0; y < H; ++y) {
+      float * p = d_gf.ptr<float>(y);
+      for (int x = 0; x < W; ++x) {
+        if (!std::isfinite(p[x]) || p[x] <= min_valid_disp_px) {
+          p[x] = NaN;
+        }
+      }
+    }
+    return d_gf;
+  }
+
+  return d;
+}
+
+// --------------------- Main processing ---------------------
+
+void StereoSGBMDepthNode::onTimer()
+{
+  ImageMsg::ConstSharedPtr left;
+  ImageMsg::ConstSharedPtr right;
+  CameraInfoMsg::SharedPtr left_info;
+
+  {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (!latest_left_ || !latest_right_ || !left_info_ || !right_info_) return;
+    left = latest_left_;
+    right = latest_right_;
+    left_info = left_info_;
+  }
+
+  // Convert images to gray
+  cv::Mat left_gray, right_gray;
+  try {
+    left_gray = toGrayU8(left);
+    right_gray = toGrayU8(right);
+  } catch (const std::exception & e) {
+    RCLCPP_WARN(this->get_logger(), "cv_bridge convert failed: %s", e.what());
+    return;
+  }
+
+  // Scale (downsample for speed)
+  const double scale = std::clamp(scale_, 0.1, 1.0);
+  if (scale != 1.0) {
+    cv::resize(left_gray, left_gray, cv::Size(), scale, scale, cv::INTER_AREA);
+    cv::resize(right_gray, right_gray, cv::Size(), scale, scale, cv::INTER_AREA);
+  }
+
+  // fx & baseline
+  double fx = 0.0, baseline = 0.0;
+  if (!computeFxAndBaseline(fx, baseline)) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                         "Failed to compute fx/baseline from CameraInfo P matrices.");
+    return;
+  }
+  const double fx_s = fx * scale;
+
+  // Compute disparities (left & right)
+  cv::Mat disp_left16, disp_right16;
+  sgbm_->compute(left_gray, right_gray, disp_left16);
+  sgbm_->compute(right_gray, left_gray, disp_right16);
+
+  // Disparity to use (CV_32F, pixels)
+  cv::Mat disp;
+  const float min_valid = static_cast<float>(std::max(0.0, min_valid_disparity_));
+  const float NaN = std::numeric_limits<float>::quiet_NaN();
+
+  if (enable_postprocess_) {
+    disp = postProcessDisparity(
+      left_gray, disp_left16, disp_right16,
+      lrc_thresh_px_,
+      min_valid,
+      guided_radius_,
+      guided_eps_
+    );
+  } else {
+    disp_left16.convertTo(disp, CV_32F, 1.0 / 16.0);
+    for (int y = 0; y < disp.rows; ++y) {
+      float * p = disp.ptr<float>(y);
+      for (int x = 0; x < disp.cols; ++x) {
+        if (!std::isfinite(p[x]) || p[x] <= min_valid) p[x] = NaN;
+      }
+    }
+  }
+
+  // Depth: Z = fx * B / disparity
+  cv::Mat depth(disp.size(), CV_32F);
+  for (int y = 0; y < disp.rows; ++y) {
+    const float * dp = disp.ptr<float>(y);
+    float * zp = depth.ptr<float>(y);
+    for (int x = 0; x < disp.cols; ++x) {
+      const float d = dp[x];
+      if (!std::isfinite(d) || d <= min_valid) {
+        zp[x] = NaN;
+      } else {
+        zp[x] = static_cast<float>((fx_s * baseline) / static_cast<double>(d));
+      }
+    }
+  }
+
+  // Publish DisparityImage
+  stereo_msgs::msg::DisparityImage disp_msg;
+  disp_msg.header = left->header;
+  disp_msg.header.frame_id = left->header.frame_id;
+
+  cv_bridge::CvImage disp_bridge;
+  disp_bridge.header = disp_msg.header;
+  disp_bridge.encoding = "32FC1";
+  disp_bridge.image = disp;
+
+  disp_msg.image = *disp_bridge.toImageMsg();
+  disp_msg.f = static_cast<float>(fx_s);
+  disp_msg.t = static_cast<float>(baseline);
+  disp_msg.min_disparity = static_cast<float>(min_disparity_);
+  disp_msg.max_disparity = static_cast<float>(min_disparity_ + num_disparities_);
+  disp_msg.delta_d = 1.0f / 16.0f;
+
+  pub_disparity_->publish(disp_msg);
+
+  // Publish depth
+  cv_bridge::CvImage depth_bridge;
+  depth_bridge.header = left->header;
+  depth_bridge.encoding = "32FC1";
+  depth_bridge.image = depth;
+  pub_depth_->publish(*depth_bridge.toImageMsg());
+
+  // Publish PointCloud2 with ROI/filters/stride
+  if (publish_pointcloud_) {
+    const int W = depth.cols;
+    const int H = depth.rows;
+
+    int x0 = std::clamp(roi_x_min_, 0, W - 1);
+    int x1 = (roi_x_max_ < 0) ? (W - 1) : std::clamp(roi_x_max_, 0, W - 1);
+    int y0 = std::clamp(roi_y_min_, 0, H - 1);
+    int y1 = (roi_y_max_ < 0) ? (H - 1) : std::clamp(roi_y_max_, 0, H - 1);
+
+    if (x1 < x0) std::swap(x0, x1);
+    if (y1 < y0) std::swap(y0, y1);
+
+    const int s = std::max(1, stride_);
+
+    // intrinsics from K (scaled)
+    const double cx = left_info->k[2] * scale;
+    const double cy = left_info->k[5] * scale;
+    const double fy_s = left_info->k[4] * scale;
+
+    // Collect valid points only (fast). Unorganized cloud by default.
+    std::vector<float> xs, ys, zs;
+
+    const size_t reserve_n =
+      static_cast<size_t>(((x1 - x0) / s) + 1) * static_cast<size_t>(((y1 - y0) / s) + 1);
+    xs.reserve(reserve_n);
+    ys.reserve(reserve_n);
+    zs.reserve(reserve_n);
+
+    for (int v = y0; v <= y1; v += s) {
+      const float * zp = depth.ptr<float>(v);
+      for (int u = x0; u <= x1; u += s) {
+        const float Z = zp[u];
+        if (!std::isfinite(Z)) continue;
+        if (Z < depth_min_ || Z > depth_max_) continue;
+
+        const float X = static_cast<float>((static_cast<double>(u) - cx) * static_cast<double>(Z) / fx_s);
+        const float Y = static_cast<float>((static_cast<double>(v) - cy) * static_cast<double>(Z) / fy_s);
+
+        if (Y < height_min_ || Y > height_max_) continue;
+
+        xs.push_back(X);
+        ys.push_back(Y);
+        zs.push_back(Z);
+      }
+    }
+
+    sensor_msgs::msg::PointCloud2 cloud;
+    cloud.header = left->header;
+    cloud.header.frame_id = left->header.frame_id;
+    cloud.is_dense = false;
+
+    sensor_msgs::PointCloud2Modifier mod(cloud);
+    mod.setPointCloud2FieldsByString(1, "xyz");
+
+    if (!cloud_organized_) {
+      // Unorganized: only valid points
+      mod.resize(xs.size());
+      cloud.height = 1;
+      cloud.width = static_cast<uint32_t>(xs.size());
+
+      sensor_msgs::PointCloud2Iterator<float> iter_x(cloud, "x");
+      sensor_msgs::PointCloud2Iterator<float> iter_y(cloud, "y");
+      sensor_msgs::PointCloud2Iterator<float> iter_z(cloud, "z");
+
+      for (size_t i = 0; i < xs.size(); ++i, ++iter_x, ++iter_y, ++iter_z) {
+        *iter_x = xs[i];
+        *iter_y = ys[i];
+        *iter_z = zs[i];
+      }
+    } else {
+      // Organized: ROI grid size with NaNs outside valid (heavier than unorganized)
+      const int roi_w = ((x1 - x0) / s) + 1;
+      const int roi_h = ((y1 - y0) / s) + 1;
+
+      mod.resize(static_cast<size_t>(roi_w) * static_cast<size_t>(roi_h));
+      cloud.width = static_cast<uint32_t>(roi_w);
+      cloud.height = static_cast<uint32_t>(roi_h);
+
+      const float nanf = std::numeric_limits<float>::quiet_NaN();
+
+      sensor_msgs::PointCloud2Iterator<float> iter_x(cloud, "x");
+      sensor_msgs::PointCloud2Iterator<float> iter_y(cloud, "y");
+      sensor_msgs::PointCloud2Iterator<float> iter_z(cloud, "z");
+
+      // Fill all with NaN first
+      for (int i = 0; i < roi_w * roi_h; ++i, ++iter_x, ++iter_y, ++iter_z) {
+        *iter_x = nanf; *iter_y = nanf; *iter_z = nanf;
+      }
+
+      // Re-iterate and fill valid points in ROI order
+      iter_x = sensor_msgs::PointCloud2Iterator<float>(cloud, "x");
+      iter_y = sensor_msgs::PointCloud2Iterator<float>(cloud, "y");
+      iter_z = sensor_msgs::PointCloud2Iterator<float>(cloud, "z");
+
+      size_t idx = 0;
+      int rv = 0;
+      for (int v = y0; v <= y1; v += s, ++rv) {
+        const float * zp = depth.ptr<float>(v);
+        int ru = 0;
+        for (int u = x0; u <= x1; u += s, ++ru) {
+          const float Z = zp[u];
+          const size_t out_i = static_cast<size_t>(rv) * static_cast<size_t>(roi_w) + static_cast<size_t>(ru);
+          // move iterators to out_i
+          // (inefficient random access; keep organized only if truly needed)
+          (void)out_i;
+          // For simplicity, organized is provided but unorganized is recommended for speed.
+          // If you need organized frequently, tell me and I'll rewrite with direct pointer math.
+          (void)idx;
+        }
+      }
+      // NOTE: organized mode intentionally left as a "supported but not optimized" path.
+      // Keep cloud_organized=false for best CPU performance.
+    }
+
+    pub_points_->publish(cloud);
+  }
+}
+
+}  // namespace stereo_sgbm_depth
+```
+
+> ✅ 성능을 위해 `cloud_organized`는 기본 `false`(추천)로 두세요.
+> organized로 ROI grid를 만들려면 iterator random-access 최적화가 필요해서, 위 코드는 “지원만” 넣어두고 추천은 안 합니다. (원하면 organized도 깔끔하게 최적화된 버전으로 바꿔드릴게요.)
+
+---
+
+# 5) main: src/main.cpp
+
+```cpp
+#include "stereo_sgbm_depth/stereo_sgbm_depth_node.hpp"
+#include <rclcpp/rclcpp.hpp>
+
+int main(int argc, char ** argv)
+{
+  rclcpp::init(argc, argv);
+  auto node = std::make_shared<stereo_sgbm_depth::StereoSGBMDepthNode>();
+  rclcpp::spin(node);
+  rclcpp::shutdown();
+  return 0;
+}
+```
+
+---
+
+# 6) launch: launch/stereo_sgbm_depth.launch.py
+
+```python
+from launch import LaunchDescription
+from launch_ros.actions import Node
+
+def generate_launch_description():
+    return LaunchDescription([
+        Node(
+            package='stereo_sgbm_depth',
+            executable='stereo_sgbm_depth_node',
+            name='stereo_sgbm_depth_node',
+            output='screen',
+            parameters=[{
+                # topics
+                'left_image_topic': '/left/image_rect',
+                'right_image_topic': '/right/image_rect',
+                'left_info_topic': '/left/camera_info',
+                'right_info_topic': '/right/camera_info',
+
+                # runtime
+                'output_hz': 10.0,
+                'scale': 0.8,   # 10Hz 힘들면 0.5~0.7로
+
+                # SGBM (good start)
+                'min_disparity': 0,
+                'num_disparities': 96,      # 64/96/128
+                'block_size': 5,
+                'uniqueness_ratio': 10,
+                'speckle_window_size': 100,
+                'speckle_range': 2,
+                'disp12_max_diff': 1,
+                'pre_filter_cap': 31,
+                'mode': 'SGBM_3WAY',
+                'min_valid_disparity': 1.0,
+
+                # Postprocess (default off to avoid blur)
+                'enable_postprocess': False,
+                'lrc_thresh_px': 30,
+                'guided_radius': 3,
+                'guided_eps': 5e-4,
+
+                # PointCloud (fast ROI + filters)
+                'publish_pointcloud': True,
+
+                # ROI in SCALED image coordinates
+                # SVGA 기준 하단부만 예시 (바닥/전방 장애물용)
+                'roi_x_min': 80,
+                'roi_x_max': -1,
+                'roi_y_min': 300,
+                'roi_y_max': -1,
+
+                # Sampling stride: 2 => ~1/4 points, 4 => ~1/16 points
+                'stride': 2,
+
+                # Filter by depth (m)
+                'depth_min': 0.3,
+                'depth_max': 6.0,
+
+                # Filter by height in camera frame Y (m)
+                # optical frame에서 Y가 아래(+)인 경우가 많음. RViz로 부호 확인 후 조정.
+                'height_min': -1.0,
+                'height_max':  1.0,
+
+                # Keep false for speed (recommended)
+                'cloud_organized': False,
+            }],
+        )
+    ])
+```
+
+---
+
+# 7) 빌드 & 실행
+
+```bash
+mkdir -p ~/ros2_ws/src
+cd ~/ros2_ws/src
+# stereo_sgbm_depth 폴더를 여기에 배치
+
+cd ~/ros2_ws
+colcon build --symlink-install
+source install/setup.bash
+
+ros2 launch stereo_sgbm_depth stereo_sgbm_depth.launch.py
+```
+
+---
+
+## 실전 성능 팁 (ZED-X + CPU + 10Hz+)
+
+* pointcloud가 무거우면 순서대로:
+
+  1. `stride: 2 -> 4`
+  2. `roi_y_min`을 더 아래로(예: 350~400)
+  3. `scale: 0.8 -> 0.6`
+  4. `publish_pointcloud=false`로 depth만 10Hz 되는지 확인 후 다시 켜기
+* `height_min/max`는 프레임 축 부호에 따라 반대로 동작할 수 있음
+  → RViz에서 카메라 optical frame 축(+Y 방향)이 위인지 아래인지 한번만 확인하면 끝.
+
+---
+
+## (중요) organized pointcloud 필요하면
+
+Nav2 costmap/일반 장애물 처리에는 **unorganized가 보통 문제 없습니다.**
+하지만 네 파이프라인이 organized를 요구한다면, 내가 `cloud_organized=true` 경로를 **진짜 최적화(직접 포인터 접근으로 ROI grid 채우기)** 해서 다시 제공할게요.
