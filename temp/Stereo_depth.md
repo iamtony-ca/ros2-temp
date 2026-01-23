@@ -1,22 +1,17 @@
-좋아. 아래는 ROS2(rclpy) + OpenCV StereoSGBM로 rectified left/right 이미지를 받아서 disparity(시차) + depth(미터) 를 10Hz 이상으로 퍼블리시하는 Python 노드 예시야.
+좋아. 아래는 **ROS2(rclpy) + OpenCV StereoSGBM**로 **rectified left/right 이미지**를 받아서 **disparity(시차) + depth(미터)** 를 **10Hz 이상**으로 퍼블리시하는 **Python 노드 예시**야.
 
-입력: left/image_rect, right/image_rect, left/camera_info, right/camera_info
+* 입력: `left/image_rect`, `right/image_rect`, `left/camera_info`, `right/camera_info`
+* 출력:
 
-출력:
-
-~/disparity : stereo_msgs/DisparityImage (권장)
-
-~/depth : sensor_msgs/Image (32FC1, meters, invalid=NaN)
-
-
-설계: 이미지 pair는 계속 최신으로 저장, timer에서 지정한 output_hz(기본 10Hz) 로만 SGBM 계산 → CPU 부하/지터 관리가 쉬움
-
-
+  * `~/disparity` : `stereo_msgs/DisparityImage` (권장)
+  * `~/depth` : `sensor_msgs/Image` (`32FC1`, meters, invalid=NaN)
+* 설계: **이미지 pair는 계속 최신으로 저장**, **timer에서 지정한 output_hz(기본 10Hz)** 로만 SGBM 계산 → CPU 부하/지터 관리가 쉬움
 
 ---
 
-stereo_sgbm_depth_node.py
+## `stereo_sgbm_depth_node.py`
 
+```python
 #!/usr/bin/env python3
 import math
 import numpy as np
@@ -333,14 +328,15 @@ def main():
 
 if __name__ == '__main__':
     main()
-
+```
 
 ---
 
-실행 예시
+## 실행 예시
 
 토픽 이름이 다르면 파라미터로 바꿔서 실행하면 돼.
 
+```bash
 ros2 run <your_pkg> stereo_sgbm_depth_node \
   --ros-args \
   -p left_image_topic:=/stereo/left/image_rect \
@@ -351,39 +347,30 @@ ros2 run <your_pkg> stereo_sgbm_depth_node \
   -p num_disparities:=128 \
   -p block_size:=5 \
   -p scale:=1.0
+```
 
-10Hz가 빡빡하면(CPU 여유 없으면) 이렇게:
+### 10Hz가 빡빡하면(CPU 여유 없으면) 이렇게:
 
-scale=0.8 또는 0.5 로 내리면 성능이 확 좋아져요.
+* **scale=0.8** 또는 **0.5** 로 내리면 성능이 확 좋아져요.
 
-
+```bash
 -p scale:=0.5
-
+```
 
 ---
 
-바로 튜닝 추천 (SVGA / depth 10Hz 목표)
+## 바로 튜닝 추천 (SVGA / depth 10Hz 목표)
 
-1차 목표(10Hz 달성): scale=0.5 + num_disparities=96~128 + block_size=5
-
-품질 올리기: scale=0.8 또는 1.0으로 올리되 num_disparities는 필요한 만큼만 유지
-
-“가까운 물체 위주”면 num_disparities를 줄이는 게 가장 큰 속도 이득이에요.
-
-
+* **1차 목표(10Hz 달성)**: `scale=0.5` + `num_disparities=96~128` + `block_size=5`
+* **품질 올리기**: `scale=0.8` 또는 `1.0`으로 올리되 `num_disparities`는 필요한 만큼만 유지
+* “가까운 물체 위주”면 `num_disparities`를 줄이는 게 가장 큰 속도 이득이에요.
 
 ---
 
 원하면 다음도 바로 붙여줄게:
 
-1. PointCloud2 생성(깊이 + 카메라 모델)
+1. **PointCloud2** 생성(깊이 + 카메라 모델)
+2. (선택) **WLS 후처리** 옵션까지 포함한 버전(품질↑, CPU↑)
+3. RViz2에서 depth 확인용 **컬러화(Colormap) 이미지 토픽** 추가
 
-
-2. (선택) WLS 후처리 옵션까지 포함한 버전(품질↑, CPU↑)
-
-
-3. RViz2에서 depth 확인용 컬러화(Colormap) 이미지 토픽 추가
-
-
-
-지금 카메라 토픽 프레임 이름(예: left_camera_frame)이랑, baseline이 대략 몇 cm인지(알면) 알려주면 파라미터도 더 딱 맞게 잡아줄 수 있어요.
+지금 카메라 토픽 프레임 이름(예: `left_camera_frame`)이랑, baseline이 대략 몇 cm인지(알면) 알려주면 파라미터도 더 딱 맞게 잡아줄 수 있어요.
