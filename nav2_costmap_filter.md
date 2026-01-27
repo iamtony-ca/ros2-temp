@@ -938,3 +938,386 @@ def generate_launch_description():
 4. **`bringup_launch.py`**: `costmap_filter.launch.py`를 Include 했나요?
 
 이렇게 4가지만 확인하면 끝입니다. 그대로 실행하시면 됩니다!
+#################################  
+###################################3  
+######################################3  
+260127  
+`bringup_launch.py`를 수정하여, 터미널에서 `filter_map:=/path/to/filter.yaml`과 같이 인자를 입력받았을 때만 `costmap_filter.launch.py`를 실행하도록 만드는 방법입니다.
+
+**핵심 변경 사항:**
+
+1. **Launch Configuration 추가:** `filter_map` 변수 선언.
+2. **DeclareLaunchArgument 추가:** `filter_map` 인자 정의 (기본값은 빈 문자열 `''`).
+3. **IncludeLaunchDescription 추가:** `filter_map`이 비어있지 않을 때만(`IfCondition`) 필터 런치 파일을 실행하도록 설정.
+
+---
+
+### [수정된 파일] `nav2_bringup/launch/bringup_launch.py`
+
+주석으로 **`# [수정]`** 및 **`# [추가]`** 라고 표시된 부분을 확인하세요.
+
+```python
+# Copyright (c) 2018 Intel Corporation
+# ... (라이선스 생략) ...
+
+import os
+
+from ament_index_python.packages import get_package_share_directory
+
+from launch import LaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    GroupAction,
+    IncludeLaunchDescription,
+    SetEnvironmentVariable,
+)
+from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch_ros.actions import Node
+from launch_ros.actions import PushROSNamespace
+from launch_ros.descriptions import ParameterFile
+from nav2_common.launch import ReplaceString, RewrittenYaml
+
+
+def generate_launch_description():
+    # Get the launch directory
+    bringup_dir = get_package_share_directory('nav2_bringup')
+    launch_dir = os.path.join(bringup_dir, 'launch')
+
+    # Create the launch configuration variables
+    namespace = LaunchConfiguration('namespace')
+    use_namespace = LaunchConfiguration('use_namespace')
+    slam = LaunchConfiguration('slam')
+    map_yaml_file = LaunchConfiguration('map')
+    use_sim_time = LaunchConfiguration('use_sim_time')
+    params_file = LaunchConfiguration('params_file')
+    autostart = LaunchConfiguration('autostart')
+    use_composition = LaunchConfiguration('use_composition')
+    use_respawn = LaunchConfiguration('use_respawn')
+    log_level = LaunchConfiguration('log_level')
+    use_localization = LaunchConfiguration('use_localization')
+    
+    # [추가] filter_map 설정 변수 (터미널 입력값을 받음)
+    filter_map_yaml_file = LaunchConfiguration('filter_map')
+
+    # Map fully qualified names to relative ones so the node's namespace can be prepended.
+    remappings = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
+
+    # ... (중략: params_file 처리 로직 등 기존 코드 유지) ...
+
+    stdout_linebuf_envvar = SetEnvironmentVariable(
+        'RCUTILS_LOGGING_BUFFERED_STREAM', '1'
+    )
+
+    declare_namespace_cmd = DeclareLaunchArgument(
+        'namespace', default_value='', description='Top-level namespace'
+    )
+
+    declare_use_namespace_cmd = DeclareLaunchArgument(
+        'use_namespace',
+        default_value='false',
+        description='Whether to apply a namespace to the navigation stack',
+    )
+
+    declare_slam_cmd = DeclareLaunchArgument(
+        'slam', default_value='False', description='Whether run a SLAM'
+    )
+
+    declare_map_yaml_cmd = DeclareLaunchArgument(
+        'map', default_value='', description='Full path to map yaml file to load'
+    )
+    
+    # [추가] filter_map 인자 선언 (기본값은 빈 문자열)
+    declare_filter_map_yaml_cmd = DeclareLaunchArgument(
+        'filter_map', 
+        default_value='', 
+        description='Full path to filter map yaml file to load. If empty, filter is skipped.'
+    )
+
+    declare_use_localization_cmd = DeclareLaunchArgument(
+        'use_localization', default_value='True',
+        description='Whether to enable localization or not'
+    )
+
+    declare_use_sim_time_cmd = DeclareLaunchArgument(
+        'use_sim_time',
+        default_value='false',
+        description='Use simulation (Gazebo) clock if true',
+    )
+
+    declare_params_file_cmd = DeclareLaunchArgument(
+        'params_file',
+        default_value="/root/amr_ws/src/navigation2/nav2_bringup/params/nav2_params.yaml",
+        description='Full path to the ROS2 parameters file to use for all launched nodes',
+    )
+
+    declare_autostart_cmd = DeclareLaunchArgument(
+        'autostart',
+        default_value='true',
+        description='Automatically startup the nav2 stack',
+    )
+
+    declare_use_composition_cmd = DeclareLaunchArgument(
+        'use_composition',
+        default_value='True',
+        description='Whether to use composed bringup',
+    )
+
+    declare_use_respawn_cmd = DeclareLaunchArgument(
+        'use_respawn',
+        default_value='False',
+        description='Whether to respawn if a node crashes. Applied when composition is disabled.',
+    )
+
+    declare_log_level_cmd = DeclareLaunchArgument(
+        'log_level', default_value='info', description='log level'
+    )
+
+    # Specify the actions
+    bringup_cmd_group = GroupAction(
+        [
+            PushROSNamespace(condition=IfCondition(use_namespace), namespace=namespace),
+            Node(
+                condition=IfCondition(use_composition),
+                name='nav2_container',
+                package='rclcpp_components',
+                executable='component_container_isolated',
+                parameters=[configured_params, {'autostart': autostart}],
+                arguments=['--ros-args', '--log-level', log_level],
+                remappings=remappings,
+                output='screen',
+            ),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(launch_dir, 'slam_launch.py')
+                ),
+                condition=IfCondition(PythonExpression([slam, ' and ', use_localization])),
+                launch_arguments={
+                    'namespace': namespace,
+                    'use_sim_time': use_sim_time,
+                    'autostart': autostart,
+                    'use_respawn': use_respawn,
+                    'params_file': params_file,
+                }.items(),
+            ),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(launch_dir, 'localization_launch.py')
+                ),
+                condition=IfCondition(PythonExpression(['not ', slam, ' and ', use_localization])),
+                launch_arguments={
+                    'namespace': namespace,
+                    'map': map_yaml_file,
+                    'use_sim_time': use_sim_time,
+                    'autostart': autostart,
+                    'params_file': params_file,
+                    'use_composition': use_composition,
+                    'use_respawn': use_respawn,
+                    'container_name': 'nav2_container',
+                }.items(),
+            ),
+            
+            # [추가] Costmap Filter 실행 부분
+            # filter_map 인자가 비어있지 않을 때만 실행 ('!= ''')
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(launch_dir, 'costmap_filter.launch.py')
+                ),
+                condition=IfCondition(PythonExpression(["'", filter_map_yaml_file, "' != ''"])),
+                launch_arguments={
+                    'namespace': namespace,
+                    'use_sim_time': use_sim_time,
+                    'autostart': autostart,
+                    'params_file': params_file,       # nav2_params.yaml 공유
+                    'mask': filter_map_yaml_file,     # 입력받은 yaml 경로 전달
+                    'use_composition': use_composition,
+                    'container_name': 'nav2_container', # bringup의 컨테이너 이름과 일치
+                }.items(),
+            ),
+
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(launch_dir, 'navigation_launch.py')
+                ),
+                launch_arguments={
+                    'namespace': namespace,
+                    'use_sim_time': use_sim_time,
+                    'autostart': autostart,
+                    'params_file': params_file,
+                    'use_composition': use_composition,
+                    'use_respawn': use_respawn,
+                    'container_name': 'nav2_container',
+                }.items(),
+            ),
+        ]
+    )
+
+    # Create the launch description and populate
+    ld = LaunchDescription()
+
+    # Set environment variables
+    ld.add_action(stdout_linebuf_envvar)
+
+    # Declare the launch options
+    ld.add_action(declare_namespace_cmd)
+    ld.add_action(declare_use_namespace_cmd)
+    ld.add_action(declare_slam_cmd)
+    ld.add_action(declare_map_yaml_cmd)
+    ld.add_action(declare_filter_map_yaml_cmd) # [추가] filter_map 인자 등록
+    ld.add_action(declare_use_sim_time_cmd)
+    ld.add_action(declare_params_file_cmd)
+    ld.add_action(declare_autostart_cmd)
+    ld.add_action(declare_use_composition_cmd)
+    ld.add_action(declare_use_respawn_cmd)
+    ld.add_action(declare_log_level_cmd)
+    ld.add_action(declare_use_localization_cmd)
+
+    # Add the actions to launch all of the navigation nodes
+    ld.add_action(bringup_cmd_group)
+
+    return ld
+
+```
+
+### 실행 방법
+
+이제 다음과 같이 두 가지 방식으로 실행할 수 있습니다.
+
+**1. 필터 적용 시 (중앙 분리대 사용):**
+
+```bash
+ros2 launch nav2_bringup bringup_launch.py map:=/path/to/map.yaml filter_map:=/path/to/median_mask.yaml
+
+```
+
+-> `filter_map` 인자가 있으므로 `costmap_filter.launch.py`가 실행되어 필터가 적용됩니다.
+
+**2. 필터 미적용 시 (일반 주행):**
+
+```bash
+ros2 launch nav2_bringup bringup_launch.py map:=/path/to/map.yaml
+
+```
+
+-> `filter_map` 인자가 없으므로(기본값 `''`), `IfCondition`에 의해 필터 관련 노드는 실행되지 않습니다.
+########################  
+###########################3  
+###########################33  
+260127  
+네, 가능합니다.
+
+사용자가 `filter_map:=median_mask.yaml` 처럼 **파일명만 입력**했을 때, 시스템이 자동으로 **"아, 이건 `maps` 폴더 안에 있는 파일이구나"**라고 인식해서 경로를 합쳐주도록 만들면 됩니다.
+
+동시에 `/home/user/.../mask.yaml` 처럼 **절대 경로**를 입력했을 때도 여전히 작동하도록 만드는 것이 가장 좋은 방법입니다.
+
+이를 위해 `PythonExpression`을 사용하여 **"입력된 값이 `/`로 시작하면 그대로 쓰고, 아니면 `maps` 폴더 경로를 앞에 붙여라"**라는 로직을 추가하겠습니다.
+
+---
+
+### [수정된 파일] `nav2_bringup/launch/bringup_launch.py`
+
+**수정 포인트:**
+
+1. `maps` 폴더의 경로(`map_dir`)를 미리 정의합니다.
+2. `PythonExpression`을 이용해 경로를 자동으로 완성하는 변수(`final_filter_mask_path`)를 만듭니다.
+3. `IncludeLaunchDescription`에서 `mask` 인자로 원본 변수 대신 **완성된 변수**를 넘겨줍니다.
+
+```python
+# ... (상단 import 생략) ...
+# [추가] os 모듈이 필요하므로 import 확인
+import os 
+
+def generate_launch_description():
+    # Get the launch directory
+    bringup_dir = get_package_share_directory('nav2_bringup')
+    launch_dir = os.path.join(bringup_dir, 'launch')
+    
+    # [추가] 맵 파일들이 위치한 기본 폴더 지정
+    # 사용자가 파일명만 입력하면 이 경로에서 파일을 찾습니다.
+    # (본인의 패키지 구조에 맞게 'maps' 폴더명을 확인하세요)
+    map_dir = os.path.join(bringup_dir, 'maps') 
+
+    # ... (기존 변수 선언 생략) ...
+    
+    # [기존 유지] 터미널에서 입력받는 변수 (파일명 or 절대경로)
+    filter_map_yaml_file = LaunchConfiguration('filter_map')
+
+    # [신규] 경로 자동 완성 로직
+    # 1. 입력값이 '' (빈 값)이거나 '/'로 시작하면 -> 그대로 사용 (절대경로 or 미사용)
+    # 2. 그 외(파일명만 입력) -> map_dir + '/' + 파일명
+    final_filter_mask_path = PythonExpression([
+        "'", filter_map_yaml_file, "' if '", filter_map_yaml_file, "'.startswith('/') or '", filter_map_yaml_file, "' == '' ",
+        "else '", map_dir, "/' + '", filter_map_yaml_file, "'"
+    ])
+
+    # ... (중략) ...
+
+    # [기존 유지] filter_map 인자 선언
+    declare_filter_map_yaml_cmd = DeclareLaunchArgument(
+        'filter_map', 
+        default_value='', 
+        description='Filename (in maps folder) or Full path to filter map yaml file.'
+    )
+
+    # ... (중략) ...
+
+    # Specify the actions
+    bringup_cmd_group = GroupAction(
+        [
+            # ... (기존 노드들) ...
+            
+            # [수정] Costmap Filter 실행 부분
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(launch_dir, 'costmap_filter.launch.py')
+                ),
+                # 조건문: 원본 입력값이 비어있지 않을 때만 실행
+                condition=IfCondition(PythonExpression(["'", filter_map_yaml_file, "' != ''"])),
+                launch_arguments={
+                    'namespace': namespace,
+                    'use_sim_time': use_sim_time,
+                    'autostart': autostart,
+                    'params_file': params_file,
+                    
+                    # [핵심 수정] 원본(filter_map_yaml_file) 대신 계산된 경로(final_filter_mask_path)를 전달
+                    'mask': final_filter_mask_path,     
+                    
+                    'use_composition': use_composition,
+                    'container_name': 'nav2_container',
+                }.items(),
+            ),
+
+            # ... (기존 Navigation 실행 부분) ...
+        ]
+    )
+
+    # ... (하단 ld.add_action 부분 유지) ...
+
+    return ld
+
+```
+
+### 적용 후 실행 방법
+
+이제 두 가지 방법 모두 가능합니다.
+
+**1. 간편하게 파일명만 입력 (추천)**
+
+* 전제조건: `median_mask.yaml` 파일이 `nav2_bringup/maps/` 폴더 안에 있어야 함.
+
+```bash
+ros2 launch nav2_bringup bringup_launch.py map:=/path/to/map.yaml filter_map:=median_mask.yaml
+
+```
+
+**2. 다른 경로에 있는 파일 입력 (기존 방식)**
+
+* 절대 경로(`/`)로 시작하면 자동으로 인식합니다.
+
+```bash
+ros2 launch nav2_bringup bringup_launch.py map:=/path/to/map.yaml filter_map:=/home/user/temp/test_mask.yaml
+
+```
+
+이 방식을 사용하면 매번 긴 경로를 타이핑할 필요 없이 훨씬 편하게 필터를 적용할 수 있습니다.
