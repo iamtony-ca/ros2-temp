@@ -80,3 +80,91 @@ echo 'export https_proxy="http://12.26.204.100:8080/"' >> ~/.bashrc
 source ~/.bashrc
 
 ```
+#######################  
+###########################  
+############################  
+상황이 진전되었습니다! **"IP: 12.26.204.100 8080"** 에러 메시지가 떴다는 것은, 이제 **Proxy 서버까지는 도달했다**는 뜻입니다.
+
+다만, 회사 Proxy 서버가 HTTPS 통신을 중간에서 복호화/재암호화(Man-in-the-Middle)하고 있는데, `sudo apt` 명령어가 이 **회사 보안 인증서(Samsung CA)를 신뢰하지 않아서** 연결을 끊어버린 것입니다.
+
+두 가지 해결 방법이 있습니다. (보안이 중요한 사내망이므로 **방법 1**을 먼저 시도하여 되는지 보고, 영구 적용은 **방법 2**로 하세요.)
+
+---
+
+### 방법 1: SSL 인증서 검증 무시 (가장 확실하고 빠른 방법)
+
+사내망(Intranet)은 이미 신뢰할 수 있는 네트워크이므로, `apt`가 인증서를 깐깐하게 검사하지 않도록 옵션을 추가합니다.
+
+아래 명령어를 **한 줄로** 입력해보세요. (`Verify-Peer=false` 옵션 추가)
+
+```bash
+sudo apt -o Acquire::http::proxy="http://12.26.204.100:8080/" \
+         -o Acquire::https::proxy="http://12.26.204.100:8080/" \
+         -o Acquire::https::Verify-Peer=false \
+         -o Acquire::https::Verify-Host=false \
+         update
+
+```
+
+**이 명령어가 성공한다면?**
+매번 이렇게 칠 수 없으니, 설정 파일에 영구적으로 박아넣어야 합니다. **방법 2**를 진행하세요.
+
+---
+
+### 방법 2: 설정 파일(`/etc/apt/apt.conf.d/05proxy`) 수정
+
+아까 만드신 `05proxy` 파일에 SSL 검증 무시 옵션을 추가하고, 혹시 모를 문법 오류를 수정합니다.
+
+1. 파일 열기:
+```bash
+sudo gedit /etc/apt/apt.conf.d/05proxy
+
+```
+
+
+(또는 `nano`, `vi` 사용)
+2. **기존 내용을 다 지우고** 아래 내용으로 덮어씌우세요. (세미콜론 `;` 필수)
+```text
+Acquire::http::proxy "http://12.26.204.100:8080/";
+Acquire::https::proxy "http://12.26.204.100:8080/";
+Acquire::ftp::proxy "ftp://12.26.204.100:8080/";
+Acquire::socks::proxy "socks://12.26.204.100:8080/";
+Acquire::https::Verify-Peer "false";
+Acquire::https::Verify-Host "false";
+
+```
+
+
+3. 저장 후 다시 `admin` 계정에서 테스트:
+```bash
+sudo apt update
+
+```
+
+
+
+---
+
+### 방법 3: 인증서 재등록 (방법 1, 2가 찜찜할 경우)
+
+만약 "나는 보안상 검증을 끄기 싫다"고 하시면, 인증서가 시스템에 제대로 등록되지 않은 것입니다. `admin` 계정에서도 시스템 전역 인증서를 다시 로드해 봅니다.
+
+1. 인증서 포맷 변환 및 이동 (확실하게 하기 위해):
+```bash
+# samsung_semi.crt 파일이 있는 곳에서 실행
+sudo cp samsung_semi.crt /usr/local/share/ca-certificates/samsung_semi.crt
+
+```
+
+
+2. 인증서 갱신 (강제 적용):
+```bash
+sudo update-ca-certificates --fresh
+
+```
+
+
+*결과 메시지에 `1 added` (또는 그 이상)가 나오는지 확인해야 합니다.*
+3. 그 후 다시 `sudo apt update` 시도.
+
+하지만, **Jetson/Ubuntu 환경의 사내망에서는 `방법 2` (Verify-Peer false)가 정신 건강에 가장 좋습니다.** 회사 Proxy 인증서 갱신 주기마다 문제가 생길 수 있기 때문입니다.
