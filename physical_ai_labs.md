@@ -130,4 +130,24 @@ https://youngwoon.github.io/
 
 https://bi.snu.ac.kr/
 
+#####################################33  ###############################3  
+##########################################################################  
+좋아. 부서원들과 공유하기 좋게 **4개 랩을 한 표로** 정리했어(필요한 정보는 각 랩 공식 페이지 기준).
+
+| 학교    | 랩 / PI                                                          | 소속(학과/스쿨)                                                     | 핵심 키워드(공식 소개 기준)                                                                                                                                                | 휴머노이드/듀얼암·E2E 적합도                                                                                                             | 산학 PoC 아이디어(예시)                                                                                                                                       |
+| ----- | --------------------------------------------------------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| KAIST | **CLVR Lab** (Joseph J. Lim, 임재환)                               | KAIST (교수 페이지에 **Kim Jaechul School of AI**로 명시) ([CLVR][1])  | **Reinforcement Learning, Robot Learning, World Model/Representation Learning, Visual Perception, Symbolic Manipulation** ([CLVR][2])                           | **중~상**: “Perception–Action–Reasoning로 sequential decision” 중심이라 **장기/복합 조작(계획+실행)** 설계에 강점 ([CLVR][2])                       | (1) **Long-horizon 조립/삽입**: 고수준 계획+저수준 스킬 학습 (2) **스킬 조합형 조작**: subtask decomposition + skill policy(IL/RL)                                           |
+| KAIST | **RIRO Lab** (Daehyung Park, 박대형)                               | **School of Computing** (GSAI 겸임 표기) ([rirolab.github.io][3]) | **Mobile manipulation**, semantic learning & reasoning, **IRL**, task-and-motion planning, **HRI**, **natural language understanding** ([rirolab.github.io][3]) | **상**: “실로봇이 사람과 협업” + **언어/계획/학습/실행**을 한 축으로 명시. 듀얼암·모바일 매니퓰레이션 산학 PoC에 매우 적합 ([rirolab.github.io][3])                       | (1) **Language-conditioned mobile manipulation** (2) **Handover/협동 조작**(dual-arm/협동로봇) (3) **VR/Teleop 데모 수집→IL**(변형물/조작 포함) ([rirolab.github.io][4]) |
+| 연세대   | **Yonsei RL & Robot Learning Lab (RLLAB)** (Youngwoon Lee, 이영운) | 연세대 **AI/첨단컴퓨팅** 연구실 목록에 공식 등재 ([연세대학교 첨단컴퓨팅학부][5])           | **Reinforcement Learning, Imitation Learning, Generative Modeling, Robotics** ([youngwoon.github.io][6])                                                        | **상**: 로봇 실세계 task + IL/생성모델 축이 뚜렷하고, 뉴스/활동에서 **whole-body / bimanual** 관련 워크숍·벤치마크 언급이 있어 방향성이 강함 ([youngwoon.github.io][6]) | (1) **데이터 효율 듀얼암 조작(조립/정렬/삽입)**: 데모 20/50/100개 스케일 성능곡선 (2) **Generative policy 기반 E2E**(시각→행동)                                                       |
+| 서울대   | **SNU Biointelligence Lab** (Byoung-Tak Zhang, 장병탁)             | SNU **컴퓨터공학부(CSE)** 소속으로 명시 ([bi.snu.ac.kr][7])               | **Embodied AI**, **Multimodal AI(vision-language-action 통합)**, sensorimotor learning, grounded reasoning, lifelong adaptation ([bi.snu.ac.kr][7])               | **중~상**: “VLA 통합 + Embodied AI”를 공식 미션으로 명시. 로봇 **E2E 정책**도 가능하지만, 강점은 **VLA/멀티모달 추론·표현**을 로봇 행동으로 연결하는 쪽 ([bi.snu.ac.kr][7]) | (1) **VLA 기반 task specification**(언어 지시→행동) (2) **멀티모달(비전+언어+행동) 데이터/모델** 공동개발 (3) 현장 시나리오에서 **grounded reasoning + 실행 안정화**                          |
+
+원하면, 이 표를 더 “보고서/메일용”으로 쓰기 좋게 **열을 추가**해서(예: *연락 포인트/협력 형태(위탁·공동·과제)/빠른 PoC 기간/필요 장비*) 깔끔하게 확장해줄게.
+
+[1]: https://clvrai.com/web_lim/?utm_source=chatgpt.com "Joseph Lim's Home Page - CLVR Lab"
+[2]: https://www.clvrai.com/ "CLVR"
+[3]: https://rirolab.github.io/ "Robust Intelligence and Robotics Laboratory"
+[4]: https://rirolab.github.io/publication/domestic/?utm_source=chatgpt.com "Publications"
+[5]: https://cais.yonsei.ac.kr/csai_en/researchAll.do?utm_source=chatgpt.com "Research Labs | All"
+[6]: https://youngwoon.github.io/ "RLLAB @ Yonsei"
+[7]: https://bi.snu.ac.kr/ "SNU Biointelligence Lab"
 
