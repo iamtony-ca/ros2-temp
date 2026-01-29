@@ -214,3 +214,32 @@ https://bi.snu.ac.kr/
 * **휴머노이드까지 포함한 end-to-end(계층형 포함)로 “바퀴 교체”를 가장 정면으로 밀기 좋은 1순위**는 **KAIST RIRO**야. (토픽 페이지에서 휴머노이드 전신 조작 + IL/RL + LLM/VLA 계획을 한 덩어리로 명시)
 
 원하면, 위 “1순위(리로)”로 컨택할 때 바로 붙일 수 있게 **바퀴 교체 태스크를 8~10개 서브태스크로 분해한 PoC 스펙(성공지표/데이터 계획/안전 제약 포함) 1페이지**도 같이 만들어줄게.
+#####################  
+#########################  
+###########################  
+좋아—오성희 교수님 RLLAB(SNU) 연구/프로젝트 페이지를 웹에서 확인해서, 기존 표와 같은 기준(키워드·연구축·바퀴교체 적합도·리스크·순위)으로 한 줄 추가해 업데이트할게.
+
+
+아래는 **서울대 오성회( Songhwai Oh ) 교수님 RLLAB**을 포함해 **5개 랩**으로 확장한 표야.
+참고로 사용자가 주신 `rllab.snu.ac.kr/research`는 제 쪽에서 접속이 간헐적으로 타임아웃이 나서(페이지 자체는 검색엔 잡힘), **같은 공식 도메인의 PI/랩 소개 + SNU ECE 공식 연구그룹 페이지 + RLLAB publications/software 페이지**를 근거로 정리했어. 
+
+> 태스크: **듀얼암/휴머노이드가 다른 로봇의 바퀴를 교체(분해→정렬→체결)하는 장기·접촉-rich 작업** 기준
+
+| 학교     | 랩 / PI                                                   | 소속(학과/스쿨)                                                | 핵심 키워드(공식 소개 기준)                                                                        | 대표 연구축                                                                                                                                        | 휴머노이드/듀얼암·E2E/VLA/IL 적합도                                                                                      | 리스크                                                                                            | 추천도 순위 |
+| ------ | -------------------------------------------------------- | -------------------------------------------------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ------ |
+| KAIST  | **RIRO Lab / Daehyung Park**                             | **School of Computing**                                  | **Humanoid whole-body manipulation**, **policy learning(IL/RL)**, **LLM/VLA 기반 계획**     | 휴머노이드 전신 조작 + IL/RL + LLM/VLA 계획을 한 프레임으로 명시                                                                                                  | **매우 높음**                                                                                                     | 휴머노이드 실물 PoC는 안전/데이터/하드웨어 리스크 큼 → 단계적 스코프(듀얼암→휴머노이드) 설계 필요                                     | **1**  |
+| Yonsei | **RL & Robot Learning Lab / Youngwoon Lee**              | (연세대) RLLAB 사이트/퍼블리케이션 기반                                | **RL, Imitation Learning, Generative modeling, Robotics**                               | **TwinVLA** 등: single-arm VLA를 조합해 **bimanual(듀얼암) VLA**로 확장                                                                                  | **높음** (듀얼암 + VLA/IL에 직접 연결)                                                                                  | 바퀴 교체는 토크/접촉 제약이 커서 비전 중심 E2E만으로는 한계 가능 → 힘/토크/안전 제약 통합 설계 필요                                  | **2**  |
+| KAIST  | **CLVR Lab / (KAIST) Joseph J. Lim 그룹**                  | KAIST (Publications 페이지 기반)                              | (페이지에 드러난 축) 조작 학습, 대규모 데이터, 오프라인 스킬/언어 신호                                              | **FurnitureBench/가구 조립**, **DROID/RT-X류 대규모 조작 데이터**, **PATO(teleop 지원)**, **EXTRACT(오프라인 스킬 추출)**, **ReWiND/SPRINT(언어 기반 학습 신호)**            | **중~높음** (조립형 장기 시퀀스 + 데이터/스킬 재사용에 강함)                                                                        | “휴머노이드/듀얼암 플랫폼”을 전면에 명시하기보단 데이터/학습 축이 강함 → 하드웨어(공구/토크) 통합은 공동 설계가 필요                           | **3**  |
+| SNU    | **Biointelligence Lab / Byoung-Tak Zhang**               | **SNU CSE**                                              | **Embodied AI**, **vision-language-action 통합**, grounded reasoning, lifelong adaptation | 프로젝트에 **Embodied AI(로봇 파운데이션 모델)**, **arm manipulation**, **언어 기반 평생학습**, **Alchemist(휴머노이드 역량)** 등을 명시                                       | **중~높음** (VLA/추론+행동 통합 “시스템”에 매우 강함)                                                                          | “바퀴 교체”처럼 공구·체결 중심 공정은 접촉/토크가 승부처 → VLA/추론 강점을 **현장 실행 안정화**로 연결하는 PoC 설계가 중요                  | **4**  |
+| SNU    | **Robot Learning Laboratory (RLLAB) / Songhwai Oh(오성회)** | **SNU ECE(전기·컴퓨터공학부)** 공식 연구그룹에 등재 ([서울대학교 전기·정보공학부][1]) | robotics + computer vision + machine learning ([rllab.snu.ac.kr][2])                    | publications/software에서 **Learning from Demonstrations/Behavior Cloning/Inverse RL**, 로봇 그라스핑·비주얼 플래닝, 모방학습 관련 항목이 확인됨 ([rllab.snu.ac.kr][3]) | **중간** (IL/RL 기반 “로봇학습” 역량은 강하지만, 이 페이지 근거로는 VLA·듀얼암/휴머노이드·E2E 조작을 전면에 내세우는 형태는 덜 명시적) ([rllab.snu.ac.kr][4]) | 바퀴 교체는 듀얼암/전신+툴링이 핵심인데, 공개 페이지 근거만으로는 해당 플랫폼/조작 파이프라인이 확정적이지 않음 → 미팅에서 최근 조작/매니퓰레이션 프로젝트 확인 필요 | **5**  |
+
+### 1개만 뽑아야 한다면(현재 정보 기준)
+
+* **RIRO(1순위)**: “휴머노이드 전신 조작 + IL/RL + LLM/VLA 계획”을 **토픽 페이지에 명시**해서, 바퀴 교체 같은 **현장형 장기·접촉 task**에 가장 정면으로 맞아.
+
+원하면, “바퀴 교체”를 **8~10개 서브태스크**로 분해해서(볼트 접근/툴 그립/풀기/정렬/체결/검증/실패복구), RIRO에 보내기 좋은 **PoC 1페이지 제안서(기간·데이터·KPI·안전 포함)** 형태로 바로 만들어줄게.
+
+[1]: https://ece.snu.ac.kr/en/research-faculty/research/groups?labidx=66&md=view&utm_source=chatgpt.com "Robot Learning Laboratory - Research Groups - Faculty & ..."
+[2]: https://rllab.snu.ac.kr/people/songhwai-oh?utm_source=chatgpt.com "Songhwai Oh"
+[3]: https://rllab.snu.ac.kr/software?utm_source=chatgpt.com "Software from RLLAB — Robot Learning Laboratory"
+[4]: https://rllab.snu.ac.kr/publications?utm_source=chatgpt.com "Publications"
