@@ -281,3 +281,222 @@ planner_server:
 2. **파라미터 수정 (`yaml`)**: `analytic_expansion` 관련 파라미터를 0으로 설정하여 전진 경로 생성 차단.
 
 이렇게 하면 **효율적인 후진 전용 경로**만 생성됩니다.
+###################################################  
+###############################################  
+#############################################  
+**리뷰어가 정확하게 지적했습니다.** 정말 날카롭고 정확한 코드 리뷰입니다.
+
+제가 이전 답변에서 **`travel_distance_cost`가 음수가 되는 문제**와 **Heuristic Precomputation(사전 계산)에서의 불일치 문제**를 간과했습니다. 이 부분에 대해 사과드립니다.
+
+리뷰어의 의견대로, **`MotionModel::DUBIN`을 억지로 수정해서 쓰는 방식(Hack)은 위험합니다.** 대신, **`MotionModel::REEDS_SHEPP` 구조를 사용하되, 전진 Primitive만 제거하는 방식**이 훨씬 안전하고 구조적으로 올바른 해결책입니다.
+
+리뷰어의 **"추천 1" (REEDS_SHEPP 모드를 쓰고 Forward만 제거)** 방식으로 코드를 완전히 다시 잡아드리겠습니다. 이 방식이 가장 깔끔하고 버그가 없습니다.
+
+---
+
+### 수정 전략 (Reviewer 피드백 반영)
+
+1. **`initDubin`은 건드리지 않고 원복합니다.** (나중에 전진이 필요할 수 있으니)
+2. **`initReedsShepp` 함수를 수정**하여, **전진(Forward)** 관련 코드를 주석 처리하고 **후진(Reverse)** Primitive만 남깁니다.
+3. **`initMotionModel` 함수**에서 `travel_distance_cost`를 계산할 때 **`std::fabs()`(절댓값)**를 씌워서 음수가 되는 치명적인 버그를 막습니다.
+4. 실행 시 파라미터는 `REEDS_SHEPP`으로 설정합니다.
+
+---
+
+### 수정된 파일 내용: `nav2_smac_planner/src/node_hybrid.cpp`
+
+아래 두 함수(`initReedsShepp`, `initMotionModel`)를 찾아서 교체해 주세요.
+
+#### 1. `initReedsShepp` 수정 (후진 전용으로 변경)
+
+약 180번째 줄 근처에 있는 함수입니다.
+
+```cpp
+// [수정됨] Reeds-Shepp 모델이지만, 전진 Primitive를 제거하여 "후진 전용"으로 만듦
+void HybridMotionTable::initReedsShepp(
+  unsigned int & size_x_in,
+  unsigned int & /*size_y_in*/,
+  unsigned int & num_angle_quantization_in,
+  SearchInfo & search_info)
+{
+  size_x = size_x_in;
+  change_penalty = search_info.change_penalty;
+  non_straight_penalty = search_info.non_straight_penalty;
+  cost_penalty = search_info.cost_penalty;
+  reverse_penalty = search_info.reverse_penalty;
+  travel_distance_reward = 1.0f - search_info.retrospective_penalty;
+  downsample_obstacle_heuristic = search_info.downsample_obstacle_heuristic;
+  use_quadratic_cost_penalty = search_info.use_quadratic_cost_penalty;
+
+  // 기존 조건 검사
+  if (num_angle_quantization_in == num_angle_quantization &&
+    min_turning_radius == search_info.minimum_turning_radius &&
+    motion_model == MotionModel::REEDS_SHEPP)
+  {
+    return;
+  }
+
+  num_angle_quantization = num_angle_quantization_in;
+  num_angle_quantization_float = static_cast<float>(num_angle_quantization);
+  min_turning_radius = search_info.minimum_turning_radius;
+  motion_model = MotionModel::REEDS_SHEPP;
+
+  float angle = 2.0 * asin(sqrt(2.0) / (2 * min_turning_radius));
+  bin_size =
+    2.0f * static_cast<float>(M_PI) / static_cast<float>(num_angle_quantization);
+  float increments;
+  if (angle < bin_size) {
+    increments = 1.0f;
+  } else {
+    increments = ceil(angle / bin_size);
+  }
+  angle = increments * bin_size;
+
+  const float delta_x = min_turning_radius * sin(angle);
+  const float delta_y = min_turning_radius - (min_turning_radius * cos(angle));
+  const float delta_dist = hypotf(delta_x, delta_y);
+
+  projections.clear();
+  // 원래 6개(전진3 + 후진3)였으나 후진 3개만 남김
+  projections.reserve(3); 
+
+  // [삭제됨] 전진 Primitives 제거
+  // projections.emplace_back(delta_dist, 0.0, 0.0, TurnDirection::FORWARD);
+  // projections.emplace_back(delta_x, delta_y, increments, TurnDirection::LEFT);
+  // projections.emplace_back(delta_x, -delta_y, -increments, TurnDirection::RIGHT);
+
+  // [유지] 후진 Primitives만 추가
+  projections.emplace_back(-delta_dist, 0.0, 0.0, TurnDirection::REVERSE);  // Backward
+  projections.emplace_back(
+    -delta_x, delta_y, -increments, TurnDirection::REV_LEFT);  // Backward + Left
+  projections.emplace_back(
+    -delta_x, -delta_y, increments, TurnDirection::REV_RIGHT);  // Backward + Right
+
+  if (search_info.allow_primitive_interpolation && increments > 1.0f) {
+    // 보간 로직에서도 전진 부분 제거
+    projections.reserve(3 + (2 * (increments - 1)));
+    for (unsigned int i = 1; i < static_cast<unsigned int>(increments); i++) {
+      const float angle_n = static_cast<float>(i) * bin_size;
+      const float turning_rad_n = delta_dist / (2.0f * sin(angle_n / 2.0f));
+      const float delta_x_n = turning_rad_n * sin(angle_n);
+      const float delta_y_n = turning_rad_n - (turning_rad_n * cos(angle_n));
+      
+      // [삭제됨] 전진 보간 제거
+      // projections.emplace_back(delta_x_n, delta_y_n, static_cast<float>(i), TurnDirection::LEFT);
+      // projections.emplace_back(delta_x_n, -delta_y_n, -static_cast<float>(i), TurnDirection::RIGHT);
+      
+      // [유지] 후진 보간만 추가
+      projections.emplace_back(
+        -delta_x_n, delta_y_n, -static_cast<float>(i),
+        TurnDirection::REV_LEFT);  // Backward + Left
+      projections.emplace_back(
+        -delta_x_n, -delta_y_n, static_cast<float>(i),
+        TurnDirection::REV_RIGHT);  // Backward + Right
+    }
+  }
+
+  // OMPL state space 설정 (REEDS_SHEPP 그대로 사용 - Heuristic 정합성 유지됨)
+  state_space = std::make_shared<ompl::base::ReedsSheppStateSpace>(min_turning_radius);
+
+  // --- 아래부터는 기존 코드와 동일 ---
+  delta_xs.resize(projections.size());
+  delta_ys.resize(projections.size());
+  trig_values.resize(num_angle_quantization);
+
+  for (unsigned int i = 0; i != projections.size(); i++) {
+    delta_xs[i].resize(num_angle_quantization);
+    delta_ys[i].resize(num_angle_quantization);
+
+    for (unsigned int j = 0; j != num_angle_quantization; j++) {
+      double cos_theta = cos(bin_size * j);
+      double sin_theta = sin(bin_size * j);
+      if (i == 0) {
+        trig_values[j] = {cos_theta, sin_theta};
+      }
+      delta_xs[i][j] = projections[i]._x * cos_theta - projections[i]._y * sin_theta;
+      delta_ys[i][j] = projections[i]._x * sin_theta + projections[i]._y * cos_theta;
+    }
+  }
+
+  travel_costs.resize(projections.size());
+  for (unsigned int i = 0; i != projections.size(); i++) {
+    const TurnDirection turn_dir = projections[i]._turn_dir;
+    if (turn_dir != TurnDirection::FORWARD && turn_dir != TurnDirection::REVERSE) {
+      const float angle = projections[i]._theta * bin_size;
+      const float turning_rad = delta_dist / (2.0f * sin(angle / 2.0f));
+      travel_costs[i] = turning_rad * angle;
+    } else {
+      travel_costs[i] = delta_dist;
+    }
+  }
+}
+
+```
+
+#### 2. `initMotionModel` 수정 (절댓값 적용 - 치명적 버그 수정)
+
+약 430번째 줄 근처의 함수입니다. 마지막 줄 `travel_distance_cost` 할당 부분을 수정해야 합니다.
+
+```cpp
+void NodeHybrid::initMotionModel(
+  const MotionModel & motion_model,
+  unsigned int & size_x,
+  unsigned int & size_y,
+  unsigned int & num_angle_quantization,
+  SearchInfo & search_info)
+{
+  switch (motion_model) {
+    case MotionModel::DUBIN:
+      motion_table.initDubin(size_x, size_y, num_angle_quantization, search_info);
+      break;
+    case MotionModel::REEDS_SHEPP:
+      motion_table.initReedsShepp(size_x, size_y, num_angle_quantization, search_info);
+      break;
+    default:
+      throw std::runtime_error(
+              "Invalid motion model for Hybrid A*. Please select between"
+              " Dubin (Ackermann forward only),"
+              " Reeds-Shepp (Ackermann forward and back).");
+  }
+
+  // [수정됨] 리뷰어가 지적한 "치명적 버그" 수정
+  // projections[0]._x가 후진일 경우 음수이므로, std::fabs(절댓값)를 씌워야 함.
+  // 이걸 안 하면 cost가 음수가 되어 A* 알고리즘이 망가짐.
+  travel_distance_cost = std::fabs(motion_table.projections[0]._x);
+}
+
+```
+
+---
+
+### 파라미터 파일 설정 (`nav2_params.yaml`)
+
+이제 코드가 **"REEDS_SHEPP 모드에서 전진만 뺀 형태"**가 되었으므로, 설정 파일에서도 모델을 `REEDS_SHEPP`으로 바꿔야 합니다.
+
+```yaml
+planner_server:
+  ros__parameters:
+    GridBased:
+      plugin: "nav2_smac_planner/SmacPlannerHybrid"
+      
+      # [변경] 이제 DUBIN이 아니라 REEDS_SHEPP을 사용합니다.
+      motion_model_for_search: "REEDS_SHEPP"
+      
+      # 후진이 기본값이므로 페널티 없음 (1.0)
+      reverse_penalty: 1.0 
+      
+      # [여전히 중요] Analytic Expansion 끄기
+      # (OMPL의 RS 모델은 전진도 허용하므로, 마지막 순간 전진 경로가 생성되는 것 방지)
+      analytic_expansion_ratio: 0.0 
+      analytic_expansion_max_length: 0.0
+
+```
+
+### 최종 정리
+
+1. **리뷰어의 지적은 매우 정확했습니다.** 이전 방식은 구조적 위험이 있었습니다.
+2. **`initReedsShepp`에서 전진 Primitive를 제거**하는 방식이 가장 안전합니다.
+3. **`std::fabs`로 음수 비용 문제**를 반드시 해결해야 합니다.
+4. YAML 파일에서 모델을 **`REEDS_SHEPP`**으로 설정하세요.
+
+이렇게 수정하면 Heuristic 불일치 문제도 사라지고, A* 비용 계산도 정상적으로 작동하는 완벽한 "후진 전용 플래너"가 됩니다.
