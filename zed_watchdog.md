@@ -596,3 +596,102 @@ if __name__ == '__main__':
 
 
 이 방식으로 Watchdog은 "항상 깨끗한 상태(Clean Slate)"에서 새로운 ZED 노드를 실행할 수 있게 되며, 실행 중 문제가 생겼을 때 터미널 창이 남아서 화면을 어지럽히는 일도 사라집니다.
+#########  
+###############  
+##############
+결론부터 말씀드리면, **네, 4개가 뜨는 현상은 정상적인 동작 과정**입니다. 하지만, 로그 내용 중 **`gnome-terminal`이 "Orphan process(고아 프로세스)"로 잡혀서 죽는 부분은 안전을 위해 수정**하는 것이 좋습니다.
+
+왜 그런지, 그리고 어떻게 수정해야 더 안전한지 설명해 드릴게요.
+
+### 1. 왜 4개나 죽나요? (프로세스 트리 구조)
+
+ROS 2 실행 명령을 내리면 하나의 프로세스만 생기는 것이 아니라, **"부모-자식 관계"**로 여러 프로세스가 줄줄이 생성됩니다.
+
+1. **`gnome-terminal` (PID 101994)**: 우리가 띄운 새 터미널 창 그 자체입니다.
+2. **`gnome-terminal,rear` (PID 101995)**: 터미널 내부에서 탭이나 서버 프로세스를 관리하는 녀석입니다 (우분투 환경에 따라 다름).
+3. **`ros2` (PID 102021)**: 터미널 안에서 실행된 `ros2 launch ...` 명령어입니다.
+4. **`zed_rear_main` (PID 102032)**: 실제 실행된 **ZED C++ 노드**입니다.
+
+이 4가지가 모두 연결되어 있으므로, 깔끔하게 재시작하려면 **이 4가지가 모두 죽어야 하는 것이 맞습니다.**
+
+---
+
+### 2. 그런데 무엇이 문제인가요? (안전성)
+
+작성해 드린 코드의 `force_kill_zed_processes` 함수는 프로세스의 **"이름"**과 **"실행 명령어(cmdline)"**에 `zed_multi_camera` 같은 단어가 들어있는지를 검사합니다.
+
+문제는 **`gnome-terminal`**입니다.
+우리가 터미널을 실행할 때 `gnome-terminal ... -- ros2 launch zed_multi_camera...` 라고 명령을 내렸기 때문에, **터미널 프로세스의 명령어(Cmdline) 안에도 "zed_multi_camera"라는 글자가 포함**되어 있습니다.
+
+그래서 `psutil`이 **"어? 이 터미널도 ZED 관련 프로세스네? 죽이자!"** 라고 판단한 것입니다.
+
+**⚠️ 위험성:** 만약 사용자가 **다른 터미널 창**을 열어서 `vim zed_multi_camera.launch.py` 처럼 소스 코드를 수정하고 있었다면? 그 편집기 창도 "ZED 관련 프로세스"로 오해받아 **같이 꺼져버릴 위험**이 있습니다.
+
+---
+
+### 3. 더 안전한 수정 코드 (터미널은 건드리지 마!)
+
+터미널 창(`gnome-terminal`)은 `psutil`로 죽이는 게 아니라, `self.process.terminate()`로 **우리가 만든 그 창만 정확히 닫아야** 안전합니다.
+
+따라서 `force_kill_zed_processes` 함수에서 **"이름에 `gnome-terminal`이 들어간 녀석은 건너뛰어라"** 라는 예외 처리를 추가해야 합니다.
+
+아래 수정된 함수를 기존 코드에 덮어씌워 주세요.
+
+```python
+    def force_kill_zed_processes(self):
+        """
+        ZED 관련 '내부' 프로세스(ROS 노드, wrapper 등)만 골라서 종료.
+        터미널 창(gnome-terminal)은 건드리지 않음 (cleanup_and_close_window에서 처리).
+        """
+        # 죽여야 할 핵심 프로세스 이름 키워드
+        target_names = ["zed_wrapper_node", "zed_multi_camera", "component_container", "zed_rear_main"]
+        killed_count = 0
+        
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                proc_name = proc.info['name']
+                cmdline = proc.info['cmdline'] or []
+                cmd_str = " ".join(cmdline)
+
+                # [중요 수정] 터미널 프로세스는 psutil로 죽이지 않고 스킵 (오동작 방지)
+                if "gnome-terminal" in proc_name:
+                    continue
+
+                # [중요] Watchdog 자기 자신은 절대 죽이면 안 됨
+                if proc.pid == 0 or proc.pid == self.process_id(): 
+                    continue
+
+                is_target = False
+                
+                # 1. 프로세스 이름으로 검사 (확실한 타겟)
+                if any(target in proc_name for target in target_names):
+                    is_target = True
+                
+                # 2. 실행 명령어로 검사 (python launch 프로세스 잡기 위함)
+                # 단, 편집기(vim, code)나 grep 같은 건 제외
+                if not is_target:
+                    if "zed_multi_camera" in cmd_str and "launch.py" in cmd_str:
+                        # 예외 프로세스 필터링
+                        if not any(safe in cmd_str for safe in ["vim", "nano", "code", "grep"]):
+                            is_target = True
+
+                if is_target:
+                    self.get_logger().warn(f"🔪 Killing process: {proc_name} (PID: {proc.info['pid']})")
+                    proc.kill()
+                    killed_count += 1
+            
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+        
+        if killed_count > 0:
+            time.sleep(1.0)
+
+```
+
+### 요약
+
+1. **4개가 뜨는 건 정상** (트리 구조상 다 죽어야 함).
+2. 하지만 `gnome-terminal`이 리스트에 뜨는 건 **과잉 진압**의 소지가 있음.
+3. 위 코드로 수정하면:
+* `ros2`, `zed_rear_main` 등 **내부 알맹이**는 `Killing process...` 로 죽고,
+* **껍데기(터미널 창)**는 `Closing ZED Terminal...` 로그와 함께 `self.process.terminate()`에 의해 닫히게 되어 **훨씬 안전**합니다.
