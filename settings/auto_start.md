@@ -156,3 +156,67 @@ gnome-terminal --title="Camera Node" -- bash -c "$ROS_SETUP; ros2 launch [pkg3] 
 3. **각 창마다 독립적 실행:** 이렇게 해야 각 터미널 창이 켜질 때마다 스스로 ROS 2 환경을 로드하고 노드를 실행하게 됩니다.
 
 이 방식으로 작성하시면 코드는 깔끔하게 유지하면서, 기능은 확실하게 보장할 수 있습니다.
+#####################  
+######################  
+#####################  
+결론부터 말씀드리면 **"먼저 환경(Source)을 불러오고, 그 뒤에 설정(Export)을 덮어쓰는 것"**이 가장 안전하고 일반적인 순서입니다.
+
+ROS 2의 `setup.bash` 스크립트들이 내부적으로 특정 변수를 초기화하거나 기본값으로 설정하는 경우가 간혹 있기 때문에, **나의 설정을 가장 마지막에 적용**하여 확실하게 효력을 발휘하게 하는 것이 좋습니다.
+
+추천하는 순서는 다음과 같습니다:
+
+1. `source /opt/ros/jazzy/setup.bash` (기반 환경 로드)
+2. `source ~/ros2_ws/install/setup.bash` (내 워크스페이스 로드)
+3. `export ...` (나만의 커스텀 설정 적용: Domain ID, RMW, Log Dir 등)
+
+---
+
+### 수정된 `start_ros.sh` 예시
+
+`.bashrc`에 있는 내용을 그대로 스크립트에 옮길 때, 아래와 같이 작성하시면 됩니다. (`ROS_LOG_DIR` 경로 등은 본인 환경에 맞게 확인해주세요.)
+
+```bash
+#!/bin/bash
+
+sleep 10
+
+# 1. 경로 변수 설정 (스크립트 내에서만 쓸 변수)
+# 주의: ROS_LOG_DIR 같은 경로는 '~' 대신 '/home/계정명' 또는 '$HOME'을 사용하는 것이 안전합니다.
+MY_DOMAIN_ID=30
+MY_RMW="rmw_cyclonedds_cpp"  # 예: rmw_cyclonedds_cpp 또는 rmw_fastrtps_cpp
+MY_LOG_DIR="$HOME/.ros/log_custom" # 원하는 로그 경로
+
+# 2. ROS_SETUP 문자열 하나에 명령어들을 순서대로 담습니다. (세미콜론으로 연결)
+# 순서: Source (Jazzy) -> Source (Workspace) -> Export (설정들)
+ROS_SETUP="source /opt/ros/jazzy/setup.bash; \
+           source ~/ros2_ws/install/setup.bash; \
+           export ROS_DOMAIN_ID=$MY_DOMAIN_ID; \
+           export RMW_IMPLEMENTATION=$MY_RMW; \
+           export ROS_LOG_DIR=$MY_LOG_DIR"
+
+# 3. 각 터미널 실행
+# 팁: 로그 디렉토리가 없다면 생성해주는 명령어도 포함하면 좋습니다. (mkdir -p $MY_LOG_DIR)
+mkdir -p $MY_LOG_DIR
+
+gnome-terminal -- bash -c "$ROS_SETUP; ros2 launch [pkg1] [launch1]; exec bash"
+sleep 5
+gnome-terminal -- bash -c "$ROS_SETUP; ros2 launch [pkg2] [launch2]; exec bash"
+
+```
+
+### 각 변수별 주의사항 (Checklist)
+
+1. **`ROS_DOMAIN_ID`**:
+* 가장 중요합니다. 이게 맞지 않으면 `node list`에 안 뜹니다.
+
+
+2. **`RMW_IMPLEMENTATION`**:
+* 보통 `rmw_cyclonedds_cpp`나 `rmw_fastrtps_cpp`를 쓰실 텐데, 이 변수가 설정된 상태에서 노드를 실행해야 해당 미들웨어(DDS)로 통신이 시작됩니다. 따라서 **반드시 `ros2 launch` 명령어보다 앞(왼쪽)에** 있어야 합니다. (위의 코드처럼 하면 됩니다.)
+
+
+3. **`ROS_LOG_DIR`**:
+* 이 경로가 **실제로 존재하는지** 확인해야 합니다. 만약 없는 폴더를 지정하면 ROS 2가 실행되면서 경고를 띄우거나 기본 경로로 돌아갈 수 있습니다. 위 코드처럼 `mkdir -p`를 한번 해주는 것이 안전합니다.
+
+
+
+이렇게 구성하면 `.bashrc`에 의존하지 않고도, 재부팅 시 항상 완벽하게 세팅된 환경에서 노드들이 실행됩니다.
