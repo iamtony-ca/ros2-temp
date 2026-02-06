@@ -104,3 +104,55 @@ sudo reboot
 3. 스크립트 내에서 ROS 2 `source`를 명시적으로 해주는 것이 안전하다.
 
 이 방식이 개발자님이 원하시는 "Display 상에 터미널 창 띄우기"를 가장 확실하게 보장합니다.
+########################  
+#######################  
+##########################  
+아니요, **그렇게 하면 작동하지 않을 가능성이 매우 높습니다.**
+
+이유는 **`gnome-terminal`이 실행하는 새 창은 `start_ros.sh`와는 완전히 분리된 "새로운 쉘(Shell)"이기 때문**입니다.
+
+1. 작성하신 `start_ros.sh` 파일 안에서 `source`를 하면, **현재 실행 중인 `start_ros.sh` 스크립트 안에서만** ROS 2 명령어를 알게 됩니다.
+2. 하지만 `gnome-terminal` 명령어로 **새로 띄운 창**은 부모 스크립트(`start_ros.sh`)의 환경 변수를 온전히 물려받지 못하거나, 초기화된 상태로 시작합니다.
+3. 결과적으로 새 창 안에서는 `ros2` 명령어를 찾지 못해 에러가 발생합니다.
+
+따라서, **각 터미널 창이 열릴 때마다 그 안에서 `source`를 수행하도록 명령어를 묶어줘야 합니다.**
+
+---
+
+### 수정된 코드 (가독성을 높인 버전)
+
+매번 긴 `source` 경로를 적는 것은 번거롭고 지저분하므로, **변수**를 활용해 깔끔하게 정리하는 방법을 추천합니다.
+
+```bash
+#!/bin/bash
+
+# 1. 부팅 안정화 대기
+sleep 10
+
+# 2. 공통으로 사용할 setup 명령어 문자열 정의
+# (주의: 이 변수는 단지 문자열일 뿐, 이 스크립트에서 실행되는 것은 아닙니다.)
+ROS_SETUP="source /opt/ros/jazzy/setup.bash; source ~/ros2_ws/install/setup.bash"
+
+# 3. 각 터미널 실행
+# "$ROS_SETUP" 변수가 확장되면서 각 터미널 내부에서 source가 실행됩니다.
+
+# 첫 번째 노드
+gnome-terminal --title="Nav2 Launch" -- bash -c "$ROS_SETUP; ros2 launch [pkg1] [launch1]; exec bash"
+sleep 5
+
+# 두 번째 노드
+gnome-terminal --title="Robot Control" -- bash -c "$ROS_SETUP; ros2 launch [pkg2] [launch2]; exec bash"
+sleep 5
+
+# 세 번째 노드
+gnome-terminal --title="Camera Node" -- bash -c "$ROS_SETUP; ros2 launch [pkg3] [launch3]; exec bash"
+
+```
+
+### 핵심 포인트
+
+1. **변수(`ROS_SETUP`) 사용:** `source` 명령어들을 문자열 변수에 담아두고, `gnome-terminal` 명령 안에서 `$ROS_SETUP`으로 불러와 실행합니다.
+2. **세미콜론(`;`) 연결:** 명령어들을 `;`로 연결해야 앞의 `source`가 끝나고 나서 뒤의 `ros2 launch`가 실행됩니다.
+3. **각 창마다 독립적 실행:** 이렇게 해야 각 터미널 창이 켜질 때마다 스스로 ROS 2 환경을 로드하고 노드를 실행하게 됩니다.
+
+이 방식으로 작성하시면 코드는 깔끔하게 유지하면서, 기능은 확실하게 보장할 수 있습니다.
