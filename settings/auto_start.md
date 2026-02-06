@@ -220,3 +220,83 @@ gnome-terminal -- bash -c "$ROS_SETUP; ros2 launch [pkg2] [launch2]; exec bash"
 
 
 이렇게 구성하면 `.bashrc`에 의존하지 않고도, 재부팅 시 항상 완벽하게 세팅된 환경에서 노드들이 실행됩니다.
+네, **CUDA 관련 환경변수도 반드시 추가**해주셔야 합니다.
+
+특히 `LD_LIBRARY_PATH`는 ROS 2 노드가 실행될 때, 시스템 라이브러리가 아닌 CUDA 12.6의 특정 라이브러리를 참조해야 한다면(예: ZED SDK, PyTorch, TensorRT 등 사용 시), 이 경로가 없으면 노드가 시작되자마자 `error while loading shared libraries` 에러를 뱉으며 죽을 수 있습니다.
+
+또한 **Docker 컨테이너**도 `gnome-terminal`을 통해 독립된 창으로 띄우면 됩니다.
+
+요청하신 내용을 모두 통합하여, **완벽한 `start_ros.sh` 스크립트**를 구성해 드립니다.
+
+### 통합된 `start_ros.sh`
+
+```bash
+#!/bin/bash
+
+# 1. 부팅 후 시스템 안정화 대기 (네트워크, Docker 데몬 등)
+sleep 10
+
+# ---------------------------------------------------------
+# 2. 환경 변수 및 Setup 정의 (한 줄로 길게 쓰기보다 변수로 정리)
+# ---------------------------------------------------------
+
+# 2-1. CUDA 설정 (User의 .bashrc 내용 반영)
+# export는 순서가 중요합니다. 기존 PATH 앞에 붙여야 우선순위를 가집니다.
+CUDA_SETUP="export PATH=/usr/local/cuda-12.6/bin:\$PATH; \
+            export LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:\$LD_LIBRARY_PATH"
+
+# 2-2. ROS 2 및 사용자 설정
+# ROS_DOMAIN_ID 등은 본인 환경에 맞게 숫자 변경하세요.
+MY_DOMAIN_ID=30
+MY_RMW="rmw_cyclonedds_cpp" 
+
+ROS_SETUP="source /opt/ros/jazzy/setup.bash; \
+           source ~/ros2_ws/install/setup.bash; \
+           export ROS_DOMAIN_ID=$MY_DOMAIN_ID; \
+           export RMW_IMPLEMENTATION=$MY_RMW"
+
+# 2-3. 최종 실행용 Setup 문자열 합치기 (CUDA -> ROS 순서 추천)
+FULL_SETUP="$CUDA_SETUP; $ROS_SETUP"
+
+# ---------------------------------------------------------
+# 3. 각 터미널 실행 (ROS 2 Launch + Docker)
+# ---------------------------------------------------------
+
+# [ROS Node 1]
+gnome-terminal --title="Nav2 Launch" -- bash -c "$FULL_SETUP; ros2 launch [pkg1] [launch1]; exec bash"
+sleep 3
+
+# [ROS Node 2]
+gnome-terminal --title="Control Node" -- bash -c "$FULL_SETUP; ros2 launch [pkg2] [launch2]; exec bash"
+sleep 3
+
+# [Docker Container]
+# docker start -ai는 해당 터미널을 점유하므로, 별도 setup 없이 바로 docker 명령만 수행해도 됩니다.
+# (단, 사용자가 docker group에 포함되어 sudo 없이 실행 가능해야 함)
+gnome-terminal --title="Docker Container" -- bash -c "docker start -ai [container_name]; exec bash"
+
+
+```
+
+---
+
+### 💡 주의사항 (Docker 관련)
+
+1. **Docker 권한:**
+* 스크립트가 `sudo` 없이 실행되므로, 현재 사용자 계정이 `docker` 그룹에 포함되어 있어야 합니다.
+* 확인: 터미널에 `docker ps` 쳤을 때 `permission denied`가 안 뜨면 OK.
+
+
+2. **Docker와 ROS_DOMAIN_ID:**
+* `docker start`는 **컨테이너를 처음 생성(`run`)했을 때의 환경 변수**를 그대로 사용합니다.
+* 만약 컨테이너 내부에서도 ROS 2 통신을 해야 한다면, 컨테이너를 처음 만들 때 `ROS_DOMAIN_ID=30`을 주입했거나, `--net=host` 모드로 생성했어야 Host의 ROS 노드들과 통신이 됩니다.
+* `docker start` 명령어 시점에는 `-e` 옵션으로 환경 변수를 바꿀 수 **없습니다.** (바꾸려면 `docker run`을 다시 하거나, 켜진 뒤 `docker exec`를 써야 함)
+
+
+
+### 요약
+
+* **CUDA 경로:** `FULL_SETUP` 변수 맨 앞에 넣어 ROS 실행 전에 로드되도록 했습니다.
+* **Docker:** 별도의 `gnome-terminal` 명령으로 분리하여 `start -ai`가 해당 창을 잡고 실행되도록 했습니다.
+
+이 스크립트로 `.desktop` 설정을 유지하시면, 부팅 후 **ROS 터미널들과 Docker 터미널이 촤라락 펼쳐지는** 환경을 구축하실 수 있습니다.
