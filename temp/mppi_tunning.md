@@ -206,23 +206,72 @@ bool Optimizer::fallback(bool fail) {
 ######################
 #########################
 ```cpp
+// [nav2_mppi_controller/src/optimizer.cpp]
+
+#include <cmath> // std::isnan, std::isinf 사용을 위해 필요
+
 void Optimizer::updateControlSequence()
 {
-  // ... (이전 코드)
-
-  auto && costs_normalized = costs_ - xt::amin(costs_, immediate);
-  auto && exponents = xt::eval(xt::exp(-1 / settings_.temperature * costs_normalized));
+  // 1. 기존 Critic 점수 계산 (costs_ 업데이트)
+  // ... (앞부분 동일) ...
+  // updateControlSequence 함수 내부 시작 부분에서 bounded_noises 계산 등은 그대로 둡니다.
   
-  // [수정 제안] 모든 exponents의 합이 0에 가까우면(모두 충돌이면) 강제로 분산을 시키거나 멈춰야 함
-  float exponent_sum = xt::sum(exponents, immediate)(); 
-  if (exponent_sum < 1e-6) {
-      RCLCPP_WARN(logger_, "All trajectories have high cost! Resetting weights to uniform.");
-      // 모든 가중치를 균등하게 1.0으로 강제 설정하여 NaN 방지
-      exponents.fill(1.0f); 
+  auto & s = settings_;
+  // (중략: noise에 의한 cost 계산 부분은 기존 코드 유지)
+  // xt::noalias(costs_) += ... 
+
+  // ==================== [수정된 NaN/Inf 방어 로직 시작] ====================
+
+  // 1. 최솟값(min_cost) 먼저 추출
+  float min_cost = xt::amin(costs_, immediate)();
+
+  // 2. [핵심] 최솟값이 이미 정상이 아니라면, 계산을 중단하고 정지해야 함.
+  // 모든 궤적이 충돌(Inf)하거나 계산 오류(NaN)인 경우입니다.
+  if (std::isinf(min_cost) || std::isnan(min_cost)) {
+    RCLCPP_WARN_THROTTLE(logger_, *parent_.lock()->get_clock(), 1000, 
+      "All trajectories have Infinite or NaN costs! Forcing stop.");
+    
+    // 강제로 정지 명령 생성
+    xt::noalias(control_sequence_.vx) = 0.0f;
+    xt::noalias(control_sequence_.wz) = 0.0f;
+    if (isHolonomic()) {
+      xt::noalias(control_sequence_.vy) = 0.0f;
+    }
+    return; // 더 이상 계산하지 않고 함수 종료
   }
 
-  auto && softmaxes = xt::eval(exponents / xt::sum(exponents, immediate)); // 여기서 0으로 나누면 NaN 발생
+  // 3. 정규화 (Normalization)
+  // min_cost가 정상(finite)이므로, 여기서 NaN이 발생할 확률은 매우 낮음
+  auto && costs_normalized = costs_ - min_cost;
+
+  // 4. 가중치 계산 (Exponentials)
+  // costs_normalized가 0 이상이므로, exp 결과는 0.0 ~ 1.0 사이가 됨
+  auto && exponents = xt::eval(xt::exp(-1.0f / s.temperature * costs_normalized));
+
+  // 5. 분모(Sum) 계산 및 0 방지
+  float exponent_sum = xt::sum(exponents, immediate)();
   
-  // ...
+  // 모든 가중치가 0에 수렴하는 경우 (Underflow 방지)
+  if (exponent_sum < 1e-6f) {
+     RCLCPP_WARN_THROTTLE(logger_, *parent_.lock()->get_clock(), 1000,
+       "Weight sum is too small (Underflow). Resetting to uniform distribution.");
+     exponents.fill(1.0f);
+     exponent_sum = exponents.size(); // 1.0 * batch_size
+  }
+
+  // 6. Softmax 적용
+  auto && softmaxes = exponents / exponent_sum;
+
+  // ==================== [수정된 로직 끝] ====================
+
+  auto && softmaxes_extened = xt::eval(xt::view(softmaxes, xt::all(), xt::newaxis()));
+
+  xt::noalias(control_sequence_.vx) = xt::sum(state_.cvx * softmaxes_extened, 0, immediate);
+  xt::noalias(control_sequence_.wz) = xt::sum(state_.cwz * softmaxes_extened, 0, immediate);
+  if (isHolonomic()) {
+    xt::noalias(control_sequence_.vy) = xt::sum(state_.cvy * softmaxes_extened, 0, immediate);
+  }
+
+  applyControlSequenceConstraints();
 }
 ```
