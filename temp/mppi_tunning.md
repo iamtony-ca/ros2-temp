@@ -202,3 +202,27 @@ bool Optimizer::fallback(bool fail) {
 
 1. 위 파라미터를 적용한 후에도 특정 구간에서 멈춘다면, 그 당시의 **Local Costmap 스크린샷**이나 **로봇의 풋프린트 설정값**을 알려주세요.
 2. 혹은 `Optimizer reset` 시 발생하는 **상세 에러 코드나 속도 명령(cmd_vel) 값**을 분석해 드릴 수 있습니다.
+#################
+######################
+#########################
+```cpp
+void Optimizer::updateControlSequence()
+{
+  // ... (이전 코드)
+
+  auto && costs_normalized = costs_ - xt::amin(costs_, immediate);
+  auto && exponents = xt::eval(xt::exp(-1 / settings_.temperature * costs_normalized));
+  
+  // [수정 제안] 모든 exponents의 합이 0에 가까우면(모두 충돌이면) 강제로 분산을 시키거나 멈춰야 함
+  float exponent_sum = xt::sum(exponents, immediate)(); 
+  if (exponent_sum < 1e-6) {
+      RCLCPP_WARN(logger_, "All trajectories have high cost! Resetting weights to uniform.");
+      // 모든 가중치를 균등하게 1.0으로 강제 설정하여 NaN 방지
+      exponents.fill(1.0f); 
+  }
+
+  auto && softmaxes = xt::eval(exponents / xt::sum(exponents, immediate)); // 여기서 0으로 나누면 NaN 발생
+  
+  // ...
+}
+```
