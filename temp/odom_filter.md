@@ -116,3 +116,53 @@ void Roboteq::odom_publish()
 
 
 ```
+```
+    // =========================================================================
+    // 3단계: 대칭 EMA 필터 & 연속 Zero-Snap 카운터 (급정거 반응성 보장)
+    // =========================================================================
+    
+    // 평상시의 부드러운 필터 계수 (0.1 ~ 0.2 사이 권장)
+    const float ALPHA_V = 0.15f; 
+    const float ALPHA_W = 0.15f; 
+
+    // 정적 카운터 변수 선언 (연속으로 0이 들어온 횟수를 기억)
+    static int zero_count_vx = 0;
+    static int zero_count_vyaw = 0;
+
+    // ---------------------------------------------------------
+    // [Linear X 처리]
+    // ---------------------------------------------------------
+    // 엔코더 노이즈를 고려해 아주 작은 값(예: 0.005 m/s 이하)을 0으로 간주
+    if (std::abs(raw_vx) < 0.005f) {
+        zero_count_vx++;
+    } else {
+        zero_count_vx = 0; // 속도가 다시 들어오면 카운터 초기화
+    }
+
+    // 5사이클(예: 제어주기가 30Hz라면 약 0.16초) 연속 0이면 완전 정지로 판단
+    const int ZERO_THRESHOLD = 5; 
+
+    if (zero_count_vx >= ZERO_THRESHOLD) {
+        filtered_vx = 0.0f; // 즉시 0으로 스냅 (급정거 시 지연 없음)
+    } else {
+        // 주행 및 일반 감속 시에는 대칭 EMA로 부드럽게 노이즈 제거
+        filtered_vx = (ALPHA_V * raw_vx) + ((1.0f - ALPHA_V) * filtered_vx);
+    }
+
+    // ---------------------------------------------------------
+    // [Angular Z 처리]
+    // ---------------------------------------------------------
+    if (std::abs(raw_vyaw) < 0.005f) {
+        zero_count_vyaw++;
+    } else {
+        zero_count_vyaw = 0;
+    }
+
+    if (zero_count_vyaw >= ZERO_THRESHOLD) {
+        filtered_vyaw = 0.0f;
+    } else {
+        filtered_vyaw = (ALPHA_W * raw_vyaw) + ((1.0f - ALPHA_W) * filtered_vyaw);
+    }
+
+
+```
