@@ -61,3 +61,31 @@ void Roboteq::odom_publish()
   // ... (이후 퍼블리시 코드는 동일) ...
 }
 ```
+
+
+```
+// =========================================================================
+// 3단계: 비대칭 EMA 필터 & Zero-Snap (급정거 반응성 극대화)
+// =========================================================================
+
+// 3-1. Zero-Snap (데드밴드): 원시 데이터가 사실상 0이면 필터 무시하고 즉시 0 출력
+if (std::abs(raw_vx) < 0.001f) 
+{
+    filtered_vx = 0.0f;
+}
+// 3-2. 감속 중 (급정거 포함): 현재 속도보다 원시 속도가 0에 더 가까울 때
+else if (std::abs(raw_vx) < std::abs(filtered_vx)) 
+{
+    // 감속 시에는 반응성을 위해 아주 큰 Alpha 값(예: 0.6 ~ 0.8)을 사용합니다.
+    const float ALPHA_DECEL = 0.7f; 
+    filtered_vx = (ALPHA_DECEL * raw_vx) + ((1.0f - ALPHA_DECEL) * filtered_vx);
+}
+// 3-3. 가속 및 정속 주행 중
+else 
+{
+    // 정속 주행 노이즈를 잡기 위해 기존의 부드러운 Alpha 값(예: 0.1 ~ 0.2)을 유지합니다.
+    filtered_vx = (ALPHA_V * raw_vx) + ((1.0f - ALPHA_V) * filtered_vx);
+}
+
+
+```
