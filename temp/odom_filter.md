@@ -64,28 +64,55 @@ void Roboteq::odom_publish()
 
 
 ```
-// =========================================================================
-// 3단계: 비대칭 EMA 필터 & Zero-Snap (급정거 반응성 극대화)
-// =========================================================================
+    // =========================================================================
+    // 3단계: 비대칭 EMA 필터 & Zero-Snap (급정거 반응성 극대화)
+    // =========================================================================
+    
+    // 정속 주행용 필터 계수 (기존의 부드러운 설정 유지)
+    const float ALPHA_V = 0.1f; 
+    const float ALPHA_W = 0.1f; 
 
-// 3-1. Zero-Snap (데드밴드): 원시 데이터가 사실상 0이면 필터 무시하고 즉시 0 출력
-if (std::abs(raw_vx) < 0.001f) 
-{
-    filtered_vx = 0.0f;
-}
-// 3-2. 감속 중 (급정거 포함): 현재 속도보다 원시 속도가 0에 더 가까울 때
-else if (std::abs(raw_vx) < std::abs(filtered_vx)) 
-{
-    // 감속 시에는 반응성을 위해 아주 큰 Alpha 값(예: 0.6 ~ 0.8)을 사용합니다.
-    const float ALPHA_DECEL = 0.7f; 
-    filtered_vx = (ALPHA_DECEL * raw_vx) + ((1.0f - ALPHA_DECEL) * filtered_vx);
-}
-// 3-3. 가속 및 정속 주행 중
-else 
-{
-    // 정속 주행 노이즈를 잡기 위해 기존의 부드러운 Alpha 값(예: 0.1 ~ 0.2)을 유지합니다.
-    filtered_vx = (ALPHA_V * raw_vx) + ((1.0f - ALPHA_V) * filtered_vx);
-}
+    // 감속/급정거용 필터 계수 (반응성 극대화를 위해 큰 값 사용)
+    const float ALPHA_V_DECEL = 0.7f; 
+    const float ALPHA_W_DECEL = 0.7f; 
+
+    // ---------------------------------------------------------
+    // [Linear X 처리]
+    // ---------------------------------------------------------
+    // 1) Zero-Snap: 원시 데이터가 사실상 0이면 필터 무시하고 즉시 정지
+    if (std::abs(raw_vx) < 0.001f) 
+    {
+        filtered_vx = 0.0f;
+    }
+    // 2) 감속 중: 현재 출력되는 속도보다 목표(원시) 속도가 0에 더 가까울 때
+    else if (std::abs(raw_vx) < std::abs(filtered_vx)) 
+    {
+        filtered_vx = (ALPHA_V_DECEL * raw_vx) + ((1.0f - ALPHA_V_DECEL) * filtered_vx);
+    }
+    // 3) 가속 및 정속 주행 중
+    else 
+    {
+        filtered_vx = (ALPHA_V * raw_vx) + ((1.0f - ALPHA_V) * filtered_vx);
+    }
+
+    // ---------------------------------------------------------
+    // [Angular Z 처리]
+    // ---------------------------------------------------------
+    // 1) Zero-Snap: 원시 각속도가 사실상 0이면 즉시 회전 정지 출력
+    if (std::abs(raw_vyaw) < 0.001f) 
+    {
+        filtered_vyaw = 0.0f;
+    }
+    // 2) 감속 중: 현재 출력되는 각속도보다 목표(원시) 각속도가 0에 더 가까울 때
+    else if (std::abs(raw_vyaw) < std::abs(filtered_vyaw)) 
+    {
+        filtered_vyaw = (ALPHA_W_DECEL * raw_vyaw) + ((1.0f - ALPHA_W_DECEL) * filtered_vyaw);
+    }
+    // 3) 가속 및 정속 회전 중
+    else 
+    {
+        filtered_vyaw = (ALPHA_W * raw_vyaw) + ((1.0f - ALPHA_W) * filtered_vyaw);
+    }
 
 
 ```
