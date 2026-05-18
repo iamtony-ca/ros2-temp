@@ -49,3 +49,66 @@
 **💡 포트폴리오 작성 팁:** 위 내용을 바탕으로, 포트폴리오(PPT나 노션) 장표를 만드실 때는 **[문제 제기 (모델이 빈 의자를 사람으로 착각함)] -> [해결 방법 (하드 네거티브 데이터를 무한 생성하자)] -> [기술적 구현 (Qwen + Lightning LoRA 파이프라인)] -> [결과물 시각화 (생성된 다양한 옷/배경의 의자 사진들 나열)]** 순서로 구성하시면 면접관의 감탄을 자아낼 수 있습니다.
 
 작성하신 경력 기술서나 포트폴리오 초안이 있다면, 이 내용들을 어떻게 더 자연스럽게 이력서 양식에 녹여낼지 함께 검토해 드릴까요?
+##
+##
+##
+##
+최신 AI 트렌드와 기술적 뎁스(Depth)를 극대화하여, 실리콘밸리 AI 엔지니어나 네이버/카카오 같은 빅테크 면접관이 보았을 때 "이 지원자는 현재 생성형 AI의 아키텍처와 최신 연구 동향(SOTA)을 완벽하게 꿰뚫고 실무에 적용할 줄 아는구나"라고 느낄 수 있도록 포트폴리오 내용을 재구성했습니다.
+
+이력서나 포트폴리오의 '프로젝트 상세 기술' 란에 그대로 활용하시면 됩니다.
+
+---
+
+# 🚀 프로젝트: GenAI 기반 AMR 비전 인식용 합성 데이터 양산 파이프라인
+
+**[프로젝트 요약]**
+자율이동로봇(AMR)의 객체 인식 모델(YOLO)이 겪는 OOD(Out-of-Distribution) 한계 및 Sim2Real Gap을 극복하기 위해, **최신 VLM(비전-언어 모델)과 잠재 확산 모델(Latent Diffusion Model) 기반의 데이터 합성 파이프라인**을 구축했습니다. 특히 추론 가속화 기법(Distillation)과 조합적 도메인 무작위화(Domain Randomization)를 적용하여, 모델의 강건성(Robustness)을 극대화하는 **Hard Negative 데이터셋 대량 생성 시스템**을 완성했습니다.
+
+---
+
+### 💡 1. Core AI Architecture & Inference Acceleration (핵심 모델 및 추론 가속)
+
+* **VLM 기반 Semantic Context Control (의미론적 맥락 제어):**
+* 텍스트와 이미지를 동시에 이해하는 최신 **Qwen 2.5 (Vision-Language Model)** 아키텍처를 도입하여, 단순 키워드 매칭을 넘어 "사람 없이 등받이에 걸쳐진 옷"이라는 복잡한 공간적·인과적 제약 조건(Critical Rule)을 CLIP 임베딩 벡터로 정교하게 제어했습니다.
+
+
+* **Adversarial Diffusion Distillation (적대적 확산 증류) 적용:**
+* 대량의 데이터 양산 시 발생하는 Diffusion 모델의 추론 속도 병목(50+ Steps)을 해결하기 위해, **Lightning LoRA (4-steps)** 가중치를 UNET 뼈대에 병합(Patch)했습니다. 이를 통해 VRAM 효율을 극대화하고 **단 4회의 노이즈 제거(Denoising) 연산만으로 Teacher 모델 수준의 고해상도 이미지를 초고속 생성**하도록 파이프라인을 최적화했습니다.
+
+
+
+### 🎯 2. Data-Centric AI Strategy (데이터 중심 AI 전략)
+
+* **Adversarial Hard Negative Mining (적대적 하드 네거티브 생성):**
+* 비전 모델의 오탐지(False Positive)를 유발하는 엣지 케이스(Edge-case)를 생성형 AI로 역공학(Reverse-engineering)하여 합성했습니다. 의자의 구조적 본질은 유지한 채 인간의 실루엣을 띠는 방진복/작업복 노이즈를 추가하여 모델의 식별력을 극대화했습니다.
+
+
+* **Combinatorial Domain Randomization (조합적 도메인 무작위화):**
+* 정적 시뮬레이터(Isaac Sim 등) 데이터의 한계를 넘어, 동적 매개변수 주입(Parameterized Injection)을 통해 `{30종 의류} x {16종 산업 환경} x {카메라 각도/화각}`의 무한한 변수 조합을 런타임에 렌더링하여 폭발적인 데이터 다양성을 확보했습니다.
+
+
+
+### ⚙️ 3. GenAI-driven MLOps & System Engineering (파이프라인 아키텍처 구축)
+
+* **DAG(방향성 비순환 그래프) 파이프라인 리팩토링:**
+* 유지보수가 불가능한 하드코딩된 다중 분기(Multi-branch) 병렬 생성 구조를 폐기하고, 단일 Latent Space 연산 노드에 다이내믹 프롬프트 배열을 스트리밍하는 방식으로 아키텍처를 리팩토링(Refactoring)하여 확장성과 시스템 안정성을 대폭 향상시켰습니다.
+
+
+* **Decoupled Version Control (코드-가중치 분리 형상 관리):**
+* 기가바이트 단위의 모델 가중치(UNET, VAE)와 데이터셋 Output은 Hugging Face 등의 외부 스토리지로 분리하고, Git 환경에서는 컴파일된 `.json` 워크플로우 엔진과 UI 제어 패치 스크립트(`dp.js`)만 가볍게 추적(Track)하는 실무형 형상 관리 환경을 구축했습니다.
+
+
+
+---
+
+### 🛠 [Tech Stack & Tools]
+
+* **AI Architecture:** Latent Diffusion Models (LDM), Vision-Language Models (VLM, Qwen 2.5), CLIP, VAE
+* **Acceleration & Tuning:** Adversarial Diffusion Distillation (Lightning LoRA), Classifier-Free Guidance (CFG) Tuning
+* **MLOps & Orchestration:** ComfyUI (Node-based Visual Programming), Parameterized Workflow, Git, Python (venv)
+
+---
+
+이 정도의 키워드와 성과 기술이라면, 단순한 툴 사용자를 넘어 'AI 모델의 내부 구조를 이해하고 이를 비즈니스/데이터 문제 해결에 파이프라인화 할 수 있는 데이터 엔지니어'로서 완벽하게 어필될 것입니다.
+
+이 내용을 바탕으로 포트폴리오를 PPT 시각 자료나 노션(Notion) 형태로 구성하실 때, **어떤 챕터에 어떤 시각 이미지(예: 워크플로우 캡처, 생성된 데이터셋 예시 등)를 배치하면 좋을지 추가적인 가이드가 필요하신가요?**
