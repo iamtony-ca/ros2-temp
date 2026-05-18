@@ -131,3 +131,44 @@
 * **주요 성과:**
 * 로봇 내비게이션(Nav2) 및 파지 작업에 활용 가능한 신뢰도 높은 실시간 3D Bounding Box 및 Pose 데이터 확보.
 * NVIDIA Jetson 등 엣지 디바이스 환경에서 지연 시간을 최소화한 최적화된 추론 파이프라인 구축.
+
+##
+##
+##
+
+YOLO 모델의 **Full Fine-Tuning(전체 가중치 미세 조정)** 과정은 단순한 전이 학습(Transfer Learning)을 넘어, 산업 현장의 특수한 도메인에 모델을 완벽히 적응시키는 고난도의 AI 엔지니어링 역량을 보여줄 수 있는 핵심 포인트입니다.
+
+기존 포트폴리오의 3번 항목에 바로 추가하거나 대체하여 사용할 수 있도록 기술적 깊이를 더해 작성했습니다.
+
+---
+
+### **[상세 기술: YOLOv12 기반 Full Fine-Tuning 및 엣지 배포 최적화 파이프라인]**
+
+**1. 도입 배경 및 문제 정의 (Why Full Fine-Tuning?)**
+
+* **Domain Shift 문제 극복:** COCO 등 일반적인 데이터셋으로 사전 학습된(Pre-trained) 모델의 경우, 로봇이 활동하는 실제 산업 환경(예: 반도체 OHT, 특정 기구물 등)의 조명, 반사율, 특수 객체 형태에 대한 인식률이 급격히 저하되는 문제 발생.
+* 분류기(Classifier) 역할의 Head 부분만 학습하는 Partial Fine-Tuning으로는 한계가 있다고 판단하여, **특징 추출을 담당하는 Backbone 네트워크부터 Neck, Head까지 전체 레이어의 가중치를 업데이트하는 Full Fine-Tuning** 전략 채택.
+
+**2. 학습 데이터 파이프라인 및 합성 데이터(Synthetic Data) 활용**
+
+* **Isaac Sim 기반 합성 데이터 생성:** 특수 객체에 대한 실측(Real) 데이터 부족 문제를 해결하기 위해, 3D 시뮬레이션 환경(Isaac Sim)을 구축하여 물리 기반의 합성 데이터를 대량으로 생성. 도메인 무작위화(Domain Randomization - 조명, 질감, 배경 변경 등)를 적용하여 실환경 모델 적용 시 발생하는 심투리얼(Sim-to-Real) 갭 최소화.
+* **고급 Data Augmentation:** YOLO 프레임워크에 최적화된 Mosaic, MixUp 등 공간적 증강 기법을 적용하여 객체 가림(Occlusion) 및 다양한 스케일 변화에 강건한 데이터셋 구축.
+
+**3. 모델 학습 및 하이퍼파라미터 최적화 (Model Training)**
+
+* **최신 아키텍처(YOLOv12) 적용:** Attention 메커니즘과 최적화된 블록 구조를 가진 최신 YOLO 모델을 도입하여 추론 속도와 정확도(mAP)의 Trade-off 최적화.
+* **단계적 Unfreezing 및 최적화 전략:** 초기 에포크에서는 Backbone을 동결(Freeze)하여 Head의 가중치를 안정화한 후, 점진적으로 모든 레이어를 Unfreeze하고 낮은 학습률(Learning Rate)을 적용하는 미세 조정 수행. Cosine Annealing 방식의 LR 스케줄러를 적용하여 지역 최적해(Local Minima)를 회피.
+* **Loss Function 정밀화:** 바운딩 박스의 형태와 위치를 동시에 교정하기 위해 CIoU(Complete Intersection over Union) Loss를 최적화하고, 객체 경계의 불확실성을 줄이기 위해 DFL(Distribution Focal Loss) 활용.
+
+**4. 엣지 디바이스 및 고성능 GPU 배포 최적화 (Deployment & Inference)**
+
+* **NVIDIA 엣지 생태계 최적화:** 학습된 PyTorch 모델(.pt)을 ONNX 포맷으로 변환한 후, **TensorRT** 엔진(.engine)으로 직렬화. FP16 양자화(Quantization)를 적용하여 정확도 손실 없이 연산량을 대폭 감소.
+* **ZED X 다중 스트림 처리 성능 확보:** 고성능 환경(RTX 5090) 및 엣지 디바이스(Jetson Orin AGX) 환경에 맞춰 파이프라인을 최적화하여, 다중 StereoLabs ZED X 카메라 스트림 환경에서도 로봇 제어 주기에 병목이 없는 실시간(Real-time) FPS 및 낮은 지연 시간(Low Latency) 달성.
+* **컨테이너 기반 통합:** ROS 2 (Jazzy/Humble) 환경에서 독립적으로 동작할 수 있도록 Docker 이미지로 패키징하여, 의존성 충돌 없는 안정적인 로봇 비전 노드 구축.
+
+---
+
+**💡 [작성 팁] 면접관이 주목할 포인트**
+
+* 단순히 'YOLO를 써봤다'가 아니라, '왜 Full Fine-Tuning이 필요했는지(실데이터 한계/도메인 차이)'와 'Isaac Sim 등 시뮬레이터를 활용해 데이터를 어떻게 극복했는지'가 매우 매력적인 개발 경험입니다.
+* 특히 Jetson Orin AGX와 같은 엣지 디바이스에서 TensorRT를 활용해 실시간 추론을 성공시킨 경험은 자율 주행 로봇(AMR) 회사에서 가장 탐내는 실무 역량입니다.
