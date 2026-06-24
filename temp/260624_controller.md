@@ -528,3 +528,309 @@ void GracefulController::remainingGoalsCallback(const nav_msgs::msg::Path::Share
 **2.8 동기화** — 컨트롤러·checker 두 곳의 `PATH_DIST_MAX`가 같은 값이어야 동작이 일관됩니다. 나중에 따로 갈리지 않게, 가능하면 둘 다 nav2_params의 동일 파라미터로 빼는 걸 권합니다(지금은 최소 변경 위해 상수로 둠).
 
 타입만 알려주시면 이 패치는 그대로 빌드됩니다. 빌드 후 멀티 goal 주행에서 (a) 중간 goal 조기 종료가 사라지는지, (b) 최종 goal에서 count가 0으로 떨어져도 정상 도착하는지 두 가지를 확인해 보세요 — count==0 race를 `rgc<=1`로 막은 게 실제로 듣는지 검증 포인트입니다.
+
+##
+##
+##
+<thinking>The user confirmed the message type is `nav_msgs::msg::Path` (what I provided). Now they want the post-processing kappa singularity guard + context clamp for the controller.
+
+Let me write the post-processing block modification for graceful_controller.cpp. I need to modify the `[Post-Processing]` block in `computeVelocityCommands`.
+
+Let me recall the current post-processing block and what we agreed on:
+
+1. kappa singularity guard: `use_curvature = (|kappa| <= kSingularCurvature) && (|target_v| >= 0.02)`. With kSingularCurvature = 1/0.15 ≈ 6.67. If singular, skip curvature preservation, apply angular limit standalone.
+
+2. context clamp: `context_max_w = (enter_rotation_mode || is_xy_stabilizing_phase) ? MAX_IN_PLACE_VEL : v_angular_max`.
+
+3. stall block bug fix: when use_curvature false, don't overwrite limited_w with new_v*kappa (kappa would be 0 or singular).
+
+Now I need to write this carefully against the ACTUAL current code provided in the last documents. Let me look at the current post-processing block:
+
+```cpp
+  geometry_msgs::msg::TwistStamped final_cmd = target_cmd;
+  
+  // 1. 선속도 Y 원천 차단 (linear_y 발생 문제 해결)
+  final_cmd.twist.linear.y = 0.0; 
+
+  if (std::abs(target_cmd.twist.linear.x) < 0.001) {
+      final_cmd.twist.angular.z = applyKinematicLimits(
+        last_cmd_vel_.angular.z, target_cmd.twist.angular.z, ACC_IN_PLACE, DEC_IN_PLACE, dt_control);
+  } else {
+      double target_v = target_cmd.twist.linear.x;
+      double target_w = target_cmd.twist.angular.z;
+      double kappa = target_w / target_v; 
+      double limited_v = applyKinematicLimits(actual_speed, target_v, ACC_LINEAR, DEC_LINEAR, dt_control);
+      double limited_w = limited_v * kappa;
+      double max_w_limit = applyKinematicLimits(actual_w, target_w, ACC_ANGULAR, DEC_ANGULAR, dt_control);
+      
+      if (std::abs(limited_w) > std::abs(max_w_limit)) {
+          limited_w = max_w_limit;
+          double turning_radius = 100.0;
+          if (std::abs(kappa) > 0.001) turning_radius = 1.0 / std::abs(kappa);
+          double max_intervention_radius = MAX_INTERVENTION_RADIUS_;
+          if (turning_radius < max_intervention_radius) {
+              double radius_severity = 1.0 - (turning_radius / max_intervention_radius);
+              double max_smoothing_factor = MIN_SMOOTHING_FACTOR + (SMOOTHING_FACTOR_SCALE * speed_ratio);
+              double dynamic_smoothing_factor = radius_severity * max_smoothing_factor;
+              double strict_v = limited_w / kappa;
+              limited_v = (strict_v * dynamic_smoothing_factor) + (limited_v * (1.0 - dynamic_smoothing_factor));
+          }
+      }
+
+      double v_scale = 1.0;
+      double w_scale = 1.0;
+      if (std::abs(limited_v) > dynamic_v_max && dynamic_v_max > 0.0) {
+          v_scale = dynamic_v_max / std::abs(limited_v);
+      }
+      if (std::abs(limited_w) > params_->v_angular_max && params_->v_angular_max > 0.0) {
+          w_scale = params_->v_angular_max / std::abs(limited_w);
+      }
+      double final_scale = std::min(v_scale, w_scale);
+      limited_v *= final_scale;
+      limited_w *= final_scale;
+
+      limited_v = std::clamp(limited_v, -params_->v_linear_max, params_->v_linear_max);
+      limited_w = std::clamp(limited_w, -params_->v_angular_max, params_->v_angular_max);
+
+      if (std::abs(target_v) > 0.001) {
+          if (std::abs(limited_v) < params_->v_linear_min) {
+              double new_v = std::copysign(params_->v_linear_min, target_v); 
+              limited_w = new_v * kappa;
+              limited_v = new_v;
+              limited_w = std::clamp(limited_w, -params_->v_angular_max, params_->v_angular_max);
+          }
+      }
+
+      final_cmd.twist.linear.x = limited_v;
+      final_cmd.twist.angular.z = limited_w;
+  }
+```
+
+Now I'll rewrite the `else` branch with the guards. Let me be careful to preserve the smoothing logic when use_curvature is true.
+
+Key changes:
+1. Compute `use_curvature` and `context_max_w` at top of else.
+2. If use_curvature false: limited_w = applyKinematicLimits(actual_w, target_w, ACC_ANGULAR, DEC_ANGULAR, dt_control) standalone, skip kappa multiplication and smoothing.
+3. If use_curvature true: existing logic.
+4. Scaling: use context_max_w instead of params_->v_angular_max for the w_scale.
+5. Final clamp: use context_max_w.
+6. Stall block: only multiply by kappa if use_curvature.
+
+Let me also need `enter_rotation_mode` and `is_xy_stabilizing_phase` to be in scope at post-processing. They're declared in [6] block as local bools. The post-processing is in the same function scope, after [6]. So they're accessible. Good.
+
+Wait — but there's the first branch `if (std::abs(target_cmd.twist.linear.x) < 0.001)` which is the pure rotation (Phase 3) path. That already uses ACC_IN_PLACE/DEC_IN_PLACE and is capped because target was capped at MAX_IN_PLACE_VEL in Phase 3. That's fine, no spike there. The spike is in the else (path-following) branch. So I modify the else.
+
+Let me now also double check: context_max_w should apply in the else branch. In rotation mode (enter_rotation_mode), target_cmd.twist.linear.x is 0 (angular only set), so it goes into the FIRST branch (< 0.001), not else. So in the else branch, enter_rotation_mode could still be true only if... no. If enter_rotation_mode is true and collision_free, target_cmd.twist.angular.z is set and linear.x stays 0 → first branch. If enter_rotation_mode true but collision (collision_free false), cmd_found stays false → falls to path following → target_cmd gets linear.x from simulateTrajectory → else branch. THIS is the gap I mentioned: rotation blocked by collision falls through to path-following with v_angular_max=1.8. So context_max_w with enter_rotation_mode included matters here. Good, keep it.
+
+Also is_xy_stabilizing_phase: in that mode, it sets speed limit low and falls to path following → else branch likely (linear.x small but maybe >0.001). context clamp to MAX_IN_PLACE_VEL applies. Good.
+
+Now let me write the full replacement else-branch. I'll keep it as a clean replacement of the existing else block.
+
+Let me write:
+
+```cpp
+  } else {
+      // [경로 추종 모드] 궤적 이탈(Wobbling) 방지를 위한 곡률(Curvature) 비율 유지 로직
+      double target_v = target_cmd.twist.linear.x;
+      double target_w = target_cmd.twist.angular.z;
+
+      // ── [추가 1] 컨텍스트 각속도 상한: 회전/안정화 의도면 0.35로 제한 ──
+      double context_max_w = params_->v_angular_max;
+      if (enter_rotation_mode || is_xy_stabilizing_phase) {
+          context_max_w = MAX_IN_PLACE_VEL;
+      }
+
+      // ── [추가 2] kappa 특이점 가드 ──
+      // kappa(=curvature)가 planner 한계곡률(1/0.3≈3.3)을 크게 넘거나(=-1/r 특이점),
+      // target_v가 극저속이면 곡률 보존을 끈다. (1.8 스파이크 원천 차단)
+      constexpr double kSingularCurvature = 1.0 / 0.15;  // ≈6.67 (반경 0.15m 미만)
+      double kappa = (std::abs(target_v) > 1e-6) ? (target_w / target_v) : 0.0;
+      const bool curvature_singular =
+          (std::abs(kappa) > kSingularCurvature) || (std::abs(target_v) < 0.02);
+      const bool use_curvature = !curvature_singular;
+
+      double limited_v = applyKinematicLimits(actual_speed, target_v, ACC_LINEAR, DEC_LINEAR, dt_control);
+      double limited_w;
+
+      if (use_curvature) {
+          // 곡률 보존: 제한된 선속도에 곡률을 곱해 각속도 재계산
+          limited_w = limited_v * kappa;
+
+          double max_w_limit = applyKinematicLimits(actual_w, target_w, ACC_ANGULAR, DEC_ANGULAR, dt_control);
+          if (std::abs(limited_w) > std::abs(max_w_limit)) {
+              limited_w = max_w_limit;
+              double turning_radius = 100.0;
+              if (std::abs(kappa) > 0.001) turning_radius = 1.0 / std::abs(kappa);
+
+              double max_intervention_radius = MAX_INTERVENTION_RADIUS_;
+              if (turning_radius < max_intervention_radius) {
+                  double radius_severity = 1.0 - (turning_radius / max_intervention_radius);
+                  double max_smoothing_factor = MIN_SMOOTHING_FACTOR + (SMOOTHING_FACTOR_SCALE * speed_ratio);
+                  double dynamic_smoothing_factor = radius_severity * max_smoothing_factor;
+                  double strict_v = limited_w / kappa;
+                  limited_v = (strict_v * dynamic_smoothing_factor) + (limited_v * (1.0 - dynamic_smoothing_factor));
+              }
+          }
+      } else {
+          // [특이점 구간] 곡률 연동 차단, 각속도 단독 가감속 (kappa 곱셈 없음 → 스파이크 차단)
+          limited_w = applyKinematicLimits(actual_w, target_w, ACC_ANGULAR, DEC_ANGULAR, dt_control);
+      }
+
+      // 비율 유지 스케일링 (각속도 상한은 context_max_w 사용)
+      double v_scale = 1.0;
+      double w_scale = 1.0;
+      if (std::abs(limited_v) > dynamic_v_max && dynamic_v_max > 0.0) {
+          v_scale = dynamic_v_max / std::abs(limited_v);
+      }
+      if (std::abs(limited_w) > context_max_w && context_max_w > 0.0) {
+          w_scale = context_max_w / std::abs(limited_w);
+      }
+      double final_scale = std::min(v_scale, w_scale);
+      limited_v *= final_scale;
+      limited_w *= final_scale;
+
+      limited_v = std::clamp(limited_v, -params_->v_linear_max, params_->v_linear_max);
+      limited_w = std::clamp(limited_w, -context_max_w, context_max_w);   // [변경] context 상한
+
+      // 스톨 방지 (use_curvature일 때만 곡률 보존, 아니면 램핑된 limited_w 유지) [버그픽스]
+      if (std::abs(target_v) > 0.001 && std::abs(limited_v) < params_->v_linear_min) {
+          double new_v = std::copysign(params_->v_linear_min, target_v);
+          limited_v = new_v;
+          if (use_curvature) {
+              limited_w = new_v * kappa;
+          }
+          // use_curvature==false면 위에서 단독 램핑된 limited_w 유지
+          limited_w = std::clamp(limited_w, -context_max_w, context_max_w);
+      }
+
+      final_cmd.twist.linear.x = limited_v;
+      final_cmd.twist.angular.z = limited_w;
+  }
+```
+
+Let me double-check the v_scale issue. When use_curvature is false (singular), limited_v is ACC-limited target_v (which is small, near 0). limited_w is standalone ramped angular. The scaling: if limited_w > context_max_w, w_scale < 1, which scales BOTH limited_v and limited_w. Since limited_v is already tiny, scaling it more is fine. But does scaling limited_w down also need to scale limited_v? In the curvature-preserving case yes (to keep kappa). In singular case, v and w are decoupled, so scaling both by w_scale unnecessarily reduces v. But v is near-zero anyway, so negligible. Acceptable. Actually to be cleaner, in singular case the final_scale = min(v_scale, w_scale) — if w_scale<1 it'd shrink v too. But since we WANT decoupling in singular case, ideally we'd clamp w independently. But the final `std::clamp(limited_w, -context_max_w, context_max_w)` already enforces the w bound. So I could skip the w_scale in the singular branch. Hmm.
+
+Actually simplest: the final clamp `std::clamp(limited_w, -context_max_w, context_max_w)` guarantees the bound regardless of scaling. The proportional scaling is only meaningful for curvature preservation. In the singular case, scaling v by w_scale is a minor unwanted coupling but v≈0 so harmless. To keep code minimal and avoid branching the scaling logic, I'll leave it — the final clamp is the real guarantee. It's fine.
+
+But wait — there's a subtle issue. In singular case, if limited_w gets scaled down by w_scale (because it exceeded context_max_w), then the final clamp does nothing more. The angular velocity gets reduced proportionally. That's fine — it's bounded. Good.
+
+Actually, let me reconsider: is it cleaner to NOT do proportional scaling in singular case? The proportional scaling's purpose is "keep v/w ratio when hitting limits". In singular case we explicitly DON'T want to keep ratio (that's the whole point). So applying final_scale (which couples them) slightly contradicts. But since v≈0 in singular case (that's WHY it's singular — target_v < 0.02), v_scale is almost certainly 1.0 (limited_v < dynamic_v_max easily). So final_scale = w_scale. limited_v *= w_scale → tiny*w_scale, still tiny. limited_w *= w_scale → bounded. Then clamp. Net effect: w bounded, v stays tiny. Functionally correct. I'll leave it for minimal change. Good.
+
+Let me also verify the context_max_w in scaling: `if (std::abs(limited_w) > context_max_w ...)`. When not in rotation/stabilizing (normal driving), context_max_w = v_angular_max = 1.8, same as before. So normal driving unchanged. Only rotation/stabilizing contexts get 0.35. Good — preserves normal behavior.
+
+One more: the smoothing branch uses `params_->v_angular_max` originally? No, it used max_w_limit. I kept that. Good. The original w_scale used params_->v_angular_max; I changed to context_max_w. In normal driving they're equal, so no behavior change there. Good.
+
+Now I also should double-check: `enter_rotation_mode` and `is_xy_stabilizing_phase` are in scope. They're declared in the [6] block which is in the same function. Post-processing is after, same scope (not nested). Yes in scope. Good.
+
+Edge: what if both enter_rotation_mode true and we're in else branch (collision-blocked rotation fell through)? context_max_w = MAX_IN_PLACE_VEL = 0.35. Good — caps the fallthrough path-following angular. That was the "gap 1" I identified. Fixed.
+
+I think this is correct. Let me also note this is a replacement of the existing else-block only; the first if-branch (pure rotation) unchanged.
+
+Let me write the response concisely with the replacement block and a brief explanation of each change point and a couple of verification notes. Korean.
+
+I should keep it focused — they asked specifically for the post-processing block. Give the replacement + explain the 3 changes + note what's preserved. Brief.타입 확정 감사합니다(`nav_msgs::msg::Path` 그대로). 그러면 후처리 블록만 정리하겠습니다. 수정은 **`computeVelocityCommands`의 `[Post-Processing]` `else` 분기 하나**입니다. 첫 분기(`linear.x < 0.001`, 순수 제자리 회전)는 이미 `MAX_IN_PLACE_VEL`로 capped된 target을 받으니 건드리지 않습니다 — 스파이크는 else(경로 추종) 분기에서만 납니다.
+
+## 교체할 블록
+
+기존 `else { ... }` 전체를 아래로 교체:
+
+```cpp
+  } else {
+      // [경로 추종 모드] 궤적 보존 + 특이점 가드
+      double target_v = target_cmd.twist.linear.x;
+      double target_w = target_cmd.twist.angular.z;
+
+      // ── [추가 1] 컨텍스트 각속도 상한 ──
+      // 회전/안정화 의도(충돌로 회전이 막혀 여기로 흘러내린 경우 포함)면 0.35로 묶음
+      double context_max_w = params_->v_angular_max;
+      if (enter_rotation_mode || is_xy_stabilizing_phase) {
+          context_max_w = MAX_IN_PLACE_VEL;
+      }
+
+      // ── [추가 2] kappa(=curvature) 특이점 가드 ──
+      // planner min_turning_radius=0.3 → 합법 곡률 ≲3.3. 반경 0.15m(곡률 6.67) 초과는
+      // -1/r 특이점 아티팩트이므로 곡률 보존을 끈다. (1.8 스파이크 원천 차단)
+      constexpr double kSingularCurvature = 1.0 / 0.15;  // ≈6.67
+      double kappa = (std::abs(target_v) > 1e-6) ? (target_w / target_v) : 0.0;
+      const bool curvature_singular =
+          (std::abs(kappa) > kSingularCurvature) || (std::abs(target_v) < 0.02);
+      const bool use_curvature = !curvature_singular;
+
+      double limited_v = applyKinematicLimits(actual_speed, target_v, ACC_LINEAR, DEC_LINEAR, dt_control);
+      double limited_w;
+
+      if (use_curvature) {
+          // 곡률 보존: 제한된 선속도 × 곡률
+          limited_w = limited_v * kappa;
+
+          double max_w_limit = applyKinematicLimits(actual_w, target_w, ACC_ANGULAR, DEC_ANGULAR, dt_control);
+          if (std::abs(limited_w) > std::abs(max_w_limit)) {
+              limited_w = max_w_limit;
+              double turning_radius = 100.0;
+              if (std::abs(kappa) > 0.001) turning_radius = 1.0 / std::abs(kappa);
+
+              double max_intervention_radius = MAX_INTERVENTION_RADIUS_;
+              if (turning_radius < max_intervention_radius) {
+                  double radius_severity = 1.0 - (turning_radius / max_intervention_radius);
+                  double max_smoothing_factor = MIN_SMOOTHING_FACTOR + (SMOOTHING_FACTOR_SCALE * speed_ratio);
+                  double dynamic_smoothing_factor = radius_severity * max_smoothing_factor;
+                  double strict_v = limited_w / kappa;
+                  limited_v = (strict_v * dynamic_smoothing_factor) + (limited_v * (1.0 - dynamic_smoothing_factor));
+              }
+          }
+      } else {
+          // [특이점 구간] kappa 곱셈 차단, 각속도 단독 가감속
+          limited_w = applyKinematicLimits(actual_w, target_w, ACC_ANGULAR, DEC_ANGULAR, dt_control);
+      }
+
+      // 비율 유지 스케일링 (각속도 상한은 context_max_w)
+      double v_scale = 1.0;
+      double w_scale = 1.0;
+      if (std::abs(limited_v) > dynamic_v_max && dynamic_v_max > 0.0) {
+          v_scale = dynamic_v_max / std::abs(limited_v);
+      }
+      if (std::abs(limited_w) > context_max_w && context_max_w > 0.0) {
+          w_scale = context_max_w / std::abs(limited_w);
+      }
+      double final_scale = std::min(v_scale, w_scale);
+      limited_v *= final_scale;
+      limited_w *= final_scale;
+
+      limited_v = std::clamp(limited_v, -params_->v_linear_max, params_->v_linear_max);
+      limited_w = std::clamp(limited_w, -context_max_w, context_max_w);   // [변경] context 상한
+
+      // [버그픽스] 스톨 방지: use_curvature일 때만 곡률 보존
+      if (std::abs(target_v) > 0.001 && std::abs(limited_v) < params_->v_linear_min) {
+          double new_v = std::copysign(params_->v_linear_min, target_v);
+          limited_v = new_v;
+          if (use_curvature) {
+              limited_w = new_v * kappa;          // 곡률 정상일 때만 재계산
+          }
+          // use_curvature==false면 위에서 단독 램핑된 limited_w 유지 (kappa=0 오염 방지)
+          limited_w = std::clamp(limited_w, -context_max_w, context_max_w);
+      }
+
+      final_cmd.twist.linear.x = limited_v;
+      final_cmd.twist.angular.z = limited_w;
+  }
+```
+
+## 무엇이 바뀌었나 (3곳)
+
+**추가 1 — context 클램프.** `enter_rotation_mode || is_xy_stabilizing_phase`면 각속도 상한을 `v_angular_max`(1.8) 대신 `MAX_IN_PLACE_VEL`(0.35)로. 회전이 충돌로 막혀 path-following으로 흘러내린 경우(`enter_rotation_mode=true`인데 else 분기)까지 커버합니다. 스케일링과 최종 clamp 둘 다 이 값을 쓰도록 바꿨습니다.
+
+**추가 2 — kappa 특이점 가드.** `|kappa| > 6.67` 또는 `|target_v| < 0.02`면 `use_curvature=false`. 이때 `limited_w = limited_v * kappa`(폭증한 kappa 곱셈)를 건너뛰고 각속도를 단독 램핑합니다. SmoothControlLaw의 `curvature = -1/r·(...)`가 종단 r→0에서 발산하는 걸 여기서 차단합니다.
+
+**버그픽스 — 스톨 블록.** 기존엔 `limited_w = new_v * kappa`를 무조건 실행했는데, `use_curvature=false`면 kappa가 특이값이라 각속도를 오염시킵니다. `if (use_curvature)`로 갈라, 특이점일 땐 단독 램핑된 `limited_w`를 유지합니다.
+
+## 보존된 것 (정상 주행 영향 없음)
+
+정상 주행에서는 `context_max_w == v_angular_max == 1.8`이라 스케일링·clamp 거동이 **이전과 동일**합니다. 0.35 제한은 회전/안정화 컨텍스트에서만 걸립니다. 그리고 `use_curvature` 임계(`|target_v|<0.02`, `|kappa|>6.67`)는 정상 sharp turn(예 v=0.1, kappa≈3.3)에는 안 걸리니 곡률 보존도 그대로 동작합니다.
+
+## 빌드 전 확인 2가지
+
+`enter_rotation_mode` / `is_xy_stabilizing_phase`가 `[6]`에서 선언돼 후처리까지 같은 함수 스코프로 살아있는지 — 현재 코드 기준 맞습니다(중첩 블록 아님).
+
+`use_curvature=false`일 때 `v_scale`/`final_scale`이 `limited_v`(≈0)도 같이 줄이는 미세 결합이 있는데, 이 구간 target_v가 0.02 미만이라 `v_scale`은 사실상 1.0이고 최종 `limited_w` clamp가 상한을 보장하므로 무해합니다. 신경 쓰이면 검증 시 `use_curvature` 분기별로 `final_scale` 적용 여부를 로그로 한 번 보세요.
+
+이제 스파이크(후처리)와 도착 게이트(3-조건) 둘 다 정리됐습니다. 남은 건 교차 snap용 `max_robot_pose_search_dist` 축소(nav2_params)뿐인데, 이건 코드가 아니라 파라미터라 따로 적용하시면 됩니다.
