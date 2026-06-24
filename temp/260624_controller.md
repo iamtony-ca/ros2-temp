@@ -834,3 +834,106 @@ I should keep it focused — they asked specifically for the post-processing blo
 `use_curvature=false`일 때 `v_scale`/`final_scale`이 `limited_v`(≈0)도 같이 줄이는 미세 결합이 있는데, 이 구간 target_v가 0.02 미만이라 `v_scale`은 사실상 1.0이고 최종 `limited_w` clamp가 상한을 보장하므로 무해합니다. 신경 쓰이면 검증 시 `use_curvature` 분기별로 `final_scale` 적용 여부를 로그로 한 번 보세요.
 
 이제 스파이크(후처리)와 도착 게이트(3-조건) 둘 다 정리됐습니다. 남은 건 교차 snap용 `max_robot_pose_search_dist` 축소(nav2_params)뿐인데, 이건 코드가 아니라 파라미터라 따로 적용하시면 됩니다.
+
+##
+##
+##
+<thinking>The user wants a simple defensive guard right before publishing cmd_vel: if linear.x <= 0.02 and angular.z > 0.5, clamp angular.z to 0.5. Let me think about whether this is a good idea and any pitfalls.
+
+This is a "last line of defense" hard clamp. Let me think about correctness issues:
+
+1. It only clamps positive angular.z > 0.5. But angular.z can be negative. Need to handle |angular.z| > 0.5 with copysign, otherwise negative spikes (-1.8) pass through. This is a real bug in their proposed logic.
+
+2. linear.x <= 0.02 — but linear.x can be negative (reversing). Should be |linear.x| <= 0.02.
+
+3. Conflict with legitimate in-place rotation: Phase 3 pure rotation uses MAX_IN_PLACE_VEL = 0.35, which is < 0.5, so this guard won't interfere with normal in-place rotation (0.35 < 0.5). Good. But what about the rotation target capped at 0.35 — fine, under 0.5.
+
+4. Does 0.5 conflict with any legitimate low-speed-high-angular case? In normal driving, low linear + high angular happens during sharp turns / curve entry. But if linear.x <= 0.02 (essentially stopped) and angular > 0.5, that's basically a spin — which we want to cap. Legitimate cases where linear≈0 and angular>0.5: aggressive in-place rotation. But their MAX_IN_PLACE_VEL is 0.35, so intended rotation never exceeds 0.5. So 0.5 is a safe ceiling above intended 0.35 but below the 1.8 spike. Reasonable.
+
+5. Placement: right before `last_cmd_vel_ = final_cmd.twist; return final_cmd;`. 
+
+Let me write it correctly with copysign and abs.
+
+Also should I note that this is somewhat redundant with the context clamp + kappa guard now? It's a belt-and-suspenders. The user explicitly wants it as defense. It's fine. But I should note it's a hard floor independent of context — meaning even in legitimate path-following at very low speed (e.g., creeping through narrow space at 0.015 m/s with a turn), angular would be capped at 0.5. Is that a problem? At linear 0.02 with kappa 3.3, angular = 0.066 — way under 0.5. To get angular > 0.5 at linear 0.02 you'd need kappa > 25, which is singular territory. So legitimate path-following won't hit this. Good. It only catches genuine anomalies.
+
+One concern: last_cmd_vel_ is set AFTER. Should the clamp happen before storing last_cmd_vel_ so the ramping uses the clamped value? Yes — place it before `last_cmd_vel_ = final_cmd.twist`. Otherwise next cycle's applyKinematicLimits ramps from the unclamped spike. So placement before last_cmd_vel_ assignment is important. Let me make sure to note that.
+
+Let me write the guard:
+
+```cpp
+  // ── [방어] 최종 발행 직전 하드 가드: 사실상 정지 상태인데 각속도가 과도하면 캡 ──
+  // (kappa 특이점/스파이크가 위 로직을 빠져나오는 경우의 최후 방어선)
+  if (std::abs(final_cmd.twist.linear.x) <= 0.02 &&
+      std::abs(final_cmd.twist.angular.z) > 0.5)
+  {
+      final_cmd.twist.angular.z = std::copysign(0.5, final_cmd.twist.angular.z);
+  }
+
+  last_cmd_vel_ = final_cmd.twist;
+  return final_cmd;
+```
+
+Key corrections vs their proposal:
+- `std::abs(linear.x) <= 0.02` (handle reverse)
+- `std::abs(angular.z) > 0.5` with `copysign(0.5, ...)` (handle negative spike, e.g., the -1.8 region in their data tail — actually the data showed negative angular too)
+
+Wait — recall the cmd_vel data tail had angular.z going negative (down to -0.32 etc.) but those were small. The spike was +1.8. But in general a negative spike is possible (mirror situation), so copysign is the safe form. Their proposed `angular.z > 0.5 → 0.5` only catches positive. I'll fix to abs/copysign and explain.
+
+Also note interaction: Phase 3 pure rotation max is 0.35 < 0.5, so this never clips intended rotation. Good — mention it so they know 0.5 is safely above intended 0.35.
+
+Should I caution that this guard is now somewhat redundant given context clamp (0.35) + kappa guard? In rotation/stabilizing context, context_max_w already caps at 0.35, so angular never exceeds 0.35 there → this 0.5 guard never triggers in those contexts. It only triggers in NON-rotation context (context_max_w=1.8) where linear is near 0 but angular is high — which shouldn't happen normally but could if something slips. So it's a genuine extra safety net for the "normal driving context but linear collapsed" anomaly. Good, not fully redundant.
+
+Let me also consider: is 0.02 the right threshold vs v_linear_min (0.01)? linear.x <= 0.02 means "essentially not translating". Fine. Could tie to params_->v_linear_min*2 but hardcode 0.02 is fine and matches their request.
+
+Let me write concise response. Confirm it's a good idea, give corrected code, note the 2 corrections (abs/copysign), placement before last_cmd_vel_, and that it doesn't interfere with intended 0.35 rotation.좋은 방어로직입니다 — kappa 가드나 context 클램프를 어쩌다 빠져나온 경우의 **최후 방어선**으로 적절합니다. 다만 제안하신 조건 그대로면 **두 가지 구멍**이 있어서 그것만 고치면 됩니다.
+
+## 제안 그대로의 문제 2가지
+
+**① 음수 각속도를 못 잡습니다.** `angular.z > 0.5`는 양수만 봅니다. 스파이크는 +1.8뿐 아니라 거울 상황에서 -1.8로도 날 수 있는데(제자리 회전 방향이 반대면), `> 0.5`만 보면 -1.8은 통과합니다. `std::abs`로 봐야 합니다.
+
+**② 후진을 못 봅니다.** `linear.x <= 0.02`는 음수(후진)면 항상 참이라, 후진 주행 중(linear.x = -0.3)에도 이 조건이 걸려 각속도를 잘라버립니다. `std::abs(linear.x) <= 0.02`여야 "사실상 정지"를 의미합니다.
+
+## 수정된 가드
+
+`last_cmd_vel_ = final_cmd.twist;` **바로 위에** 추가:
+
+```cpp
+  // ── [방어] 최종 발행 직전 하드 가드 ──
+  // 사실상 병진이 없는데(|v|<=0.02) 각속도가 과도하면(>0.5) 캡.
+  // kappa 특이점/스파이크가 위 로직을 빠져나오는 경우의 최후 방어선.
+  if (std::abs(final_cmd.twist.linear.x) <= 0.02 &&
+      std::abs(final_cmd.twist.angular.z) > 0.5)
+  {
+      final_cmd.twist.angular.z = std::copysign(0.5, final_cmd.twist.angular.z);
+  }
+
+  last_cmd_vel_ = final_cmd.twist;
+  return final_cmd;
+```
+
+## 왜 이 위치 / 이 값이 맞나
+
+**위치 — `last_cmd_vel_` 저장 직전.** 이게 중요합니다. `last_cmd_vel_`는 다음 사이클 `applyKinematicLimits`의 램핑 기준점입니다. 가드를 저장 *전에* 넣어야 다음 사이클이 캡된 0.5에서 램핑을 시작합니다. 저장 *후에* 넣으면 다음 사이클이 캡 안 된 스파이크값(1.8)을 기준으로 램핑해서 가드가 한 박자 헛돕니다.
+
+**0.5라는 값 — 의도된 회전(0.35)과 충돌 안 함.** Phase 3 제자리 회전은 `MAX_IN_PLACE_VEL = 0.35`로 capped되고, context 클램프도 회전/안정화 컨텍스트에서 0.35로 묶습니다. 둘 다 0.5보다 작으니, **이 가드는 정상 회전을 절대 안 건드립니다.** 0.35(의도) < 0.5(가드) < 1.8(스파이크) 사이에 안전하게 놓입니다.
+
+**정상 주행도 안 걸림.** `|v| <= 0.02`에서 `|w| > 0.5`가 되려면 `kappa = w/v > 25`가 필요한데, 이건 planner 한계곡률(3.3)을 한참 넘는 특이점 영역뿐입니다. 정상 sharp turn(v=0.1, kappa=3.3 → w=0.33)은 절대 못 만듭니다.
+
+## 한 가지 참고
+
+이 가드는 context 클램프(0.35)와 **부분 중복이지만 완전 중복은 아닙니다.** 회전/안정화 컨텍스트에서는 context 클램프가 이미 0.35로 막아서 이 가드가 발동할 일이 없습니다. 이 가드가 실제로 의미 있는 건 **"정상 주행 컨텍스트(context_max_w=1.8)인데 어떤 이유로 v만 0으로 붕괴한"** 예외 상황입니다 — 즉 위 두 방어를 다 빠져나온 진짜 마지막 케이스. 그래서 안전망으로 넣을 가치가 있습니다.
+
+다만 이건 **증상을 자르는** 것이지 원인을 고치는 게 아니니, 만약 이 가드가 실제로 자주 발동하면(로그로 확인 가능) 그건 위 kappa 가드/context 클램프가 못 잡는 경로가 있다는 신호이므로 그쪽을 다시 봐야 합니다. 가드 발동 시 한 줄 로그를 넣어두면 "최후 방어선이 얼마나 자주 쓰이나"를 모니터할 수 있어 디버깅에 유용합니다.
+
+```cpp
+  if (std::abs(final_cmd.twist.linear.x) <= 0.02 &&
+      std::abs(final_cmd.twist.angular.z) > 0.5)
+  {
+      RCLCPP_WARN_THROTTLE(logger_, *clock_, 1000,
+        "[guard] angular capped: v=%.3f w=%.3f -> 0.5",
+        final_cmd.twist.linear.x, final_cmd.twist.angular.z);
+      final_cmd.twist.angular.z = std::copysign(0.5, final_cmd.twist.angular.z);
+  }
+```
+
+이러면 평소 0회면 "안전망이 안 쓰임 = 위 로직이 다 잡고 있음"이 확인되고, 발동 횟수가 잡히면 원인 추적 단서가 됩니다.
