@@ -215,3 +215,42 @@ sudo usermod -aG plugdev $USER
 RSUSB 백엔드는 libusb로 직접 통신하기 때문에 이 udev 권한이 V4L2 때보다 더 결정적입니다. 임시 확인용으로 `sudo realsense-viewer`를 띄워서 장치가 잡히면 권한 문제가 확실하니, 위 4)~5)를 집중해서 보시면 됩니다. 다만 sudo로 상시 쓰는 건 권하지 않습니다.
 
 각 단계 출력 붙여주시면 어디서 끊기는지 짚어드릴게요.
+##
+##
+##
+
+그러면 룰이 아예 설치되지 않은 겁니다. 아까 `setup_udev_rules.sh`를 돌리셨는데, 그 직후 실행한 패치 스크립트가 실패하면서 스크립트 흐름이 끊겼거나, 룰 스크립트 자체가 조용히 실패했을 가능성이 있습니다.
+
+**먼저 다시 실행하면서 출력을 보세요**
+```bash
+cd ~/librealsense
+./scripts/setup_udev_rules.sh
+echo "exit code: $?"
+ls -l /etc/udev/rules.d/ | grep -i realsense
+```
+에러 메시지가 나오면 그대로 붙여주세요.
+
+**여전히 비어 있으면 수동 복사**
+
+스크립트가 하는 일은 결국 룰 파일 하나를 복사하고 리로드하는 것입니다:
+
+```bash
+# 소스에 파일이 있는지 먼저 확인
+ls -l ~/librealsense/config/99-realsense-libusb.rules
+
+sudo cp ~/librealsense/config/99-realsense-libusb.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+그다음 **카메라를 뽑았다가 다시 연결**하고:
+```bash
+ls -l /etc/udev/rules.d/ | grep -i realsense
+realsense-viewer
+```
+
+**확인 포인트 하나**
+
+RSUSB 백엔드를 쓰시니 `99-realsense-libusb.rules`가 핵심입니다. 리포지토리 `config/` 디렉터리에 이 파일이 없다면 클론이 불완전한 것이니 알려주세요.
+
+`groups | grep plugdev`도 같이 확인해 두시면 좋습니다 — 룰이 들어가도 사용자가 `plugdev` 그룹에 없으면 같은 증상이 납니다.
