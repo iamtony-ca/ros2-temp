@@ -133,3 +133,37 @@ sudo dmesg | tail -n 50
 패치는 실패 시 자동 복구되고, 부분적으로 적용됐다 싶으면 재부팅만 해도 기본 모듈로 돌아옵니다.
 
 진행하시다 스크립트 출력이나 dmesg에서 막히는 부분 있으면 그대로 붙여주세요.
+##
+##
+##
+##
+예상했던 실패고, 메시지가 명확하네요. 그런데 **Docker는 이 문제를 해결하지 못합니다.** 컨테이너는 호스트 커널을 그대로 공유하기 때문에, 컨테이너 안에서 V4L2 백엔드로 빌드해도 호스트 uvcvideo가 패치되지 않았다는 사실은 똑같습니다.
+
+앞에서 5090 머신에 Docker를 권했던 건 "호스트를 안 건드리려고"였고, 실제로 커널 문제를 우회하는 건 Docker가 아니라 **RSUSB 백엔드**입니다. 지금 이 머신은 호스트를 건드릴 이유가 없으니 Docker를 끼울 이유도 없습니다 — 그냥 로컬에서 RSUSB로 다시 빌드하는 게 가장 간단합니다.
+
+udev 룰은 이미 깔렸으니 그대로 두고:
+
+```bash
+cd ~/librealsense
+rm -rf build && mkdir build && cd build
+
+cmake ../ -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_EXAMPLES=true \
+          -DFORCE_RSUSB_BACKEND=true
+
+make -j$(($(nproc)-1))
+sudo make install
+```
+(이전 cmake 캐시가 남아 있으면 백엔드 플래그가 안 먹을 수 있어 `build`를 지우고 갑니다.)
+
+빌드 후 카메라를 USB 3.x 포트에 연결하고:
+```bash
+rs-enumerate-devices -s
+realsense-viewer
+```
+
+**참고로 알아두실 것**
+- 공식 Docker 이미지가 V4L2로 빌드됐는지 RSUSB로 빌드됐는지는 제가 확인하지 못했습니다. 만약 V4L2라면 컨테이너 안에서도 지금과 같은 이유로 장치가 안 잡힙니다. Isaac ROS 문서가 컨테이너 빌드에 `--force_rsusb`를 쓰는 것도 같은 맥락입니다.
+- RSUSB로 잘 돌아가는데 나중에 CPU 부하나 멀티캠이 걸림돌이 되면, 그때 GA 커널 6.8을 추가로 설치해서 부팅하고 정식 패치 경로로 가면 됩니다. 지금 결정할 필요는 없습니다.
+
+RSUSB 빌드도 실패하면 그때 cmake/make 출력 붙여주세요.
