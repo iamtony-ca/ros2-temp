@@ -167,3 +167,51 @@ realsense-viewer
 - RSUSB로 잘 돌아가는데 나중에 CPU 부하나 멀티캠이 걸림돌이 되면, 그때 GA 커널 6.8을 추가로 설치해서 부팅하고 정식 패치 경로로 가면 됩니다. 지금 결정할 필요는 없습니다.
 
 RSUSB 빌드도 실패하면 그때 cmake/make 출력 붙여주세요.
+##
+##
+##
+##
+udev 룰이 등록은 됐는데 커널에 반영이 안 된 상태로 보입니다. 순서대로 확인해 보세요.
+
+**1) 파일이 실제로 있는지**
+```bash
+ls -l /etc/udev/rules.d/ | grep -i realsense
+```
+`99-realsense-libusb.rules`가 보여야 합니다. **두 개 이상** 나오면 그게 원인입니다 (deb·소스 혼용 케이스).
+
+**2) 룰 리로드 + 카메라 재인식**
+```bash
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+그다음 **카메라 USB를 뽑았다 다시 꽂으세요.** 룰은 장치가 연결되는 시점에 적용되므로, 이미 꽂혀 있던 장치에는 소급 적용되지 않습니다. 이게 제일 흔한 원인입니다.
+
+**3) 그래도 안 되면 룰 재설치**
+```bash
+cd ~/librealsense
+./scripts/setup_udev_rules.sh --uninstall
+./scripts/setup_udev_rules.sh
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+재부팅 한 번이 가장 확실합니다.
+
+**4) 권한이 실제로 붙었는지 확인**
+```bash
+lsusb | grep -i intel          # RealSense 장치 확인 (Bus/Device 번호 메모)
+ls -l /dev/bus/usb/<Bus>/<Device>
+```
+소유자가 `root:plugdev`이고 그룹 쓰기 권한(`rw-rw-`)이 있으면 정상입니다. `root:root`에 `rw-r--r--`이면 룰이 안 먹은 겁니다.
+
+**5) 그룹 확인**
+```bash
+groups | grep plugdev
+```
+`plugdev`가 없다면:
+```bash
+sudo usermod -aG plugdev $USER
+```
+후 **로그아웃/재로그인**(또는 재부팅)해야 반영됩니다.
+
+RSUSB 백엔드는 libusb로 직접 통신하기 때문에 이 udev 권한이 V4L2 때보다 더 결정적입니다. 임시 확인용으로 `sudo realsense-viewer`를 띄워서 장치가 잡히면 권한 문제가 확실하니, 위 4)~5)를 집중해서 보시면 됩니다. 다만 sudo로 상시 쓰는 건 권하지 않습니다.
+
+각 단계 출력 붙여주시면 어디서 끊기는지 짚어드릴게요.
