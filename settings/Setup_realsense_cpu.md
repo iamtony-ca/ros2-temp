@@ -93,3 +93,43 @@ realsense-viewer
 - VM은 USB3 변환 계층 때문에 공식 미지원입니다
 
 문서 원문: [installation.md](https://github.com/realsenseai/librealsense/blob/master/doc/installation.md) · [지원 커널 버전 확인](https://github.com/realsenseai/librealsense/releases/)
+
+##
+##
+##
+##
+
+괜찮은 접근입니다. 패치 스크립트는 **실패하면 원래 uvc 모듈로 복구**하도록 되어 있어서, 최악의 경우도 "안 됨"이지 시스템이 깨지는 건 아닙니다. 게다가 이 머신엔 NVIDIA 드라이버도 없으니 되돌릴 게 더 적고요.
+
+다만 순서를 조금 바꾸면 실패해도 헛수고가 줄어듭니다.
+
+**1) 패치를 먼저 시도** (여기가 성패 갈림)
+```bash
+cd librealsense
+./scripts/setup_udev_rules.sh
+./scripts/patch-realsense-ubuntu-lts-hwe.sh
+```
+
+**2) 결과 판정**
+```bash
+sudo dmesg | tail -n 50
+```
+- 새 uvcvideo 등록 로그가 보이면 → 성공. 그대로 빌드 진행
+- 스크립트가 에러로 죽거나 등록 로그가 없으면 → 커널 7.0 미지원 확정
+
+`module verification failed: signature ... tainting kernel` 경고는 정상이니 실패로 오해하지 마세요.
+
+**3) 빌드는 판정 후에**
+- 성공 → `cmake ../ -DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=true`
+- 실패 → 같은 명령에 `-DFORCE_RSUSB_BACKEND=true`만 추가
+
+빌드가 오래 걸리니 패치 결과를 먼저 확정하고 백엔드를 정하는 게 낫습니다. 이미 V4L2로 빌드했는데 패치가 안 된 상태면 `sudo make uninstall && make clean` 후 재빌드해야 합니다.
+
+**되돌리기**
+```bash
+./scripts/setup_udev_rules.sh --uninstall   # udev 룰 제거
+```
+
+패치는 실패 시 자동 복구되고, 부분적으로 적용됐다 싶으면 재부팅만 해도 기본 모듈로 돌아옵니다.
+
+진행하시다 스크립트 출력이나 dmesg에서 막히는 부분 있으면 그대로 붙여주세요.
