@@ -8,3 +8,74 @@ bash envs/pack_assets.sh --check dist/foup_300_semi_r2_assets.tar.gz   # ← 무
 tar -C assets/obj -xzf dist/foup_300_semi_r2_assets.tar.gz
 
 ✅ 확인: ls assets/obj/foup_300_semi_r2/ 에 full.ply·mesh.usda·ism_full·sam3_refs_* 가 보여야 한다. 공개 저장소면 릴리스 자산은 인증 없이 받아진다 — 사내망에서 토큰 없이 되는 게 장점이다.
+
+
+
+##
+##
+##
+##
+
+
+stereo 는 통과했고 SAM3 만 실패했다. segment_sam3 는 검출 0 이어도 검은 마스크를 항상 쓰므로, pose_fp 의 «없음» 은 실제로 «비었음» 이었다(그 메시지도 구분하도록 고쳤다).
+
+지금 확인할 것 3가지
+
+cd /isaac-sim/volume/spatial_manipulation_ws/src/vision && source envs/env.sh
+
+# ① SAM3 가 무엇을 봤나
+cat runs/real01_A/seg/frame_0000/det_flange.json
+python3 -c "
+import json;m=json.load(open('runs/real01_A/seg/meta_segment_flange.json'))
+print({k:m[k] for k in ('prompt','refs','n_refs','refs_mode','confidence_threshold')})
+a=[f['area_px'] for f in m['frames']]; s=[f['score'] for f in m['frames']]
+print('area 0 인 프레임:', sum(1 for x in a if x==0), '/', len(a))
+print('score 최대:', max(s))"
+
+# ② depth 는 나왔나 — 🔴 열린 항목 #1(반투명 본체)이 여기서 갈린다
+python3 -c "
+import json,glob
+v=[json.load(open(p))['depth_mm']['valid_frac'] for p in sorted(glob.glob('runs/real01_A/st/frame_*/meta_stereo.json'))]
+print(f'depth 유효율 중앙 {sorted(v)[len(v)//2]*100:.1f}%  최소 {min(v)*100:.1f}%')"
+
+③ 눈으로 — runs/real01/frame_0000/left.png 와 runs/real01_A/st/frame_0000/valid.png.
+
+유력한 원인
+
+SAM3 exemplar 참조가 sim 렌더로 만들어졌다. 이 프로젝트에 이미 기록된 실패 양식이다 — "참조는 배포 조건에서 만들어야 한다. 원거리 참조로 근접 질의를 하면 IoU 0.044, 클린 참조로 랜덤화 질의를 하면 0.382". 실사진(실텍스처·실조명)은 마지막 남은 도메인 갭 축이고, 지금 그걸 정면으로 맞은 것으로 보인다.
+
+복구 사다리 — 추가 촬영 0
+
+OBJ=assets/obj/foup_300_semi_r2
+
+# (a) SAM3 텍스트 프롬프트만 (참조 없이)
+envs/seg_sam3/bin/python -m spatial_vision.stages.segment_sam3 \
+    --in runs/real01 --out runs/real01_seg_text --target flange \
+    --prompts-file $OBJ/sam3_prompts.json
+
+# (b) 중앙 박스 지정 (카메라가 물체를 겨눴다면)
+envs/seg_sam3/bin/python -m spatial_vision.stages.segment_sam3 \
+    --in runs/real01 --out runs/real01_seg_box --target flange \
+    --box-source center --no-text
+
+# (c) ★ ISM — CAD 렌더 템플릿이라 사진 참조가 필요 없다
+envs/seg_sam6d/bin/python -m spatial_vision.stages.segment_sam6d \
+    --in runs/real01 --out runs/real01_seg_ism --target full \
+    --templates $OBJ/ism_full --depth-dir runs/real01_A/st
+
+(c) 가 구조적으로 가장 유망하다 — ISM 은 CAD 형상 템플릿을 쓰므로 실사진 텍스처에 덜 민감하고, 배경·재질 randomization 하에서 유지된 전례가 있다. 원래 B그룹 B1 이 이 비교였는데 순서가 앞당겨진 셈이다.
+
+⚠️ ISM 은 full 타깃이다. 근접 0.28m 에서 FOUP 전체가 프레임을 벗어났으면 안 맞을 수 있다 — 그래서 ①의 left.png 를 먼저 봐야 한다.
+
+그다음
+
+마스크가 하나라도 나오면 그걸로 실사진 참조를 새로 만든다(§19 의 «면적 중앙값 상위 5장», GT 불필요):
+
+envs/seg_sam3/bin/python -m spatial_vision.cad.select_sam3_refs --help
+
+이러면 SAM3 경로가 실환경에서 되살아난다.
+
+---
+①②③ 결과를 알려줘. 특히 left.png 에 FOUP 이 어떻게 담겼는지가 제일 중요하다 — 분할 실패가 «참조 문제» 인지 «촬영 문제» 인지가 거기서 갈린다.
+
+✻ Cogitated for 2m 17s
