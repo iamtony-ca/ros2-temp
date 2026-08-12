@@ -1,0 +1,10 @@
+cd /isaac-sim/volume/spatial_manipulation_ws/src/vision
+mkdir -p dist
+BASE=https://github.com/iamtony-ca/spatial-vision/releases/download/assets-r2
+curl -LO --output-dir dist $BASE/foup_300_semi_r2_assets.tar.gz
+curl -LO --output-dir dist $BASE/foup_300_semi_r2_assets.tar.gz.sha256
+
+bash envs/pack_assets.sh --check dist/foup_300_semi_r2_assets.tar.gz   # ← 무결성
+tar -C assets/obj -xzf dist/foup_300_semi_r2_assets.tar.gz
+
+✅ 확인: ls assets/obj/foup_300_semi_r2/ 에 full.ply·mesh.usda·ism_full·sam3_refs_* 가 보여야 한다. 공개 저장소면 릴리스 자산은 인증 없이 받아진다 — 사내망에서 토큰 없이 되는 게 장점이다.
