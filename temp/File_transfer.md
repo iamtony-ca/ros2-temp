@@ -74,3 +74,41 @@ sync && sudo umount /media/xfer
 **한 가지 조언**: ssd1을 앞으로 안 쓰신다고 해도, PC2에서 정상 동작을 확인할 때까지는 ssd1을 지우거나 포맷하지 마세요. 뭔가 빠뜨렸을 때 다시 꺼내올 수 있는 유일한 원본입니다. Isaac Sim 컨테이너가 PC2에서 제대로 뜨고 GUI까지 확인된 뒤에 정리하시는 걸 권합니다.
 
 그리고 외장 1TB에 100GB만 쓰는 거라면, 이 기회에 `~/` 아래 다른 작업 데이터(ROS 2 워크스페이스, 데이터셋, `.ssh`, `.gitconfig` 등)도 같이 담아두시면 왕복을 줄일 수 있습니다.
+
+
+
+##
+##
+##
+##
+##
+자동 마운트됐네요. 목적지는 `/media/amr/XFER` 입니다.
+
+```bash
+sudo rsync -aHAX --numeric-ids --info=progress2 \
+  ~/docker/isaac-sim-601 ~/ros2_ws \
+  /media/amr/XFER/
+```
+
+(옮길 폴더는 실제 필요한 것으로 바꾸시고, 소스 끝에 슬래시 붙이지 않는 것만 지키세요.)
+
+**시작 전 두 가지 확인:**
+
+```bash
+df -h /media/amr/XFER          # 여유 공간
+du -sh ~/* ~/.??* 2>/dev/null | sort -h | tail -20   # 뭐가 큰지
+```
+
+두 번째 명령으로 홈 디렉터리에서 용량 큰 항목들이 정렬돼 나옵니다. 목록 보시고 무엇을 가져갈지 정하시면 됩니다. `.cache`처럼 안 옮겨도 되는 것들이 꽤 클 거예요.
+
+**복사 끝나면:**
+
+```bash
+sync
+udisksctl unmount -b /dev/sda1
+udisksctl power-off -b /dev/sda
+```
+
+자동 마운트된 거라 `umount` 대신 `udisksctl unmount`가 깔끔합니다 (파일 관리자의 ⏏ 버튼과 동일).
+
+한 가지 — `~/docker/isaac-sim-601` 안의 `cache`와 `logs`는 재생성되는 캐시라 제외하면 시간이 크게 줄어듭니다. 다만 폴더를 통째로 지정하면서 일부만 빼려면 `--exclude`를 쓰셔야 하는데, 여러 소스를 나열할 때는 패턴이 모든 소스에 적용되니 주의하세요. 헷갈리면 isaac-sim-601만 따로 한 줄로 돌리시는 게 안전합니다.
