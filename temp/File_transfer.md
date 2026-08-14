@@ -112,3 +112,74 @@ udisksctl power-off -b /dev/sda
 자동 마운트된 거라 `umount` 대신 `udisksctl unmount`가 깔끔합니다 (파일 관리자의 ⏏ 버튼과 동일).
 
 한 가지 — `~/docker/isaac-sim-601` 안의 `cache`와 `logs`는 재생성되는 캐시라 제외하면 시간이 크게 줄어듭니다. 다만 폴더를 통째로 지정하면서 일부만 빼려면 `--exclude`를 쓰셔야 하는데, 여러 소스를 나열할 때는 패턴이 모든 소스에 적용되니 주의하세요. 헷갈리면 isaac-sim-601만 따로 한 줄로 돌리시는 게 안전합니다.
+
+
+##
+##
+##
+##
+네, 순서 정확합니다. 정리하면:
+
+**ssd1에서:** commit → save → 볼륨 rsync → 언마운트  
+**ssd2에서:** load → 볼륨 rsync (외장 → 홈) → 권한/ACL 확인 → run
+
+## ssd2에서의 주의점 하나
+
+`~/docker/isaac-sim-601`이 **이미 존재합니다.** ssd2에서 이미지 빌드하실 때 그 디렉터리들을 만드셨을 테니까요. rsync가 덮어쓰기 전에 확인하세요:
+
+```bash
+ls -la ~/docker/isaac-sim-601/
+du -sh ~/docker/isaac-sim-601/
+```
+
+비어 있으면 그냥 덮어쓰시면 되고, 뭔가 있으면 백업하거나 이름을 바꿔두세요. 어차피 컨테이너를 만든 적이 없다니 비어 있을 가능성이 높습니다.
+
+```bash
+sudo rsync -aHAX --numeric-ids --info=progress2 \
+  /media/sim1/XFER/isaac-sim-601/ ~/docker/isaac-sim-601/
+```
+
+(소스 끝 슬래시 있음 — 내용물을 기존 디렉터리 안으로)
+
+## run 직전 체크리스트
+
+```bash
+id -u                                        # 1000인지
+ls -ln ~/docker/isaac-sim-601/               # 소유권 1234인지
+getfacl ~/docker/isaac-sim-601/volume | head # ACL 살아있는지
+ls ~/.cache/ov/hub                           # hub 캐시 있는지 ★
+docker images | grep isaac                   # load된 이미지 확인
+nvidia-smi                                   # 드라이버
+```
+
+★ **`~/.cache/ov/hub`는 `~/docker` 밖에 있습니다.** 별도로 옮기셔야 해요. ssd1에서 아직 안 하셨으면 지금 챙기세요:
+
+```bash
+# ssd1
+sudo rsync -aHAX --numeric-ids ~/.cache/ov/hub /media/amr/XFER/ov-hub-backup/
+
+# ssd2
+mkdir -p ~/.cache/ov
+sudo rsync -aHAX --numeric-ids /media/sim1/XFER/ov-hub-backup/hub/ ~/.cache/ov/hub/
+```
+
+## 그리고 run 전에
+
+```bash
+xhost +local:
+```
+
+이건 재부팅할 때마다 필요합니다. 빠뜨리면 GUI가 안 뜨고 X11 연결 오류가 납니다.
+
+## 첫 실행 후 확인
+
+```bash
+docker exec isaac-sim-601 ls /opt/ros/          # ROS 2 살아있나
+docker exec isaac-sim-601 id                    # 1234인지
+docker exec isaac-sim-601 touch /isaac-sim/volume/test.txt
+ls -l ~/docker/isaac-sim-601/volume/test.txt    # 호스트에서 보이고 편집 가능한지
+```
+
+마지막 테스트가 ACL이 제대로 동작하는지 확인하는 가장 빠른 방법입니다. 호스트에서 그 파일을 지울 수 있으면 양방향 권한이 정상입니다.
+
+**그리고 반복해서 말씀드리지만** — 이 모든 게 정상 동작하는 걸 확인할 때까지 ssd1은 그대로 두세요. GUI로 Isaac Sim이 실제로 뜨는 것까지 보신 뒤에 정리하시면 됩니다.
