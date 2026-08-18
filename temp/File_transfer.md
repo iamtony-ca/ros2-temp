@@ -183,3 +183,116 @@ ls -l ~/docker/isaac-sim-601/volume/test.txt    # 호스트에서 보이고 편�
 마지막 테스트가 ACL이 제대로 동작하는지 확인하는 가장 빠른 방법입니다. 호스트에서 그 파일을 지울 수 있으면 양방향 권한이 정상입니다.
 
 **그리고 반복해서 말씀드리지만** — 이 모든 게 정상 동작하는 걸 확인할 때까지 ssd1은 그대로 두세요. GUI로 Isaac Sim이 실제로 뜨는 것까지 보신 뒤에 정리하시면 됩니다.
+
+
+##
+##
+##
+## ssd1 (PC1) — 내보내기
+
+```bash
+# 1. 현황 확인
+docker ps -a
+docker images
+df -h /media/amr/XFER
+
+# 2. 설치 내역 기록 (컨테이너 실행 중이어야 함)
+docker start isaac-sim-601 2>/dev/null
+docker exec isaac-sim-601 dpkg -l > /media/amr/XFER/dpkg-list.txt
+docker exec isaac-sim-601 pip list > /media/amr/XFER/pip-list.txt 2>/dev/null
+docker exec isaac-sim-601 ls /opt/ros/ > /media/amr/XFER/ros-check.txt 2>&1
+
+# 3. 컨테이너 → 이미지
+docker stop isaac-sim-601
+docker commit -m "ROS2 Jazzy + tools from ssd1" isaac-sim-601 isaac-sim:6.0.1-full
+docker images | grep isaac-sim
+
+# 4. 이미지 저장
+docker save isaac-sim:6.0.1-full -o /media/amr/XFER/isaac-sim-601-full.tar
+ls -lh /media/amr/XFER/isaac-sim-601-full.tar
+sha256sum /media/amr/XFER/isaac-sim-601-full.tar > /media/amr/XFER/isaac-full.sha256
+
+# 5. 볼륨 데이터
+sudo rsync -aHAX --numeric-ids --info=progress2 \
+  ~/docker/isaac-sim-601 /media/amr/XFER/
+
+sudo rsync -aHAX --numeric-ids --info=progress2 \
+  ~/.cache/ov/hub /media/amr/XFER/ov-hub/
+
+# 6. 안전하게 분리
+sync
+udisksctl unmount -b /dev/sda1
+udisksctl power-off -b /dev/sda
+```
+
+## ssd2 (PC2) — 복원
+
+```bash
+# 1. 마운트 경로 확인
+lsblk -f | grep XFER
+cd /media/sim1/XFER          # 실제 경로로
+
+# 2. 무결성 검증 후 이미지 로드
+sha256sum -c isaac-full.sha256
+docker load -i isaac-sim-601-full.tar
+docker images | grep isaac-sim
+
+# 3. 기존 디렉터리 확인 (덮어쓰기 전)
+ls -la ~/docker/isaac-sim-601/
+
+# 4. 볼륨 복원
+sudo rsync -aHAX --numeric-ids --info=progress2 \
+  /media/sim1/XFER/isaac-sim-601/ ~/docker/isaac-sim-601/
+
+mkdir -p ~/.cache/ov
+sudo rsync -aHAX --numeric-ids --info=progress2 \
+  /media/sim1/XFER/ov-hub/hub/ ~/.cache/ov/hub/
+
+# 5. 권한 확인 및 보정
+id -u                                          # 1000이어야 함
+ls -ln ~/docker/isaac-sim-601/                 # 1234 소유 확인
+getfacl ~/docker/isaac-sim-601/volume | head
+
+# UID가 1000이 아니거나 ACL이 없으면:
+MYUID=$(id -u)
+sudo setfacl -R    -m u:$MYUID:rwx -m u:1234:rwx -m m:rwx ~/docker/isaac-sim-601/volume
+sudo setfacl -R -d -m u:$MYUID:rwx -m u:1234:rwx -m m:rwx ~/docker/isaac-sim-601/volume
+
+# 6. 사전 점검
+nvidia-smi
+docker info | grep -i Runtimes
+```
+
+## 컨테이너 생성
+
+```bash
+xhost +local:
+docker run --name isaac-sim-601 --entrypoint bash -it --gpus all -e "ACCEPT_EULA=Y" --network=host \
+    -e "PRIVACY_CONSENT=Y" \
+    -v $HOME/.Xauthority:/isaac-sim/.Xauthority \
+    -e DISPLAY \
+    -v ~/docker/isaac-sim-601/cache/main:/isaac-sim/.cache:rw \
+    -v ~/docker/isaac-sim-601/cache/computecache:/isaac-sim/.nv/ComputeCache:rw \
+    -v ~/docker/isaac-sim-601/logs:/isaac-sim/.nvidia-omniverse/logs:rw \
+    -v ~/docker/isaac-sim-601/config:/isaac-sim/.nvidia-omniverse/config:rw \
+    -v ~/docker/isaac-sim-601/data:/isaac-sim/.local/share/ov/data:rw \
+    -v ~/docker/isaac-sim-601/pkg:/isaac-sim/.local/share/ov/pkg:rw \
+    -v ~/docker/isaac-sim-601/volume:/isaac-sim/volume:rw \
+    -v ~/.cache/ov/hub:/var/cache/hub:rw \
+    -u 1234:1234 \
+    isaac-sim:6.0.1-full
+```
+
+이미지 태그가 `-full`로 바뀐 것 외에는 기존과 동일합니다.
+
+## 동작 확인
+
+```bash
+docker exec isaac-sim-601 ls /opt/ros/
+docker exec isaac-sim-601 id
+docker exec isaac-sim-601 touch /isaac-sim/volume/perm-test
+ls -l ~/docker/isaac-sim-601/volume/perm-test    # 호스트에서 보이고 삭제 가능한지
+rm ~/docker/isaac-sim-601/volume/perm-test
+```
+
+마지막으로 Isaac Sim GUI가 실제로 뜨는 것까지 확인한 뒤에 ssd1을 정리하세요. `xhost +local:`은 재부팅할 때마다 필요합니다.
