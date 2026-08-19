@@ -1,0 +1,32 @@
+cd /<경로>/vision && source envs/env.sh
+
+IN=runs/real_50            # ← 네 촬영 디렉토리
+A=runs/real_50_A           # ← 이미 돌린 --out (st/ 가 여기 있어야 한다)
+O=assets/obj/foup_300_semi_r2
+
+# ① ISM 분할을 --select center 로 다시 (stereo depth 는 기존 것을 그대로 쓴다)
+envs/seg_sam6d/bin/python -m spatial_vision.stages.segment_sam6d \
+    --in $IN --out $A/seg_ism_center --target full \
+    --templates $O/ism_full --cad $O/full.ply \
+    --depth stereo --depth-dir $A/st \
+    --select center
+
+# ② 그 마스크로 pose (SAM3 무관)
+envs/pose/bin/python -m spatial_vision.stages.pose_fp \
+    --in $IN --out $A/fp_ism_center --no-stage2 \
+    --obj $O --masks $A/seg_ism_center --depth stereo --depth-dir $A/st \
+    --primary full --flange-mask-from pose --input-scale 0.5
+
+# ③ 테두리 정합 + 게이트  ← 🔴 flange 마스크가 필요 없다
+envs/pose/bin/python -m spatial_vision.stages.refine_contour \
+    --in $IN --pose-dir $A/fp_ism_center --pose-name pose_coarse.json \
+    --obj $O --mesh top_flange.ply --outer-only --gate-deg 1.5 \
+    --out $A/I1_center
+
+# ④ 눈으로 — 오버레이 (GT 불필요)
+envs/pose/bin/python -m spatial_vision.viz.overlay_pose \
+    --in $IN --pose-dir $A/I1_center --obj $O \
+    --frames 6 --per-frame-dir $A/I1_center/overlay \
+    --out $A/I1_center/overlay_sheet.png
+
+②③④가 곧 「경로 B」다 — SAM3 를 완전히 우회해서 pose 까지 간다.
