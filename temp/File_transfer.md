@@ -296,3 +296,61 @@ rm ~/docker/isaac-sim-601/volume/perm-test
 ```
 
 마지막으로 Isaac Sim GUI가 실제로 뜨는 것까지 확인한 뒤에 ssd1을 정리하세요. `xhost +local:`은 재부팅할 때마다 필요합니다.
+
+
+##
+##
+##
+ACL이 깨진 상황으로 보입니다. 원인 확인부터 해보세요.
+
+```bash
+id -u
+getfacl ~/docker/isaac-sim-601/volume
+getfacl ~/docker/isaac-sim-601/volume/spatial_manipulation_ws/src/vision/docs
+ls -ln ~/docker/isaac-sim-601/volume/spatial_manipulation_ws/src/vision/docs/
+```
+
+**세 가지 중 하나일 가능성이 큽니다:**
+
+**1. rsync가 ACL을 못 옮겼다**  
+`-A` 옵션을 썼어도 중간 경유지(외장 SSD)에서 뭔가 어긋났을 수 있습니다. `getfacl`에 `user:1000:rwx`가 안 보이면 이 경우입니다.
+
+**2. sim1의 UID가 amr과 다르다**  
+ssd1 ACL에는 `u:1000:rwx`가 박혀 있는데, sim1이 1001 등이면 매칭이 안 됩니다. `id -u` 결과를 확인하세요.
+
+**3. `unlink` 실패는 부모 디렉터리 문제**  
+파일을 지우려면 그 파일이 아니라 **부모 디렉터리에 쓰기 권한**이 있어야 합니다. `docs` 디렉터리 자체의 ACL을 보세요.
+
+## 해결
+
+원래 쓰시던 명령을 다시 적용하면 됩니다:
+
+```bash
+MYUID=$(id -u)
+sudo setfacl -R    -m u:$MYUID:rwx -m u:1234:rwx -m m:rwx ~/docker/isaac-sim-601/volume
+sudo setfacl -R -d -m u:$MYUID:rwx -m u:1234:rwx -m m:rwx ~/docker/isaac-sim-601/volume
+```
+
+`-R`이 하위 전체에 적용하고, `-d`는 앞으로 생길 파일에 자동 적용되도록 default ACL을 겁니다. 컨테이너가 실행 중이어도 무방합니다.
+
+적용 후 확인:
+```bash
+getfacl ~/docker/isaac-sim-601/volume/spatial_manipulation_ws/src/vision/docs | head
+touch ~/docker/isaac-sim-601/volume/test && rm ~/docker/isaac-sim-601/volume/test
+```
+
+## 주의할 점 하나
+
+`-R`은 **파일에도 x(실행) 권한을 붙입니다.** 소스코드 디렉터리에 이걸 걸면 `.cpp`, `.md` 파일까지 실행 가능으로 바뀌어서 git이 mode 변경을 감지할 수 있습니다. `spatial_manipulation_ws`가 git 저장소라면 적용 후 `git status`를 확인해보세요.
+
+이게 거슬리면 대문자 X를 쓰면 됩니다 — 디렉터리와 이미 실행 가능한 파일에만 x를 부여합니다:
+
+```bash
+sudo setfacl -R -m u:$MYUID:rwX -m u:1234:rwX -m m:rwX ~/docker/isaac-sim-601/volume
+```
+
+다만 default ACL(`-d`)에는 X가 의도대로 동작하지 않으니, 그쪽은 원래대로 `rwx`를 쓰시는 게 낫습니다.
+
+## VS Code 쪽
+
+권한을 고친 뒤에도 에러가 나면 VS Code Remote 창을 새로고침하세요 (`Ctrl+Shift+P` → Reload Window). 파일시스템 상태를 캐시하고 있을 수 있습니다.
