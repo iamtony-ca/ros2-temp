@@ -394,3 +394,35 @@ docker restart isaac-sim-601
 VS Code 닫고 다시 attach.
 
 먼저 `hostname`과 `mount | grep volume` 결과를 보여주시면 어느 쪽인지 바로 판단됩니다.
+##
+##
+##
+##
+`hostname`이 `sim1`로 나온 게 핵심입니다.
+
+컨테이너의 hostname은 보통 컨테이너 ID 앞자리(`70349066b1f8`)가 되는데, `--network=host`를 쓰셨기 때문에 호스트 이름을 그대로 물려받은 겁니다. 그러니 이것만으로는 컨테이너인지 호스트인지 구분이 안 됩니다.
+
+그리고 `mount` 결과가 결정적입니다. 컨테이너의 바인드 마운트라면 `/dev/nvme0n1p2 on /isaac-sim/volume`이 아니라 원본 경로가 표시되는 형태로 나오는데, 지금 출력은 **호스트에서 본 것과 같은 모양**입니다.
+
+즉 **VS Code가 컨테이너가 아니라 호스트에 붙어 있을 가능성**이 큽니다. 호스트의 sim1(UID 1000)에게 `/isaac-sim/volume`이라는 경로는 존재하지 않아야 정상인데... 확인이 필요합니다.
+
+**호스트 터미널에서:**
+
+```bash
+ls -ld /isaac-sim/volume
+docker inspect isaac-sim-601 --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'
+```
+
+호스트에 `/isaac-sim`이 실재하는지 보세요. 있다면 어느 시점엔가 호스트 루트에 그 디렉터리가 만들어진 겁니다.
+
+**VS Code 컨테이너 터미널에서:**
+
+```bash
+ls /.dockerenv && echo "IN CONTAINER" || echo "ON HOST"
+cat /proc/1/cgroup | head -3
+ls /isaac-sim/
+```
+
+`/.dockerenv` 파일 존재 여부가 컨테이너인지 판별하는 가장 확실한 방법입니다.
+
+이 두 결과를 보여주시면 정확히 짚어드릴 수 있습니다. 다만 `mount` 출력을 보면 VS Code 창이 컨테이너가 아닌 다른 곳에 연결돼 있을 가능성이 높고, 그렇다면 attach 대상을 다시 선택하시는 게 해법이 될 겁니다.
