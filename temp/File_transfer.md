@@ -354,3 +354,43 @@ sudo setfacl -R -m u:$MYUID:rwX -m u:1234:rwX -m m:rwX ~/docker/isaac-sim-601/vo
 ## VS Code 쪽
 
 권한을 고친 뒤에도 에러가 나면 VS Code Remote 창을 새로고침하세요 (`Ctrl+Shift+P` → Reload Window). 파일시스템 상태를 캐시하고 있을 수 있습니다.
+##
+##
+##
+##
+결정적인 단서입니다. 같은 컨테이너, 같은 경로, 같은 UID인데 한쪽만 안 된다 — 그렇다면 **VS Code가 실제로는 다른 컨테이너에 붙어 있을 가능성**이 큽니다.
+
+이전에 "같은 Dockerfile로 다른 이름의 이미지와 컨테이너를 만들어봤다"고 하셨죠. VS Code의 attach 목록에 비슷한 컨테이너가 여러 개 뜨는데, 실수로 옛날 것을 고르셨을 수 있습니다. 그쪽은 볼륨 마운트가 없거나 다른 경로를 물고 있어서 `/isaac-sim/volume`이 컨테이너 내부 디렉터리(root 소유)일 겁니다.
+
+**VS Code의 컨테이너 터미널에서 확인:**
+
+```bash
+hostname
+cat /etc/hostname
+ls -ld /isaac-sim/volume
+mount | grep volume
+```
+
+`hostname`은 컨테이너 ID 앞자리입니다. 호스트에서 `docker ps`와 대조하세요.
+
+```bash
+docker ps --format "table {{.ID}}\t{{.Names}}\t{{.Image}}"
+```
+
+**핵심은 `mount | grep volume`입니다.** 바인드 마운트가 제대로 걸려 있으면 그 줄이 나오고, 안 나오면 마운트 없는 컨테이너에 붙은 겁니다.
+
+그리고 `ls -ld /isaac-sim/volume` 결과를 비교해보세요:
+- 정상 컨테이너: `drwxrwxr-x+ ... 1234 1234` (끝의 `+`가 ACL 표시)
+- 다른 컨테이너: `+` 없음, 또는 root 소유
+
+**만약 같은 컨테이너가 맞다면** — 그때는 VS Code 서버가 마운트 이전 상태를 캐시했거나, 서버 프로세스가 다른 네임스페이스에 있는 경우입니다. 이 경우:
+
+```bash
+# 호스트에서
+docker exec -u 0 isaac-sim-601 rm -rf /isaac-sim/.vscode-server
+docker restart isaac-sim-601
+```
+
+VS Code 닫고 다시 attach.
+
+먼저 `hostname`과 `mount | grep volume` 결과를 보여주시면 어느 쪽인지 바로 판단됩니다.
