@@ -426,3 +426,40 @@ ls /isaac-sim/
 `/.dockerenv` 파일 존재 여부가 컨테이너인지 판별하는 가장 확실한 방법입니다.
 
 이 두 결과를 보여주시면 정확히 짚어드릴 수 있습니다. 다만 `mount` 출력을 보면 VS Code 창이 컨테이너가 아닌 다른 곳에 연결돼 있을 가능성이 높고, 그렇다면 attach 대상을 다시 선택하시는 게 해법이 될 겁니다.
+
+##
+##
+##
+##
+컨테이너가 맞군요. 그러면 남은 원인은 하나로 좁혀집니다 — **VS Code의 파일 작업이 터미널과 다른 프로세스 컨텍스트에서 돌고 있는** 겁니다.
+
+핵심 확인: VS Code 컨테이너 터미널에서 `touch`가 실패했다고 하셨는데, 그 터미널의 `id`가 1234로 나온 게 이상합니다. UID가 같은데 결과가 다르다면 **보조 그룹이나 프로세스 속성 차이**입니다.
+
+호스트 터미널의 `docker exec`와 VS Code 터미널에서 각각 비교해보세요:
+
+```bash
+id -G                          # 보조 그룹 전체
+cat /proc/self/status | grep -E 'Uid|Gid|Groups|CapEff'
+touch /isaac-sim/volume/t2 2>&1
+```
+
+`docker exec`는 `-u 1234:1234`로 붙을 때 보조 그룹을 안 넘기는 반면, VS Code 서버는 다른 방식으로 뜹니다. ACL의 `mask::rwx`와 group 권한 해석이 갈릴 수 있어요.
+
+**그리고 하나 더 — 이게 유력합니다:**
+
+`ls -ld`에서 소유자가 `isaac-sim`으로 표시됐죠. 그런데 ACL 항목은 `user:1234:rwx`입니다. 파일 소유자 본인은 `user::rwx`(첫 줄)를 적용받는데, **소유자에게는 mask가 적용되지 않습니다.** 여기까진 문제없어요.
+
+문제는 `/isaac-sim/volume` **위쪽 경로**일 수 있습니다:
+
+```bash
+ls -ld / /isaac-sim /isaac-sim/volume
+namei -l /isaac-sim/volume/testfile
+```
+
+`namei -l`이 경로를 한 단계씩 훑으면서 어디서 권한이 막히는지 보여줍니다. 이게 가장 빠른 진단입니다.
+
+**실용적 우회책**
+
+원인 규명이 길어지면, 호스트에서 VS Code Remote-SSH로 `~/docker/isaac-sim-601/volume`을 여시는 게 낫습니다. 같은 파일 실체이고 편집·복사·삭제가 잘 되니까요. 빌드와 실행만 컨테이너 터미널에서 하시면 됩니다.
+
+`namei -l` 결과를 보여주시면 어디가 막혔는지 확정할 수 있습니다.
