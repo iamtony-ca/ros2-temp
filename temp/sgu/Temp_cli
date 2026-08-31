@@ -17,3 +17,16 @@ for D in 28 40 50; do
       --text-conf 0.05 --text-conf-flange 0.15 \
       --true-distance-mm ${D}0 --note "COMBO+TF+프롬프트4 · ${D}cm"
 done
+
+
+
+
+cd <ws>/src/vision && source envs/env.sh
+
+for D in 28 56 66; do
+  envs/pose/bin/python tools/inspect_frames.py \
+      --in runs/real_zedx_${D}cm --run runs/R${D}_combo \
+      --prompts f002_base,f005,f007
+done
+
+<run>/inspect/{arms,prompts,all}/segcmp_frame_XXXX.png — 프레임 수만큼 나온다.
