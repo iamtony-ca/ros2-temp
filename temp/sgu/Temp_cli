@@ -30,3 +30,12 @@ for D in 28 56 66; do
 done
 
 <run>/inspect/{arms,prompts,all}/segcmp_frame_XXXX.png — 프레임 수만큼 나온다.
+
+
+tools/arm_diff.py — 신규. "눈에 안 보인다" 를 숫자로 굳힌다.
+
+envs/pose/bin/python tools/arm_diff.py --run runs/R28_combo runs/R56_combo runs/R66_combo \
+    --arms RH1,RH2,RP3,RP1,RH1@f005,RH1@f007 --md-out arm_diff.md
+
+stats/metrics_long.csv 만 읽어 프레임마다 짝지어 ΔR·Δt 를 내고 재실행 잡음 바닥(ΔR 중앙 0.146° · ADD 0.095mm)과 견준다. 바닥 안이면 «구분되지 않는다» 가 증명된 것이다.
+
