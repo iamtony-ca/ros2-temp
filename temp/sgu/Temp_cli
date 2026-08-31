@@ -39,3 +39,4 @@ envs/pose/bin/python tools/arm_diff.py --run runs/R28_combo runs/R56_combo runs/
 
 stats/metrics_long.csv 만 읽어 프레임마다 짝지어 ΔR·Δt 를 내고 재실행 잡음 바닥(ΔR 중앙 0.146° · ADD 0.095mm)과 견준다. 바닥 안이면 «구분되지 않는다» 가 증명된 것이다.
 
+
