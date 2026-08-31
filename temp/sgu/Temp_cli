@@ -4,3 +4,16 @@ envs/seg_sam3/bin/python tools/sam3_prompt_sweep.py \
     --confidence 0.05 --full-area-min 0.005 --ref-full-slug f002,f005,f007
 grep -m1 "flange 기준 full 참조" runs/psweep_real01_fl/report.md   # «3개 잡힘» 이어야 한다
 → sheets → check → rank(--target flange --combine human) → slugs 로 3~4개.
+
+
+
+
+for D in 28 40 50; do
+  envs/pose/bin/python tools/run_group_a.py \
+      --in runs/real_zedx_${D}cm --out runs/R${D}_combo \
+      --mode combo,prompts --no-exemplar \
+      --text-prompt        "cube shaped sealed plastic wafer pod" \
+      --text-prompt-flange "top mounting plate with a hole" \
+      --text-conf 0.05 --text-conf-flange 0.15 \
+      --true-distance-mm ${D}0 --note "COMBO+TF+프롬프트4 · ${D}cm"
+done
