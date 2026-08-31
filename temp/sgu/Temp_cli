@@ -1,0 +1,6 @@
+envs/seg_sam3/bin/python tools/sam3_prompt_sweep.py \
+    --imgs assets/real_imgs/zedx_2026xxxx --out runs/psweep_real01_fl \
+    --target full,flange --prompts-json assets/prompts/flange_real20.json \
+    --confidence 0.05 --full-area-min 0.005 --ref-full-slug f002,f005,f007
+grep -m1 "flange 기준 full 참조" runs/psweep_real01_fl/report.md   # «3개 잡힘» 이어야 한다
+→ sheets → check → rank(--target flange --combine human) → slugs 로 3~4개.
