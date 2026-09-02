@@ -50,3 +50,7 @@ envs/pose/bin/python tools/diag_arm.py --run <디렉토리> --arm RH1 --make-hyb
 - diag_metrics.json — 그 수치
 
 --frames N 대신 --pick frame_0003,frame_0017 로 특정 프레임만, --all 로 전 프레임 개별 장.
+
+
+envs/pose/bin/python tools/diag_arm.py --run <디렉토리> --arm RH1 --make-hybrid \
+    --depth-pct 0 100 --frames 6
