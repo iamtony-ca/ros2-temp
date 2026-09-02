@@ -40,3 +40,22 @@ envs/pose/bin/python tools/arm_diff.py --run runs/R28_combo runs/R56_combo runs/
 stats/metrics_long.csv 만 읽어 프레임마다 짝지어 ΔR·Δt 를 내고 재실행 잡음 바닥(ΔR 중앙 0.146° · ADD 0.095mm)과 견준다. 바닥 안이면 «구분되지 않는다» 가 증명된 것이다.
 
 
+
+
+cd <ws>/src/vision && source envs/env.sh
+
+envs/pose/bin/python -m spatial_vision.viz.diag_sheet \
+    --in <촬영디렉토리> --out <out>/diag_RH1 \
+    --seg-full   <out>/seg_txt \
+    --seg-flange <out>/fp_c075  --flange-name mask_flange_proj.png \
+    --depth-dir  <out>/st \
+    --pose-dir   <out>/hyb_combo --pose-name pose_coarse.json \
+    --obj assets/obj/foup_300_semi_r2 --frames 6
+
+나오는 것 4종
+- diag_sheet.png — 프레임 여러 장을 한 시트에
+- diag_<frame>.png — 프레임당 6패널(원본 · mask_full · mask_flange · depth · valid · RH1 pose)
+- diag_trends.png — 전 프레임 추이(등가지름 · depth · 평면잔차 · 유효율)
+- diag_metrics.json — 그 수치
+
+--frames N 대신 --pick frame_0003,frame_0017 로 특정 프레임만, --all 로 전 프레임 개별 장.
