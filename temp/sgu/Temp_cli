@@ -44,17 +44,8 @@ stats/metrics_long.csv 만 읽어 프레임마다 짝지어 ΔR·Δt 를 내고 
 
 cd <ws>/src/vision && source envs/env.sh
 
-envs/pose/bin/python -m spatial_vision.viz.diag_sheet \
-    --in <촬영디렉토리> --out <out>/diag_RH1 \
-    --seg-full   <out>/seg_txt \
-    --seg-flange <out>/fp_c075  --flange-name mask_flange_proj.png \
-    --depth-dir  <out>/st \
-    --pose-dir   <out>/hyb_combo --pose-name pose_coarse.json \
-    --obj assets/obj/foup_300_semi_r2 --frames 6
-
-나오는 것 4종
-- diag_sheet.png — 프레임 여러 장을 한 시트에
-- diag_<frame>.png — 프레임당 6패널(원본 · mask_full · mask_flange · depth · valid · RH1 pose)
+envs/pose/bin/python tools/diag_arm.py --run <디렉토리> --arm RH1 --make-hybrid --frames 6
+필요하면 --order default · --panel5 valid · --mesh full.ply 로 되돌릴 수 있고, 실행 시 무엇을 골랐는지 찍어 준다.
 - diag_trends.png — 전 프레임 추이(등가지름 · depth · 평면잔차 · 유효율)
 - diag_metrics.json — 그 수치
 
