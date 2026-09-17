@@ -88,3 +88,43 @@ ros2 service call /omy_bridge/enable std_srvs/srv/Trigger
 - 최종 offset/sign 은 teleop_omy.launch.py 기본값과 virtual_omy_leader.py 양쪽에 넣습니다.
 
 리더가 실물이라 브리지 상한 1.0 에서 sim 팔이 뒤늦게 따라오면 정상이고, 그건 sim 이라 2.0 까지 바로 올려도 됩니다. --mode match 출력과 verify 잔차를 붙여 주세요.
+
+##
+##
+##
+##
+
+
+
+❯ 그러면, 내가 다른pc 에서 필요한 정보들을 알려줄게. 차근차근근 가이드를 줄래?
+
+좋습니다. 단계별로 "실행할 것" 과 "보고할 것" 을 나눕니다. 전제: T1 리더(실물), T2 Isaac GUI 세트2, T3 제어 스택 sim, T4 MoveIt sim, T5 브리지가 떠 있고, 브리지는 disabled 상태. 그쪽 PC 가 pull 전이면 캘리브 도구에 --sign/--offset 을 직접 주는 형태로 명령을 드립니다(pull 후에는 생략 가능).
+
+1단계. 리더 rest pose 실측
+리더를 손 떼도 서 있는 자세에 두고:
+ros2 run ur_bringup omy_leader_calib.py --mode check --seconds 3
+보고: joint1~6 의 값 6개, 발행 Hz, 잡음 sd. 그리고 트리거를 완전히 놓았을 때와 꽉 쥐었을 때의 rh_r1_joint 값 2개(각각 --mode check 를 한 번씩 더 돌리면 됨).
+
+2단계. 관절별 방향 시험 (부호 확정용, sim 이라 안전)
+# T5 브리지를 느리게 재기동
+ros2 launch ur_bringup teleop_omy.launch.py use_sim_time:=true virtual_leader:=false max_joint_speed:=0.5
+# 리더 rest, sim UR 을 랑데부로
+ros2 service call /omy_bridge/sync std_srvs/srv/Trigger      # status: synced
+ros2 service call /omy_bridge/enable std_srvs/srv/Trigger    # 거부되면 거부 메시지를 그대로 보고
+enable 이 되면 리더 관절을 J1 부터 하나씩 10° 정도 돌리고 Isaac 의 UR16e 같은 관절이 같은 물리 방향으로 도는지 봅니다(베이스 회전 방향, 어깨/팔꿈치가 접히는 쪽, 손목 회전 방향).
+보고: J1 같음 / J2 반대 / J3 같음 / … 6개. enable 이 거부됐으면 그 메시지(어긋난 관절과 도 단위 값이 나옵니다).
+
+3단계. 부호 확정 → 오프셋 측정 (제가 2단계 결과로 sign 벡터를 드리면)
+ros2 service call /omy_bridge/disable std_srvs/srv/Trigger
+ros2 param set /omy_to_ur16e sign "[<제가 준 6개>]"
+# 리더 rest, UR 랑데부 상태에서
+ros2 run ur_bringup omy_leader_calib.py --mode match --seconds 3 --sign <같은 6개, 쉼표구분>
+보고: 출력 표의 → offset 6개.
+
+4단계. 적용·검증
+ros2 param set /omy_to_ur16e offset "[<offset 6개>]"
+ros2 run ur_bringup omy_leader_calib.py --mode verify --seconds 3 --sign <6개> --offset <6개>
+잔차가 전 관절 8.6° 미만이면 enable → 리더를 여러 자세로 움직여 방향과 모양이 맞는지 확인. 리더를 다른 자세로 잡고 verify 를 2~3회 더(잔차가 자세마다 다르면 부호나 J4/J6 오프셋을 다시 봅니다).
+보고: verify 잔차 6개(2~3 자세), 체감.
+
+5단계. 영구화 — 최종 sign/offset/트리거값을 주시면 teleop_omy.launch.py 기본값, virtual_omy_leader.py, rendezvous 재계산, 문서까지 제가 반영하고 sim 회귀로 확인합니다.
