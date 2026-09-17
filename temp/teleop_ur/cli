@@ -41,3 +41,50 @@ ros2 service call /omy_bridge/disable std_srvs/srv/Trigger
 - 어느 관절이 반대로 움직이면 disable 후 ros2 param set /omy_to_ur16e sign "[...]" 로 그 관절 부호를 뒤집습니다.
 
 잘 되면 match 로 얻은 offset 을 teleop_omy.launch.py 기본값에 넣어 두세요. engage 거부 메시지나 engage_error 값이 나오면 붙여 주세요.
+
+
+
+
+##
+##
+##
+
+든 터미널에서 먼저 source /opt/ros/jazzy/setup.bash && source /isaac-sim/volume/ur_ws/install/setup.bash. T2(실물 UR)·T3 는 내려 주세요.
+
+T1 리더 (실물)
+ros2 launch ur_bringup omy_leader.launch.py port_name:=/dev/ttyUSB0
+# pull 전이면: ros2 launch open_manipulator_bringup omy_l100_leader_ai.launch.py port_name:=/dev/ttyUSB0 use_self_collision_avoidance:=false
+#   (sim UR 의 /joint_states 때문에 joint1 ERROR 가 반복되지만 무해)
+
+T2 Isaac (세트2, GUI)
+/isaac-sim/python.sh src/ur_bringup/isaac/common/ur16e_isaac_ros2.py \
+    --asset-path /isaac-sim/volume/ur_ws/src/ur_bringup/isaac/assets/ur16e_with_2f85.usd
+GUI 로 띄우는 이유: headless 는 실시간의 3.8배로 돌아서 실물 리더와 시간축이 안 맞습니다. 로봇이 뜨고 /isaac_joint_states 가 나올 때까지 기다립니다.
+
+T3 제어 스택 / T4 MoveIt (sim)
+ros2 launch ur_bringup ur16e_2f85.launch.py use_sim:=true
+ros2 launch ur_bringup ur16e_2f85_moveit.launch.py use_sim:=true
+
+T5 브리지 (sim 시간, 실물 리더)
+ros2 launch ur_bringup teleop_omy.launch.py use_sim_time:=true virtual_leader:=false max_joint_speed:=1.0
+
+T6 절차
+# 1) 리더를 손 떼도 서 있는 rest pose 에 두고 → sim UR16e 를 랑데부로
+ros2 service call /omy_bridge/sync std_srvs/srv/Trigger
+ros2 topic echo /omy_bridge/status                 # synced
+
+# 2) 어긋남 확인 → 크면 오프셋 캘리브 (여기서 하는 게 핵심)
+ros2 topic echo /omy_bridge/engage_error
+ros2 run ur_bringup omy_leader_calib.py --mode match
+ros2 param set /omy_to_ur16e offset "[<6개>]"
+ros2 run ur_bringup omy_leader_calib.py --mode verify   # 자세 바꿔 2~3회
+
+# 3) engage
+ros2 service call /omy_bridge/enable std_srvs/srv/Trigger
+
+여기서 확인·기록할 것
+- 어느 관절이 반대로 가는지 → sign 뒤집기(disable 후 param set). 특히 J5 는 이미 −1 입니다.
+- 실물 리더의 rest pose 실측값, J2 가동범위, 트리거 열림/닫힘 값(E-1 ②③④). 트리거 값은 브리지의 gripper_in_open/closed 로 들어갑니다. sim 에는 2F-85 가 있어서 트리거 매핑도 눈으로 확인됩니다.
+- 최종 offset/sign 은 teleop_omy.launch.py 기본값과 virtual_omy_leader.py 양쪽에 넣습니다.
+
+리더가 실물이라 브리지 상한 1.0 에서 sim 팔이 뒤늦게 따라오면 정상이고, 그건 sim 이라 2.0 까지 바로 올려도 됩니다. --mode match 출력과 verify 잔차를 붙여 주세요.
