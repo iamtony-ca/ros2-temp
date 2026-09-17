@@ -160,3 +160,23 @@ engage 후 두 가지를 봅니다:
 2. 손목 판정: L100 의 그리퍼가 테이블을 똑바로 향하게 손목을 내리고, sim UR16e 의 그리퍼도 아래를 향하는지 봅니다. 아래면 B2 확정. 위(또는 반대편)를 향하면 B 로 바꿉니다(offset J4 +1.5708, J6 3.1416, rendezvous J4 2.7858, J6 3.1140).
 
 방향 6개, engage_error, 손목 판정 결과를 보내 주세요. 확정되면 기본값·virtual_omy_leader.py·문서(§47 랑데부 재정의, 거울 가지 채택 이유)에 반영하고 sim 회귀를 돌리겠습니다.
+
+
+
+최종 후보
+ros2 service call /omy_bridge/disable std_srvs/srv/Trigger
+ros2 launch ur_bringup teleop_omy.launch.py use_sim_time:=true virtual_leader:=false max_joint_speed:=0.5 \
+    sign:="[1.0, -1.0, -1.0, -1.0, 1.0, -1.0]" \
+    offset:="[3.1416, -1.5708, 0.0, -1.5708, 0.0, 0.0]" \
+    rendezvous:="[3.1217, -0.0276, -2.6534, -0.3559, 1.5263, -0.0276]"   # = [178.9, -1.6, -152.0, -20.4, 87.5, -1.6]°
+ros2 service call /omy_bridge/sync std_srvs/srv/Trigger
+ros2 topic echo /omy_bridge/engage_error        # 리더 rest 에서 전 관절 ≈ 0
+ros2 service call /omy_bridge/enable std_srvs/srv/Trigger
+
+확인할 것 세 가지: ① J1~J6 방향 모두 같음, ② 그리퍼 방향(정면·아래) 일치, ③ 리더를 크게 몇 자세 움직여도 UR 모양이 따라오는지, 그리고 max_joint_speed 를 1.0~2.0 으로 올려도 이상 없는지.
+
+이 결과가 좋으면 제가 반영할 내용은 다음과 같습니다. 미리 알려 드리는 이유는 ready 자세가 바뀌기 때문입니다.
+- teleop_omy.launch.py 기본값 sign/offset/rendezvous, virtual_omy_leader.py sign/offset.
+- reset_pose.py 의 ready 를 이 랑데부로 갱신(기존 §47 값은 ready_v2 로 보존, ready_v1 은 그대로), pick_place_demo.py READY 도 동일하게.
+- 문서: HISTORY §49.8(실측 rest, 거울 가지 채택 이유, J5 부호 정정), plan_il_vla §3.5 의 "J5 반전 필요" 는 실측으로 정정, CHECKLIST E-3 표.
+- sim 회귀: 가짜 리더 teleop + 세트3 pick&place 를 새 ready 로 재실행.
