@@ -9,7 +9,7 @@ ros2 launch open_manipulator_bringup omy_l100_leader_ai.launch.py port_name:=/de
 확인: ros2 control list_controllers -c /leader/controller_manager 4개 active, 손을 떼면 그 자세로 서 있음.
 
 T2 UR16e
-ros2 launch ur_bringup ur16e.launch.py use_sim:=false robot_ip:=192.168.0.10
+ros2 launch ur_bringup ur16e.launch.py use_sim:=false robot_ip:=192.168.0.10 headless_mode:=true
 펜던트에서 External Control 프로그램 ▶. 확인: ros2 topic echo /joint_states --once 에 NaN 없음.
 
 T3 MoveIt (랑데부 sync 가 충돌검사 계획에 씀)
