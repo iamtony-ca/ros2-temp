@@ -1,0 +1,61 @@
+1. 계층과 패키지
+
+┌───────────┬─────────────────────────────────────────────────────────────┬──────────────────────────────────────────────────┬────────────────────────────┐
+│   계층    │                           패키지                            │                       sim                        │            실물            │
+├───────────┼─────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────┼────────────────────────────┤
+│ 상위 명령 │ moveit_ros_move_group(+cuMotion 플러그인), moveit_servo,    │ 동일                                             │ 동일                       │
+│           │ 우리 omy_to_ur16e.py, 정책 클라이언트                       │                                                  │                            │
+├───────────┼─────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────┼────────────────────────────┤
+│           │ ros2_controllers: joint_state_broadcaster,                  │                                                  │                            │
+│ 컨트롤러  │ scaled_joint_trajectory_controller(JTC),                    │ 동일(config/common/ur16e_2f85_controllers.yaml)  │ 동일(UR 공식 yaml 도 같은  │
+│           │ forward_position_controller(JointGroupPosition),            │                                                  │ 이름)                      │
+│           │ gripper_controller(GripperAction)                           │                                                  │                            │
+├───────────┼─────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────┼────────────────────────────┤
+│ 컨트롤러  │ controller_manager/ros2_control_node                        │ 동일                                             │ 동일                       │
+│ 매니저    │                                                             │                                                  │                            │
+├───────────┼─────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────┼────────────────────────────┤
+│ 하드웨어  │                                                             │ topic_based_ros2_control(vcs 0.2.1): 관절을      │ ur_robot_driver 하드웨어   │
+│ 플러그인  │ —                                                           │ 토픽으로 미러링                                  │ 인터페이스: RTDE +         │
+│           │                                                             │                                                  │ External Control 스크립트  │
+├───────────┼─────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────┼────────────────────────────┤
+│ 물리/로봇 │ —                                                           │ Isaac Sim ur16e_isaac_ros2.py(OmniGraph          │ UR16e 컨트롤박스(URScript  │
+│           │                                                             │ ArticulationController)                          │ servoj)                    │
+├───────────┼─────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────┼────────────────────────────┤
+│ 그리퍼    │ —                                                           │ 같은 topic_based 인터페이스에 finger_joint 포함  │ robotiq_driver(RS-485, 툴  │
+│ 하드웨어  │                                                             │                                                  │ 통신으로 /tmp/ttyUR)       │
+└───────────┴─────────────────────────────────────────────────────────────┴──────────────────────────────────────────────────┴────────────────────────────┘
+
+2. 토픽·액션 (이름은 양쪽 동일, 굵은 것만 백엔드 전용)
+
+[명령 소스]                                   [컨트롤러]                       [하드웨어 인터페이스]           [로봇]
+MoveIt / reset_pose.py
+  └ action /scaled_joint_trajectory_controller/follow_joint_trajectory ─▶ JTC ─┐
+omy_to_ur16e.py / Servo / 정책 클라이언트                                       ├▶ ros2_control 루프 ─▶ sim:  /isaac_joint_commands (JointState) ─▶ Isaac
+  └ topic  /forward_position_controller/commands (Float64MultiArray, 100 Hz) ─┘         (500 Hz)          ◀─ /isaac_joint_states   (JointState) ◀─ Isaac
+                                                                                                           ◀─ /clock                          ◀─ Isaac
+                                                                                                    real: RTDE 30004 (state 500 Hz) ◀─▶ UR 컨트롤박스
+                                                                                                          reverse 50001 / script 50002 / trajectory 50003
+그리퍼: action /gripper_controller/gripper_cmd ─▶ GripperActionController ─▶ (sim) 같은 topic_based / (real) robotiq_driver ─▶ RS-485
+상태:   joint_state_broadcaster ─▶ /joint_states (팔 6 + finger_joint)  ─▶ MoveIt, 브리지 engage 게이트, 기록기 state, 정책 관측
+
+- sim 전용: /isaac_joint_commands, /isaac_joint_states, /clock(use_sim_time:=true 필수). Isaac 스크립트가 셋을 다 만듭니다.
+- 실물 전용: RTDE(30004)로 상태 수신, reverse 인터페이스(50001)로 servoj 목표 송신, External Control URCap 또는 headless_mode 로 스크립트 주입(50002). 토픽으로는 /io_and_status_controller/*(program_running, robot_mode, speed_scaling) 이 추가로 생깁니다.
+- 두 컨트롤러는 상호배타: switch_control_mode.py {trajectory|streaming} 이 /controller_manager/switch_controller 로 전환합니다. JTC 는 궤적(MoveIt), forward_position 은 스트리밍(텔레옵·정책).
+
+3. 데이터 플로우 (텔레옵 → 기록 → 학습 → 추론)
+
+OMY-L100 ──Dynamixel 4 Mbps──▶ ROBOTIS 리더 스택(ros2_control, 중력보상) ──▶ /leader/joint_states (300 Hz)
+   ▼
+omy_to_ur16e.py: sign/offset 매핑 → clamp → slew → /forward_position_controller/commands (100 Hz)
+                                              └─▶ /omy_bridge/command_joint_states (= IL action)
+                                              └─▶ /gripper_controller/gripper_cmd (트리거)
+   ▼
+ros2_control ──▶ [sim] /isaac_joint_commands → Isaac  |  [real] RTDE servoj → UR16e
+   ▼
+/joint_states (state) + /camera/color/image_raw, /static_cam/color/image_raw (관측)
+   ▼
+il_recorder.py (30 Hz 리샘플, raw JPEG+JSON) ──▶ raw_to_lerobot.py (ML venv) ──▶ LeRobot 데이터셋
+   ▼
+lerobot-train (ACT / GR00T) ──▶ 체크포인트
+   ▼
+정책 서버(async_inference) ◀──▶ robot_client(UR16eROS 어댑터: /joint_states·카메라 구독, /forward_position_controller/commands 발행)
