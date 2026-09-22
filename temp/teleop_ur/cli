@@ -180,3 +180,45 @@ ros2 service call /omy_bridge/enable std_srvs/srv/Trigger
 - reset_pose.py 의 ready 를 이 랑데부로 갱신(기존 §47 값은 ready_v2 로 보존, ready_v1 은 그대로), pick_place_demo.py READY 도 동일하게.
 - 문서: HISTORY §49.8(실측 rest, 거울 가지 채택 이유, J5 부호 정정), plan_il_vla §3.5 의 "J5 반전 필요" 는 실측으로 정정, CHECKLIST E-3 표.
 - sim 회귀: 가짜 리더 teleop + 세트3 pick&place 를 새 ready 로 재실행.
+
+
+##
+##
+##
+
+T2 Isaac — 세트3 pick_place 씬 (GUI)
+/isaac-sim/python.sh src/ur_bringup/isaac/common/ur16e_isaac_ros2.py \
+    --asset-path /isaac-sim/volume/ur_ws/src/ur_bringup/isaac/assets/ur16e_2f85_d405.usd \
+    --scene pick_place --table --table-height 0.20 --table-pose 0.72,0.0 --table-size 0.70,0.90 \
+    --object-pose 0.60,0.0,0.225 --object-size 0.035,0.035,0.035 \
+    --place-pose 0.60,0.315,0.0 --object-names red,blue --place-names left,right --object-spacing 0.20 \
+    --camera-res 320x240 --grasp-attach --with-camera --with-static-cam
+수집 하네스와 같은 씬입니다. --grasp-attach 는 그리퍼가 물체 위에서 finger_joint 0.25 rad 이상 닫히면 물체를 그리퍼에 용접하고, 열면 놓습니다(접촉 물리 대신). --randomize-object --randomize-radius 0.06 을 붙이면 에피소드 리셋마다 물체 위치가 바뀝니다.
+
+T3 / T4 — 세트3 스택
+ros2 launch ur_bringup ur16e_2f85_d405.launch.py use_sim:=true
+ros2 launch ur_bringup ur16e_2f85_d405_cumotion_moveit.launch.py use_sim:=true ur_only:=false   # sync 용
+
+T5 — 브리지 (트리거 값 포함)
+먼저 리더 단독으로 트리거를 완전히 놓았을 때/쥐었을 때 rh_r1_joint 값을 --mode check 로 두 번 읽어 두세요(E-1 ④). 그 값을 넣습니다(방금 런치 인자로 노출했습니다, pull 필요; 그 전엔 기본값 0.0/−1.0 추정치):
+ros2 launch ur_bringup teleop_omy.launch.py use_sim_time:=true virtual_leader:=false max_joint_speed:=1.0 \
+    gripper_in_open:=<놓았을 때 rad> gripper_in_closed:=<쥐었을 때 rad>
+그리퍼는 /gripper_controller/gripper_cmd 액션으로 가고, finger_joint 0(열림)~0.8(닫힘) 으로 비례 매핑됩니다.
+
+T6 — engage (지금 하던 대로)
+ros2 service call /omy_bridge/sync std_srvs/srv/Trigger      # 리더 rest → synced
+ros2 service call /omy_bridge/enable std_srvs/srv/Trigger
+이제 리더로 팔을 물체 위로 → 트리거 쥐기(물체가 붙음) → 옮겨서 → 트리거 놓기(놓임)가 됩니다. 씬은 ros2 service call /scene/reset_episode std_srvs/srv/Trigger 로 물체를 원위치(또는 랜덤)합니다.
+
+T7 — 기록 (데이터까지 모을 때)
+ros2 run ur_bringup il_recorder.py --ros-args -p use_sim_time:=true \
+    -p out_dir:=/isaac-sim/volume/ur_ws/outputs/il_raw_teleop -p task:=" target" \
+    -p action_source:=topic -p action_topic:=/omy_bridge/command_joint_states
+ros2 service call /il/start_episode  std_srvs/srv/Trigger   # engaged 상태여야 시작됨
+# ... 시연 ...
+ros2 service call /il/stop_episode   std_srvs/srv/Trigger   # 저장 + 씬 자동 리셋(auto_reset)
+ros2 service call /il/discard_episode std_srvs/srv/Trigger  # 실패 시
+ros2 param set /il_recorder task "put the blue block on the right target상
+OMY 브리지의 패드 버튼은 enable/sync/disable 뿐이라 기록 시작/정지는 서비스로 합니다. 손이 리더에 있으니 다른 사람이 누르거나, pad:=true 로 enable/sync 만 패드에 두는 정도가 현재 가능한 범위입니다.
+
+끝나면: ros2 service call /omy_bridge/disable ..., 변환은 ML 환경에서 deps/.venv-ml/bin/python src/ur_bringup/scripts/raw_to_lerobot.py --raw outputs/il_raw_teleop --repo-id <id> --root outputs/lerobot_ds_teleop.
