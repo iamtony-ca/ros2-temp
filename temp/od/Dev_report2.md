@@ -1,6 +1,6 @@
 # YOLO26n 대체 사람 감지 모델 개발 결과
 
-Oct 15, 2026 · @tony
+Oct 15, 2026 · 
 
 로봇 전방 카메라의 사람 감지 모델을 Ultralytics YOLO26n(AGPL-3.0)에서 자체 학습한 DEIM-N 512 KD 모델(Apache-2.0)로 바꿔 10월 15일 Orin에 적용했습니다. 사용 범위인 3 m 이내 정확도는 YOLO26n과 비슷하고, Orin 추론 시간은 기존 운영 설정(YOLO26n FP32) 대비 28% 줄었습니다(3.55 → 2.57 ms). Orin 환경, ZED SDK, 는 그대로 두고 ONNX 파일과 설정만 바꿨습니다.
 
