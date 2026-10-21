@@ -1,6 +1,6 @@
 # ACT physical contact grasp 개선 보고 (fixed-joint attach 대비)
 
-Oct 21, 2026 · @tony
+Oct 21, 2026 · 
 
 ## 요약
 
