@@ -1,0 +1,105 @@
+보고서의 파이프라인 6단계를 코드와 다시 맞춰 보는 중입니다(scripted expert 동작 부분 확인).
+
+보고서의 6단계를 순서대로 풀어 보겠습니다. 숫자는 현재 코드·설정과 2026-10-21~22 실행 로그에서 다시 확인한 값입니다.
+
+```
+Isaac scene ──GT pose──▶ Scripted expert ──로봇 움직임──▶ Recorder ──JPEG+JSON──▶ Conversion
+ (seed 로 배치)            (MoveIt/cuMotion)                (30 Hz)                  (ML venv)
+                                                                                      │ LeRobot dataset
+Rollout·scoring ◀──checkpoint── ACT training ◀────────────────────────────────────────┘
+```
+
+## 1. Isaac scene: 연습 환경
+- **장면**: 높이 0.20 m 테이블 위에 35 mm 큐브 2개와 marker 2개가 있습니다.
+  - 빨강 큐브 기본 위치는 [0.60, −0.10] m, 파랑은 [0.60, 0.10] m 입니다.
+  - 왼쪽 marker 는 [0.60, 0.215] m, 오른쪽은 [0.60, 0.415] m 입니다.
+- **카메라 2대** (둘 다 320×240):
+  - exterior: 로봇 앞쪽 위(1.1, 0, 1.1 m)에서 테이블을 내려다봅니다.
+  - wrist: 손목의 D405 입니다.
+- **무작위 배치**: episode 를 리셋할 때마다(`/scene/reset_episode`) 큐브 위치와 yaw 를 새로 뽑습니다.
+  - 기본 범위는 x·y ±60 mm, yaw 는 −180°~180° 입니다.
+  - 바깥 띠는 빨강 x 만 ±60~100 mm 에서 뽑고, yaw 를 45° 경계 근처에서 더 자주 뽑습니다.
+  - seed 가 같으면 배치 순서도 같습니다.
+- **물리**: physical 모드는 물리 120 Hz, 렌더 60 Hz 로 돕니다.
+  - 그리퍼는 "soft" 프로파일(finger 최대 3 N·m, 패드 마찰 1.2)이라 용접 없이 마찰만으로 쥡니다.
+- **GT 의 쓰임**: 큐브의 정답 위치(GT)는 ROS topic 으로 나갑니다. scripted expert 와 채점만 이 값을 쓰고, policy 입력에는 들어가지 않습니다. policy 는 카메라와 관절값만 봅니다.
+
+## 2. Scripted expert: 데모를 보여 주는 선생
+`pick_place_demo.py` 의 state machine 입니다. 한 사이클은 다음과 같습니다.
+
+1. **READY**: 시작 자세로 갑니다(실물 OMY L100 리더의 rest 자세에 맞춘 자세).
+2. **reset**: 큐브를 새 배치로 놓고, 멈출 때까지 기다립니다.
+3. **DETECT**: GT 로 큐브 위치와 yaw 를 읽습니다. 큐브는 90° 대칭이라 yaw 를 ±45° 안으로 접어 손목 회전 각을 정합니다.
+4. **녹화 시작** (`il/start`)
+5. **PRE_GRASP**: 큐브 15 cm 위로 갑니다. MoveIt + cuMotion 이 계획하는 큰 이동입니다.
+6. **GRASP**: 직선으로 내려갑니다. Cartesian 경로를 5 mm 간격으로 보간합니다.
+7. **CLOSE**: 그리퍼를 0.8 rad 로 한 번에 닫습니다.
+   - 접촉 중 PhysX 가 속도를 틀리게 보고하므로, 손가락 위치가 더 안 변하면(plateau) 닫힘 완료로 봅니다.
+8. **LIFT**: 20 cm 직선으로 듭니다. 큐브가 절반 이상 따라 올라왔는지 확인합니다.
+9. **TRANSFER**: marker 위로 이동합니다(MoveIt).
+10. **PLACE**: marker 위 2 cm 까지 직선으로 내립니다.
+11. **OPEN, RETRACT**: 놓고 물러납니다.
+12. **판정**: 큐브가 marker 에서 35 mm 이내이고 그리퍼가 비어 있으면 저장(`il/stop`), 아니면 버립니다(`il/discard`).
+
+- 속도·가속도는 최대의 20% 로 제한합니다.
+- 한 사이클은 약 23초이고, 그중 녹화 구간은 약 16.6초입니다.
+- 190번 모두 성공해서 버린 데모는 없었습니다.
+
+## 3. Recorder: 기록
+`il_recorder.py` 입니다.
+
+- **샘플링**: sim 시간 기준 30 Hz 타이머가 각 스트림의 최신값을 그대로 집습니다(zero-order hold). 보간하지 않습니다.
+- **state** (7개): 팔 관절 6개 + 그리퍼(finger 각도 ÷ 0.8 로 0~1 정규화)
+- **action** (7개):
+  - 팔: 다음 frame 의 관절값(`next_state`). "다음 순간 여기로 가라"는 목표를 배웁니다.
+  - 그리퍼: Isaac 에 보낸 그리퍼 **명령값**입니다. 실제 위치를 쓰면 큐브에 막혀 멈춘 값(0.506)을 배우게 되고, 그 값으로는 쥐는 힘이 0 이 되기 때문입니다.
+- **이미지**: 카메라 2대를 JPEG(q92)로 frame 마다 저장하고, `meta.json` 에 형식을 적어 둡니다.
+- **안전장치**:
+  - 카메라·관절·그리퍼 명령이 아직 안 들어왔으면 녹화를 시작하지 않습니다.
+  - Isaac 의 grasp mode 와 설정이 다르면 거부합니다.
+  - 10 frame 미만이거나 action 이 비어 있는 episode 는 버립니다.
+
+## 4. Conversion: 학습용 형식으로 변환
+- **환경 분리**: ROS 쪽 python 에는 torch·LeRobot 이 없고, 넣으면 시스템 환경이 오염됩니다. 그래서 기록은 단순한 JPEG + JSON 으로 하고, 분리된 ML venv 에서 `raw_to_lerobot.py` 로 변환합니다.
+- **변환 결과**:
+  - state·action 은 parquet 표로 저장합니다.
+  - 카메라 2대는 h264(crf 23) 영상으로 인코딩합니다.
+  - 190 episode = 94,574 frame, 382 MB 입니다.
+- **합치기**: 기본 100개와 바깥 띠 90개는 복사하지 않고 symlink 190개로 엮어서 한 번에 변환했습니다.
+- **안전장치**: grasp mode 나 그리퍼 기록 방식이 다른 episode 가 섞이면 변환을 거부합니다.
+
+## 5. ACT training: 학습
+- **입력**: 카메라 이미지 2장(320×240)과 현재 state 7개입니다. 평균·표준편차로 정규화합니다.
+- **구조** (LeRobot ACT 기본 설정, 파라미터 약 52M):
+  - 이미지마다 ResNet18(ImageNet 사전학습)로 특징을 뽑습니다.
+  - Transformer(encoder 4층, decoder 1층, 차원 512)가 이미지 특징과 state 를 함께 봅니다.
+  - **출력**: 앞으로 100 frame(약 3.3초)의 7-D action 을 한 번에 내놓습니다(action chunk).
+  - **CVAE**: 같은 상황에서 시연이 여러 방식일 수 있는 것을 다루기 위해, 학습 때는 정답 action 을 32차원 latent 로 압축해 함께 넣습니다(KL 가중치 10). 추론 때는 latent 를 0 으로 둡니다.
+- **학습 설정**: 손실은 예측 action 과 정답의 L1 오차입니다. batch 32, learning rate 1e-5 입니다.
+- **진행**:
+  - 200k step 은 데이터를 약 68번 도는 양입니다(epoch 67.7).
+  - RTX 5090 에서 12.7 step/s 로, 약 4시간 23분 걸렸습니다.
+  - 20k step 마다 checkpoint 를 저장했고, 100k 에서 멈춘 뒤 `--resume` 으로 200k 까지 이어 학습했습니다.
+  - loss 는 100k 에서 0.019, 200k 에서 0.013 이었습니다.
+
+## 6. Rollout · scoring: 평가와 채점
+- **준비**: 하네스가 Isaac 을 headless 로 새로 띄우고(seed 지정), 제어 스택과 관절 스트리밍 controller 를 올립니다.
+- **구조**: LeRobot async inference 의 두 프로세스로 나뉩니다.
+  - **policy server** (localhost gRPC): checkpoint 를 읽어 CPU 에서 추론합니다. chunk 한 번에 약 64 ms 입니다.
+  - **robot client**: 벽시계 30 Hz 로 돕니다. ROS 에서 카메라 2장과 관절값을 모아 server 로 보내고, 받은 action 을 하나씩 실행합니다.
+    - 관절 목표는 `/forward_position_controller/commands` 로 보냅니다. 한 번에 최대 0.05 rad 로 제한합니다.
+    - 그리퍼는 GripperCommand action 으로 보냅니다.
+- **chunk 실행 방식**: chunk 100개 중 앞 50개만 씁니다. 실제로는 50개를 거의 다 쓴 뒤(약 1.67초마다) 새 chunk 를 받았습니다. 그래서 그 사이 약 1.7초는 열린 루프로 움직입니다.
+- **trial 진행**:
+  1. 큐브를 리셋하고 시작 자세로 보냅니다.
+  2. 벽시계 70초 동안 policy 가 구동합니다. sim 이 실시간보다 조금 빨라 sim 으로는 약 77~79초입니다.
+  3. GT 로 판정합니다. 큐브와 marker 의 수평 거리 35 mm 이하, 그리퍼 열림이면 성공입니다.
+- **기록**: trial 마다 영상(sim 10 Hz 녹화, 3배속 재생)과 step 로그(steps.csv, sim 60 Hz)를 남깁니다.
+- **소요 시간**: 10 trial 한 run 이 약 15분, 12 run 이 약 3시간이었습니다.
+
+## 실물로 옮길 때
+- **그대로 쓰는 것**: policy 쪽(robot adapter, topic 이름, controller), recorder, 데이터 형식입니다.
+- **바꾸는 것**: Isaac 대신 실물 driver(UR, Robotiq, RealSense)를 연결합니다.
+- **sim 에서만 되는 것**: GT 가 필요한 scripted expert 와 자동 채점입니다. 실물 데모는 OMY 리더 teleop 으로 모아야 하고, 실물에는 exterior 카메라가 아직 없습니다.
+
+특정 단계를 더 깊이 보고 싶으면 말씀해 주세요. 예를 들어 CVAE 가 하는 일이나 chunk 를 이어 붙이는 방식을 따로 풀어 드릴 수 있습니다.
