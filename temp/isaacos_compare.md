@@ -46,3 +46,52 @@ Sources:
 - [Isaac ROS SIPL Camera (release-5.0)](https://nvidia-isaac-ros.github.io/v/release-5.0/repositories_and_packages/isaac_ros_sipl_camera/index.html)
 - [isaac_ros_sipl_camera GitHub](https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_sipl_camera)
 - [NVIDIA Forums – HoloHub holoscan_ros2](https://forums.developer.nvidia.com/t/holohub-and-holoscan-sensor-bridge-version-compatibility-for-vb1940-ros-2-example/376015)
+
+##
+##
+##
+##
+##
+# Isaac Sim 6.2.0 vs Isaac Lab 3.0 / ROS 2 vs Isaac OS 비교
+
+## 1. Isaac Sim 6.2.0 vs Isaac Lab 3.0
+
+| 구분 | Isaac Sim 6.2.0 | Isaac Lab 3.0 |
+|---|---|---|
+| 정체 | Kit 기반 로봇 시뮬레이터 | 로봇 학습(RL·IL) 프레임워크 |
+| 출시 | 2026-10-14 GA | 2026-10-20 GA (v3.0.0) |
+| 물리엔진 | PhysX(기본), Newton 1.6.1 + MuJoCo Warp 3.12.0 | Newton(MJWarp·VBD·MPM·Kamino), OVPhysX, Isaac Sim PhysX |
+| Newton 실행 | Kit 내부에서 실행 | Kit 없이 단독 실행 |
+| 렌더링 | RTX | Newton Warp 렌더러, OVRTX, Isaac Sim RTX |
+| ROS 2 | ROS 2 Bridge, ros2_control 확장 | Isaac Sim을 설치한 경우에만 사용 |
+| 주 인터페이스 | GUI, WebRTC 스트리밍, Python | `isaaclab train/play` CLI, 설정 기반 |
+| 라이선스 | 소스 Apache 2.0 (실행에 필요한 구성요소는 별도 약관) | BSD-3-Clause |
+| 상호 관계 | Isaac Lab 3.0 GA를 지원하는 버전 | Isaac Sim은 선택 설치 (`--extra isaacsim`) |
+
+**근거:**
+- Isaac Sim 6.2 기본 엔진은 PhysX이고, Docker Compose에서 `ISAACSIM_PHYSICS_ENGINE=newton`으로 Newton을 선택합니다 ([6.2.0 Release Notes](https://docs.isaacsim.omniverse.nvidia.com/6.2.0/overview/release_notes.html)).
+- 6.2에 번들된 엔진 버전은 Newton 1.6.1, MuJoCo/MuJoCo Warp 3.12.0이며, Isaac Lab v3.0.0-GA를 지원합니다 ([호환성 표](https://docs.isaacsim.omniverse.nvidia.com/6.2.0/installation/compatibility.html)).
+- Isaac Lab 3.0에서 Isaac Sim은 풀 PhysX/RTX, ROS bridge, XR, Kit 도구가 필요할 때만 쓰는 선택 사항입니다 ([v3.0.0 Release](https://github.com/isaac-sim/IsaacLab/releases/tag/v3.0.0)).
+
+## 2. ROS 2 vs Isaac OS
+
+| 구분 | ROS 2 | Isaac OS |
+|---|---|---|
+| 성격 | 오픈소스 로봇 미들웨어 | 오픈소스 런타임 프레임워크 |
+| 발표·출시 | Jazzy는 LTS (2024~2029) | 2026-10-21 GTC Berlin 발표 / **출시일 자료 없음** |
+| 기반 기술 | DDS 기반 pub/sub (rmw로 교체 가능) | NVIDIA Holoscan |
+| 목적 | 분산 노드 간 통신, 로봇 SW 재사용 | AI·센서·제어·로봇 HW를 연결하고, 시뮬레이션부터 실로봇까지 결정론적 실시간 성능 제공 |
+| 대상 애플리케이션 | 범용 | 엔터프라이즈급 애플리케이션 (NVIDIA 표현) |
+| 실행 모델 / API | 노드·토픽·서비스·액션, C++/Python | **자료 없음** |
+| 지원 HW / OS | 하드웨어 무관, Ubuntu 등 | **자료 없음** (사례에 Jetson Thor가 언급될 뿐 공식 지원 목록은 없음) |
+| ROS 2 연동 | — | **자료 없음** |
+| 라이선스 | 코어 Apache 2.0 | "오픈소스"라고만 명시 / **구체 라이선스 자료 없음** |
+| 코드·문서 | 공개 | **자료 없음** (공개 저장소·문서 확인 안 됨) |
+| 생태계 | Nav2, MoveIt2, ros2_control 등 | 사례: Humanoid, Hexagon Robotics, Bear Robotics (Jetson Thor, Holoscan Sensor Bridge, Halos와 함께 사용) |
+
+**근거:**
+- Isaac OS의 정의, Holoscan 기반이라는 점, 결정론적 실시간이라는 목표, 파트너 사례는 모두 [NVIDIA 공식 보도자료](https://nvidianews.nvidia.com/news/nvidia-advances-isaac-platform-for-general-purpose-robotics-with-new-reference-humanoid-frameworks-simulation-pipelines-and-data)에 나옵니다.
+- "Isaac ROS는 ROS 2 기반, Isaac OS는 Holoscan 기반이며 엔터프라이즈급 애플리케이션용"이라는 구분은 [NVIDIA Isaac ROS 페이지](https://developer.nvidia.com/isaac/ros)의 설명입니다.
+- 출시일이 발표 외에 명시되지 않았다는 점은 [Blockchain.News 보도](https://blockchain.news/news/nvidia-expands-isaac-robotics-platform-with-humanoid-and-new-tools)에서도 확인됩니다.
+
+**작성 원칙:** Isaac OS 열에는 위 공식 자료에 적힌 내용만 넣었고, 확인되지 않은 항목은 모두 "자료 없음"으로 표시했습니다. ROS 2 열은 공개 표준 사실 기준으로 작성했습니다.
